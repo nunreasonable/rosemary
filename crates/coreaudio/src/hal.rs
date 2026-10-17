@@ -196,6 +196,12 @@ fn input() -> Option<&'static Device> {
         .as_ref()
 }
 
+/// The recording device's rate, channel count and buffer size in frames, for
+/// an output unit that records through it; `None` without one.
+pub(crate) fn input_shape() -> Option<(f64, u32, u32)> {
+    input().map(|d| (d.sample_rate, d.channels, d.buffer_frames()))
+}
+
 fn device(object: ObjectId) -> Option<&'static Device> {
     match object {
         OUTPUT_DEVICE => Some(output()),

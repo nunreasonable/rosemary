@@ -5,6 +5,7 @@ use std::collections::BTreeSet;
 use std::ffi::c_void;
 use std::sync::{Arc, Mutex};
 
+mod capture;
 mod converter;
 mod foreign;
 mod format;
@@ -184,6 +185,12 @@ pub struct Unit {
     pub(crate) matrix: bool,
     /// `kAudioUnitProperty_MatrixLevels` as the guest last set it.
     pub(crate) levels: Vec<f32>,
+    /// `kAudioOutputUnitProperty_EnableIO` on each scope of an output unit:
+    /// playing on element 0, recording on element 1.
+    pub(crate) output_enabled: bool,
+    pub(crate) input_enabled: bool,
+    /// `kAudioOutputUnitProperty_CurrentDevice`.
+    pub(crate) device: u32,
     /// A varispeed's playback rate, which scales how fast it consumes its
     /// input; `None` for every other unit.
     pub(crate) varispeed: Option<f64>,
@@ -299,6 +306,9 @@ pub unsafe extern "C" fn AudioComponentInstanceNew(
         stream: std::ptr::null_mut(),
         running: false,
         rendered: 0,
+        output_enabled: true,
+        input_enabled: false,
+        device: hal::OUTPUT_DEVICE,
     }));
     let handle = Arc::as_ptr(&unit) as *mut c_void;
     let mut units = UNITS.lock().unwrap_or_else(|e| e.into_inner());
@@ -328,6 +338,7 @@ pub unsafe extern "C" fn AudioComponentInstanceDispose(handle: *mut c_void) -> i
     };
     // SAFETY: `close` owns the stream and leaves none behind.
     unsafe { stream::close(&mut unit.lock().unwrap_or_else(|e| e.into_inner())) };
+    capture::forget(handle);
     SUCCESS
 }
 
@@ -346,7 +357,10 @@ pub unsafe extern "C" fn AudioUnitInitialize(handle: *mut c_void) -> i32 {
     if unit.kind != Kind::Output {
         return SUCCESS;
     }
-    if !unit.stream.is_null() {
+    if unit.input_enabled && !capture::open(handle) {
+        return CANNOT_DO_IN_CURRENT_CONTEXT;
+    }
+    if !unit.output_enabled || !unit.stream.is_null() {
         return SUCCESS;
     }
     let Some(spec) = sdl_spec(&unit.format) else {
@@ -374,6 +388,7 @@ pub unsafe extern "C" fn AudioUnitUninitialize(handle: *mut c_void) -> i32 {
     };
     // SAFETY: as `AudioComponentInstanceDispose`.
     unsafe { stream::close(&mut unit.lock().unwrap_or_else(|e| e.into_inner())) };
+    capture::close(handle);
     SUCCESS
 }
 
@@ -390,12 +405,18 @@ pub unsafe extern "C" fn AudioOutputUnitStart(handle: *mut c_void) -> i32 {
         unit.running = true;
         return SUCCESS;
     }
-    if unit.stream.is_null() {
+    if unit.stream.is_null() && !unit.input_enabled {
         return UNINITIALIZED;
     }
-    // SAFETY: a stream this crate opened.
-    unsafe { sdl3::audio::resume(unit.stream) };
+    if !unit.stream.is_null() {
+        // SAFETY: a stream this crate opened.
+        unsafe { sdl3::audio::resume(unit.stream) };
+    }
     unit.running = true;
+    // Outside the unit's lock: SDL may be in the recording callback, which is
+    // guest code that may ask this unit for something.
+    drop(unit);
+    capture::run(handle, true);
     trace::say(format_args!("start"), SUCCESS);
     SUCCESS
 }
@@ -411,6 +432,9 @@ pub unsafe extern "C" fn AudioOutputUnitStop(handle: *mut c_void) -> i32 {
         unsafe { sdl3::audio::pause(unit.stream) };
     }
     unit.running = false;
+    // As in `AudioOutputUnitStart`.
+    drop(unit);
+    capture::run(handle, false);
     SUCCESS
 }
 
@@ -474,6 +498,12 @@ pub unsafe extern "C" fn AudioUnitRender(
 ) -> i32 {
     if list.is_null() {
         return PARAM_ERROR;
+    }
+    if bus == capture::INPUT_ELEMENT {
+        // SAFETY: the caller's obligation, as this function's.
+        if let Some(status) = unsafe { capture::render(handle, frames, list) } {
+            return status;
+        }
     }
     let Some(unit) = unit_for(handle) else {
         return foreign::status(c"AudioUnitRender", handle).unwrap_or(INVALID_COMPONENT);

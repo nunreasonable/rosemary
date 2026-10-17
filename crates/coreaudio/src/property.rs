@@ -129,7 +129,21 @@ pub unsafe extern "C" fn AudioUnitSetProperty(
         return unsafe { crate::foreign::set_property(handle, id, scope, element, data, size) }
             .unwrap_or(INVALID_COMPONENT);
     };
-    let status = unsafe { set(&unit, id, scope, element, data, size) };
+    let recording = unsafe {
+        crate::capture::set_property(
+            handle,
+            &mut unit.lock().unwrap_or_else(|e| e.into_inner()),
+            id,
+            scope,
+            element,
+            data,
+            size,
+        )
+    };
+    let status = match recording {
+        Some(status) => status,
+        None => unsafe { set(&unit, id, scope, element, data, size) },
+    };
     crate::trace::say(
         format_args!("set property {id} scope {scope} element {element}"),
         status,
@@ -422,6 +436,11 @@ pub unsafe extern "C" fn AudioUnitGetProperty(
         format_args!("get property {id} scope {scope} element {element} capacity {capacity}"),
         SUCCESS,
     );
+    if let Some(status) =
+        unsafe { crate::capture::get_property(handle, &unit, id, scope, element, out, size) }
+    {
+        return status;
+    }
     if unit.matrix && (id == MATRIX_DIMENSIONS || id == MATRIX_LEVELS) {
         let (inputs, outputs) = matrix_dimensions(&unit);
         let words: Vec<u32> = match id {
@@ -606,8 +625,15 @@ mod tests {
         };
         assert_eq!(word(1, ENABLE_IO, scope::OUTPUT), SUCCESS);
         assert_eq!(word(0, ENABLE_IO, scope::INPUT), SUCCESS);
-        assert_eq!(word(1, ENABLE_IO, scope::INPUT), INVALID_PROPERTY_VALUE);
-        assert_eq!(word(0, ENABLE_IO, scope::OUTPUT), INVALID_PROPERTY_VALUE);
+        // Recording is there exactly when the host has a microphone.
+        let recording = match crate::hal::input_shape() {
+            Some(_) => SUCCESS,
+            None => INVALID_PROPERTY_VALUE,
+        };
+        assert_eq!(word(1, ENABLE_IO, scope::INPUT), recording);
+        assert_eq!(word(0, ENABLE_IO, scope::INPUT), SUCCESS);
+        assert_eq!(word(0, ENABLE_IO, scope::OUTPUT), SUCCESS);
+        assert_eq!(word(1, ENABLE_IO, scope::OUTPUT), SUCCESS);
         assert_eq!(word(0, ENABLE_IO, 0), INVALID_SCOPE);
 
         assert_eq!(word(crate::hal::OUTPUT_DEVICE, CURRENT_DEVICE, 0), SUCCESS);
