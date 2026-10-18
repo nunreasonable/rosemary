@@ -245,11 +245,59 @@ const fn zone(name: *const libc::c_char) -> Zone {
     }
 }
 
-static DEFAULT_ZONE: Zone = zone(c"DefaultMallocZone".as_ptr());
+/// Every zone there is, by address: the default zone, the purgeable one, and
+/// each `malloc_create_zone` made, in that order.
+///
+/// On the heap rather than in a `static`, because a zone is writable memory:
+/// Chromium's allocator shim saves a zone's functions and writes its own over
+/// them, and a zone in this binary's read-only data would fault on the write.
+static ZONES: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
+
+fn zones() -> std::sync::MutexGuard<'static, Vec<usize>> {
+    let mut zones = ZONES.lock().unwrap_or_else(|e| e.into_inner());
+    if zones.is_empty() {
+        for name in [c"DefaultMallocZone", c"DefaultPurgeableMallocZone"] {
+            zones.push(Box::into_raw(Box::new(zone(name.as_ptr()))) as usize);
+        }
+    }
+    zones
+}
 
 /// `malloc_zone_t *malloc_default_zone(void)`
 pub unsafe extern "C" fn malloc_default_zone() -> *mut c_void {
-    &DEFAULT_ZONE as *const Zone as *mut c_void
+    zones()[0] as *mut c_void
+}
+
+/// `malloc_zone_t *malloc_default_purgeable_zone(void)`: a zone of its own
+/// over the same heap. Nothing here purges memory, which is what Darwin does
+/// too under no memory pressure.
+pub unsafe extern "C" fn malloc_default_purgeable_zone() -> *mut c_void {
+    zones()[1] as *mut c_void
+}
+
+/// `kern_return_t malloc_get_all_zones(task_t, memory_reader_t,
+/// vm_address_t **addresses, unsigned *count)`, for this task, which is the
+/// only one a reader is never needed for. The array is the caller's to read
+/// and not to free, as Darwin's is.
+pub unsafe extern "C" fn malloc_get_all_zones(
+    _task: u32,
+    _reader: *const c_void,
+    addresses: *mut *const usize,
+    count: *mut u32,
+) -> i32 {
+    let list = zones().clone().into_boxed_slice();
+    let length = list.len() as u32;
+    let pointer = Box::leak(list).as_ptr();
+    // SAFETY: writable, per the caller, when not null.
+    unsafe {
+        if !addresses.is_null() {
+            addresses.write(pointer);
+        }
+        if !count.is_null() {
+            count.write(length);
+        }
+    }
+    0
 }
 
 /// `malloc_zone_t *malloc_create_zone(vm_size_t start_size, unsigned flags)`
@@ -261,7 +309,9 @@ pub unsafe extern "C" fn malloc_default_zone() -> *mut c_void {
 /// would notice. The zone itself is leaked for the same reason Darwin keeps
 /// it: a pointer to it may outlive the call that destroys it.
 pub unsafe extern "C" fn malloc_create_zone(_start: usize, _flags: u32) -> *mut c_void {
-    Box::into_raw(Box::new(zone(std::ptr::null()))).cast()
+    let zone = Box::into_raw(Box::new(zone(std::ptr::null())));
+    zones().push(zone as usize);
+    zone.cast()
 }
 
 /// `void malloc_set_zone_name(malloc_zone_t *zone, const char *name)`
@@ -320,6 +370,8 @@ pub unsafe extern "C" fn malloc_zone_from_ptr(_ptr: *const c_void) -> *mut c_voi
 exports::exports! {
     functions {
         "malloc_default_zone" => malloc_default_zone,
+        "malloc_default_purgeable_zone" => malloc_default_purgeable_zone,
+        "malloc_get_all_zones" => malloc_get_all_zones,
         "malloc_create_zone" => malloc_create_zone,
         "malloc_set_zone_name" => malloc_set_zone_name,
         "malloc_destroy_zone" => malloc_destroy_zone,

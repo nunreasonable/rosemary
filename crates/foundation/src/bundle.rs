@@ -90,7 +90,10 @@ impl Layout {
         let executable = absolute.as_deref().unwrap_or(executable);
         let macos = executable.parent()?;
         if macos.file_name()? != "MacOS" {
-            return None;
+            // A framework's binary sits at its top level, beside `Resources`,
+            // and in a versioned one under `Versions/A`, which is the bundle
+            // a framework's code asks for through its own classes.
+            return Self::framework(macos).filter(|f| f.executable == executable);
         }
         let contents = macos.parent()?;
         if contents.file_name()? != "Contents" {
@@ -123,6 +126,11 @@ impl Layout {
         let absolute = root.canonicalize().ok();
         let root = absolute.as_deref().unwrap_or(root);
         let contents = root.join("Contents");
+        if !contents.is_dir()
+            && let Some(framework) = Self::framework(root)
+        {
+            return Some(framework);
+        }
         let info_path = contents.join("Info.plist");
         // CFBundle takes a bundle with no `Info.plist` at all, as an empty
         // dictionary: plug-in `.bundle`s built outside Xcode are often only
@@ -149,6 +157,42 @@ impl Layout {
             plugins: plugins_of(&contents),
             executable,
             contents,
+            info,
+        })
+    }
+
+    /// A framework on disk: `Resources/Info.plist` at its top level, as a
+    /// versioned framework has through its `Versions/Current` links and as
+    /// `Versions/A` itself has. Its executable is beside `Resources`, and it
+    /// has no `Contents`: the bundle's top level is its contents.
+    ///
+    /// `Versions/<x>` is reported as the `.framework` that holds it, as
+    /// `-bundlePath` does on a Mac.
+    fn framework(root: &Path) -> Option<Layout> {
+        let info_path = root.join("Resources/Info.plist");
+        if !info_path.is_file() {
+            return None;
+        }
+        let info = plist::parse(&std::fs::read(&info_path).ok()?).ok()?;
+        let executable = ["CFBundleExecutable", "NSExecutable"]
+            .iter()
+            .find_map(|key| info.get(key)?.as_str().filter(|name| !name.is_empty()))
+            .map(std::ffi::OsStr::new)
+            .or_else(|| root.file_stem())?
+            .to_owned();
+        let outer = root
+            .parent()
+            .filter(|versions| versions.file_name().is_some_and(|n| n == "Versions"))
+            .and_then(Path::parent)
+            .filter(|f| f.extension().is_some_and(|e| e == "framework"))
+            .unwrap_or(root);
+        Some(Layout {
+            root: outer.to_path_buf(),
+            resources: root.join("Resources"),
+            frameworks: root.join("Frameworks"),
+            plugins: root.join("PlugIns"),
+            executable: root.join(executable),
+            contents: root.to_path_buf(),
             info,
         })
     }

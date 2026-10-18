@@ -71,6 +71,8 @@ exports::exports! {
         "method_getTypeEncoding" => api::method_getTypeEncoding,
         "method_getName" => api::method_getName,
         "method_setImplementation" => api::method_setImplementation,
+        "method_exchangeImplementations" => api::method_exchangeImplementations,
+        "class_copyMethodList" => api::class_copyMethodList,
         "imp_implementationWithBlock" => imp_block::imp_implementationWithBlock,
         "imp_getBlock" => imp_block::imp_getBlock,
         "imp_removeBlock" => imp_block::imp_removeBlock,

@@ -421,6 +421,30 @@ fn memory_error(addr: u64) -> VmError {
     })
 }
 
+/// The `_OBJC_CLASS_$_` imports nothing satisfied, by the address of the slot
+/// each was meant to be written to.
+static MISSING_CLASSES: std::sync::Mutex<Vec<(u64, String)>> = std::sync::Mutex::new(Vec::new());
+
+/// Remember an unbound class import, so that a guest class whose superclass
+/// slot it is can be given a stand-in rather than refused.
+pub fn note_missing_class(slot: u64, symbol: &str) {
+    if let Some(name) = symbol.strip_prefix("_OBJC_CLASS_$_") {
+        MISSING_CLASSES
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push((slot, name.to_string()));
+    }
+}
+
+fn missing_class_at(slot: u64) -> Option<String> {
+    MISSING_CLASSES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .find(|(s, _)| *s == slot)
+        .map(|(_, name)| name.clone())
+}
+
 /// Create one class, registering its superclass first if that is also a guest's.
 fn register_class(
     r: &dyn Realizer,
@@ -475,6 +499,34 @@ fn register_class(
         // the common case: `Greeter : NSObject` binds `_OBJC_CLASS_$_NSObject`
         // to the host's own, which is exactly the class we want to derive from.
         class.superclass as host::Class
+    } else if let Some(missing) = (class.superclass == 0)
+        .then(|| missing_class_at(class.va + 8))
+        .flatten()
+    {
+        // The superclass is a framework class nothing here implements. Refusing
+        // the subclass leaves every reference to it pointing at the raw
+        // `class_t`, and the first message to it reads guest bytes as this
+        // runtime's class - a lock that looks held forever, or a table that
+        // is not one. An empty class of the right name keeps the subclass
+        // working for everything it defines itself, and a message only the
+        // missing superclass would answer is refused naming both.
+        eprintln!(
+            "rosemary: objc: {name} derives from {missing}, which is not implemented; it \
+             derives from an empty {missing} instead"
+        );
+        let Some(missing) = host::c_string(&missing) else {
+            rt.refusals.push(Refusal::SuperclassMissing {
+                name,
+                superclass: class.superclass,
+            });
+            return None;
+        };
+        objc::class::ptr(corefoundation::base::register(
+            &missing,
+            None,
+            size_of::<usize>(),
+            false,
+        )) as host::Class
     } else {
         rt.refusals.push(Refusal::SuperclassMissing {
             name,

@@ -452,6 +452,9 @@ pub fn announce_unbound_imports<'r>(
     // than leaving the reader to match a return address against this list by
     // hand.
     crate::fault::note_unbound(&unbound);
+    for (_, m) in &unbound {
+        crate::objc::note_missing_class(m.slot_va, &m.symbol);
+    }
     fill_unbound_data(&unbound);
     name_missing_classes(&unbound);
     unbound

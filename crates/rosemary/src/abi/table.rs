@@ -3806,10 +3806,12 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     // Imported by the interposing mimalloc rather than by the guest itself, which is
     // what makes most of it passthrough: a zone from `malloc_default_zone` is
     // libsystem_malloc's own structure, so calling through it is the host allocating
-    // for itself. `malloc_zone_register` and `malloc_get_all_zones` are refused -
-    // they hand the host a structure of *guest* function pointers.
+    // for itself. `malloc_zone_register` is refused - it hands the host a
+    // structure of *guest* function pointers. `malloc_get_all_zones` answers
+    // for this task only, and never calls the reader.
     sig!("malloc_default_zone", P),
     sig!("malloc_default_purgeable_zone", P),
+    sig!("malloc_get_all_zones", I32, U32, P, P, P),
     sig!("malloc_create_zone", P, U64, U32),
     sig!("malloc_destroy_zone", V, P),
     sig!("malloc_zone_from_ptr", P, P),
@@ -4167,12 +4169,6 @@ pub static REFUSED: &[(&str, &str)] = &[
     (
         "malloc_zone_register",
         "registers a zone of guest function pointers the host would call as arm64",
-    ),
-    // `kern_return_t malloc_get_all_zones(task_t, memory_reader_t *,
-    // vm_address_t **, unsigned *)` - the same shape once removed.
-    (
-        "malloc_get_all_zones",
-        "walks another task's zones through a guest reader callback",
     ),
 ];
 

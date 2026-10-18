@@ -408,6 +408,33 @@ pub unsafe extern "C" fn class_copyPropertyList(
     unsafe { copied_list(values, out_count) }
 }
 
+/// `Method *class_copyMethodList(Class, unsigned *outCount)`: the methods the
+/// class declares itself, not its superclasses', in a list the caller frees.
+pub unsafe extern "C" fn class_copyMethodList(
+    cls: *const c_void,
+    out_count: *mut u32,
+) -> *mut *const c_void {
+    let methods = unsafe { class(cls) }
+        .map(|c| c.own_methods())
+        .unwrap_or_default();
+    let values: Vec<*const c_void> = methods
+        .into_iter()
+        .map(|m| m as *const Method as *const c_void)
+        .collect();
+    // SAFETY: `out_count` is null or writable, as the C prototype requires.
+    unsafe { copied_list(values, out_count) }
+}
+
+/// `void method_exchangeImplementations(Method, Method)`: the swizzle.
+pub unsafe extern "C" fn method_exchangeImplementations(m1: *const c_void, m2: *const c_void) {
+    let (Some(m1), Some(m2)) = (unsafe { method(m1) }, unsafe { method(m2) }) else {
+        return;
+    };
+    let first = m1.implementation();
+    let second = m2.set_implementation(first);
+    m1.set_implementation(second);
+}
+
 pub unsafe extern "C" fn class_getProperty(
     cls: *const c_void,
     name: *const c_char,
