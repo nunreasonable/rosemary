@@ -1348,13 +1348,11 @@ fn say_stack_scan(out: &mut Buffer, context: *mut libc::c_void) {
         static __executable_start: u8;
         static etext: u8;
     }
-    // SAFETY: linker-provided symbols, read for their addresses only.
-    let (start, end) = unsafe {
-        (
-            &raw const __executable_start as u64,
-            &raw const etext as u64,
-        )
-    };
+    // Linker-provided symbols, read for their addresses only.
+    let (start, end) = (
+        &raw const __executable_start as u64,
+        &raw const etext as u64,
+    );
     // SAFETY: as in `say_registers`.
     let gregs = unsafe { &(*(context as *const libc::ucontext_t)).uc_mcontext.gregs };
     let rsp = gregs[libc::REG_RSP as usize] as u64;

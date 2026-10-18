@@ -1063,17 +1063,47 @@ pub unsafe extern "C" fn detach(thread: u64) -> i32 {
 /// As [`key_delete`].
 pub unsafe extern "C" fn getspecific(key: u64) -> u64 {
     // A key nobody created reads null, which is what Darwin does.
-    match u32::try_from(key) {
+    let value = match u32::try_from(key) {
         Ok(key) => crate::tls::key::Key::from_index(key).get() as usize as u64,
         Err(_) => 0,
+    };
+    if value != 0 && trace_tsd() {
+        let me = id();
+        let setters = SETTERS.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((_, _, setter)) = setters.iter().find(|(k, v, _)| *k == key && *v == value)
+            && *setter != me
+        {
+            eprintln!(
+                "rosemary: tsd: thread {me} reads key {key} = {value:#x}, which thread {setter} set"
+            );
+        }
     }
+    value
 }
+
+/// `ROSEMARY_TRACE_TSD=1`: report a thread reading a key's value that another
+/// thread stored - which per-thread data never does.
+fn trace_tsd() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("ROSEMARY_TRACE_TSD").is_some())
+}
+
+/// Under [`trace_tsd`]: who stored each `(key, value)`.
+static SETTERS: std::sync::Mutex<Vec<(u64, u64, u32)>> = std::sync::Mutex::new(Vec::new());
 
 /// # Safety
 ///
 /// As [`key_delete`]; `value` is the guest's own pointer, which only guest code
 /// dereferences.
 pub unsafe extern "C" fn setspecific(key: u64, value: u64) -> i32 {
+    if value != 0 && trace_tsd() {
+        let mut setters = SETTERS.lock().unwrap_or_else(|e| e.into_inner());
+        setters.retain(|(k, v, _)| !(*k == key && *v == value));
+        setters.push((key, value, id()));
+        if setters.len() > 100_000 {
+            setters.drain(..50_000);
+        }
+    }
     match u32::try_from(key) {
         Ok(key) => {
             crate::tls::key::Key::from_index(key).set(value as usize as *mut core::ffi::c_void)

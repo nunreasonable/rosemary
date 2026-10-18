@@ -38,6 +38,27 @@ fn fill_dyld_sections(exec: &dyn Execution) {
 }
 
 /// Run initializers and then the entry point, returning `main`'s status.
+/// `ROSEMARY_STOP_AT_START=<text>`: a process whose executable path contains
+/// `<text>` stops itself with `SIGSTOP` once its images are bound, before any
+/// of its own code runs, so that a debugger can attach before the first
+/// initializer and see everything - a process that is attached to a few
+/// seconds in has often already done the thing being looked for.
+fn stop_for_debugger() {
+    let Some(wanted) = std::env::var_os("ROSEMARY_STOP_AT_START") else {
+        return;
+    };
+    let exe = std::env::args().nth(2).unwrap_or_default();
+    if !exe.contains(&*wanted.to_string_lossy()) {
+        return;
+    }
+    eprintln!(
+        "rosemary: ROSEMARY_STOP_AT_START: process {} ({exe}) stopped for a debugger",
+        std::process::id()
+    );
+    // SAFETY: stops this process until something continues it.
+    unsafe { libc::raise(libc::SIGSTOP) };
+}
+
 pub fn run(exec: &dyn Execution) -> Result<i32, VmError> {
     // Before anything the program can fault in, which is everything below. The
     // image map goes with it.
@@ -53,6 +74,7 @@ pub fn run(exec: &dyn Execution) -> Result<i32, VmError> {
     say_image_map(exec);
     // Whatever this backend must do before any of the program's own code runs.
     exec.prepare()?;
+    stop_for_debugger();
     // Everything above is this runtime's own start-up, and a host library that
     // returns successfully is still entitled to leave `errno` wherever it likes:
     // the loader leaves `EPERM` here and `NSUserDefaults` leaves `EINVAL`. A real

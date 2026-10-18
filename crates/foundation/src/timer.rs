@@ -31,6 +31,9 @@ pub struct Timer {
     interval: f64,
     repeats: usize,
     passes_timer: usize,
+    /// The run loop it was scheduled on, as a raw `Arc`, so `-invalidate`
+    /// takes it off that loop rather than the main one.
+    run_loop: *const c_void,
 }
 
 pub const DATE_INSTANCE_SIZE: usize = size_of::<Date>();
@@ -256,13 +259,14 @@ fn make(
     }
     let object = object as Id;
     if schedule {
-        add_to_main_loop(object);
+        // `+scheduledTimer...` schedules on the calling thread's loop.
+        add_to_loop(object, corefoundation::runloop::current());
     }
     objc::arc::autorelease(object)
 }
 
-/// Schedule an already-built timer on the main run loop.
-fn add_to_main_loop(object: Id) {
+/// Schedule an already-built timer on `run_loop`.
+fn add_to_loop(object: Id, run_loop: Arc<corefoundation::runloop::RunLoop>) {
     let timer = timer_of(object);
     if !timer.timer.is_null() {
         return;
@@ -271,8 +275,8 @@ fn add_to_main_loop(object: Id) {
     let repeat = (timer.repeats != 0).then_some(interval);
     let run_loop_timer =
         corefoundation::runloop::new_timer(interval, repeat, Some(fire), object as usize);
-    corefoundation::runloop::main()
-        .add_timer(&run_loop_timer, corefoundation::runloop::DEFAULT_MODE);
+    run_loop.add_timer(&run_loop_timer, corefoundation::runloop::DEFAULT_MODE);
+    timer.run_loop = Arc::into_raw(run_loop) as *const c_void;
     // Kept alive by the object, and by the table: a scheduled timer outlives
     // the reference the program holds.
     objc::arc::retain(object);
@@ -407,8 +411,14 @@ unsafe extern "C" fn invalidate(receiver: Id, _sel: Sel) {
     let run_loop_timer =
         unsafe { Arc::from_raw(timer.timer as *const corefoundation::runloop::Timer) };
     timer.timer = std::ptr::null();
-    corefoundation::runloop::main()
-        .remove_timer(&run_loop_timer, corefoundation::runloop::DEFAULT_MODE);
+    let run_loop = match std::mem::replace(&mut timer.run_loop, std::ptr::null()) {
+        // SAFETY: the `Arc` `add_to_loop` leaked into the object, taken once.
+        loop_ if !loop_.is_null() => unsafe {
+            Arc::from_raw(loop_ as *const corefoundation::runloop::RunLoop)
+        },
+        _ => corefoundation::runloop::main(),
+    };
+    run_loop.remove_timer(&run_loop_timer, corefoundation::runloop::DEFAULT_MODE);
     run_loop_timer.invalidate();
     SCHEDULED
         .lock()
@@ -438,40 +448,78 @@ unsafe extern "C" fn fire_date(receiver: Id, _sel: Sel) -> Id {
     date(now() + timer_of(receiver).interval)
 }
 
-/// The one run loop object, which `+currentRunLoop` and `+mainRunLoop` answer.
-///
-/// One rather than one per thread: `corefoundation::runloop::main` is what every
-/// method here acts on, so two objects would be two names for the same loop and
-/// a program comparing them would be told they were different.
-static RUN_LOOP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-
-unsafe extern "C" fn current_run_loop(class: Id, _sel: Sel) -> Id {
-    *RUN_LOOP.get_or_init(|| {
-        // SAFETY: `class` is `NSRunLoop`, which this module registered.
-        let object = unsafe {
-            objc::object::create_instance(
-                objc::class::from_ptr(class as *const objc::class::Class).expect("a class"),
-                0,
-            )
-        };
-        objc::arc::retain(object);
-        object as usize
-    }) as Id
+/// An `NSRunLoop`: the Core Foundation loop it stands for, as a raw `Arc`.
+#[repr(C)]
+struct RunLoopObject {
+    isa: *const c_void,
+    run_loop: *const corefoundation::runloop::RunLoop,
 }
 
-unsafe extern "C" fn add_timer_for_mode(_receiver: Id, _sel: Sel, timer: Id, _mode: Id) {
+/// One object per loop, by the loop's address: a program comparing
+/// `+currentRunLoop` with `+mainRunLoop` on the main thread is told they are
+/// the same object, and on another thread that they are not.
+static RUN_LOOPS: std::sync::Mutex<Vec<(usize, usize)>> = std::sync::Mutex::new(Vec::new());
+
+fn object_for(class: Id, run_loop: Arc<corefoundation::runloop::RunLoop>) -> Id {
+    let key = Arc::as_ptr(&run_loop) as usize;
+    let mut objects = RUN_LOOPS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((_, object)) = objects.iter().find(|(l, _)| *l == key) {
+        return *object as Id;
+    }
+    let class = unsafe { objc::class::from_ptr(class as *const objc::class::Class) }
+        .or_else(|| objc::class::lookup(c"NSRunLoop"))
+        .expect("NSRunLoop is registered");
+    let object = objc::object::create_instance(class, 0);
+    objc::arc::make_immortal(object);
+    // SAFETY: an instance of this module's layout.
+    unsafe { (*(object as *mut RunLoopObject)).run_loop = Arc::into_raw(run_loop) };
+    objects.push((key, object as usize));
+    object
+}
+
+/// The loop an `NSRunLoop` stands for.
+fn loop_of(receiver: Id) -> Arc<corefoundation::runloop::RunLoop> {
+    // SAFETY: an instance of this module's layout, whose `Arc` it keeps for
+    // the life of the process.
+    let raw = unsafe { (*(receiver as *const RunLoopObject)).run_loop };
+    if raw.is_null() {
+        return corefoundation::runloop::main();
+    }
+    unsafe {
+        Arc::increment_strong_count(raw);
+        Arc::from_raw(raw)
+    }
+}
+
+unsafe extern "C" fn current_run_loop(class: Id, _sel: Sel) -> Id {
+    object_for(class, corefoundation::runloop::current())
+}
+
+unsafe extern "C" fn main_run_loop(class: Id, _sel: Sel) -> Id {
+    object_for(class, corefoundation::runloop::main())
+}
+
+/// `-getCFRunLoop`: the loop itself, which is what `CFRunLoopGetCurrent`
+/// answers on that loop's thread.
+unsafe extern "C" fn get_cf_run_loop(receiver: Id, _sel: Sel) -> *const c_void {
+    Arc::as_ptr(&loop_of(receiver)) as *const c_void
+}
+
+unsafe extern "C" fn add_timer_for_mode(receiver: Id, _sel: Sel, timer: Id, _mode: Id) {
     if !timer.is_null() {
-        add_to_main_loop(timer);
+        add_to_loop(timer, loop_of(receiver));
     }
 }
 
 /// `-runMode:beforeDate:`, which is `CFRunLoopRunInMode` under another name.
-unsafe extern "C" fn run_mode_before_date(_receiver: Id, _sel: Sel, _mode: Id, limit: Id) -> u8 {
+unsafe extern "C" fn run_mode_before_date(receiver: Id, _sel: Sel, _mode: Id, limit: Id) -> u8 {
     let seconds = match limit.is_null() {
         true => 0.0,
         false => (date_of(limit) - now()).max(0.0),
     };
-    let result = corefoundation::runloop::main().run_in_mode(
+    // The receiver's loop: a thread running its own `+currentRunLoop` must
+    // not run the main thread's sources.
+    let result = loop_of(receiver).run_in_mode(
         corefoundation::runloop::DEFAULT_MODE,
         seconds,
         true,
@@ -543,12 +591,13 @@ pub(crate) fn install() {
     });
 
     let run_loop =
-        corefoundation::base::register(c"NSRunLoop", None, std::mem::size_of::<usize>(), false);
+        corefoundation::base::register(c"NSRunLoop", None, size_of::<RunLoopObject>(), false);
     class_methods!(run_loop, {
         "currentRunLoop" => current_run_loop, c"@16@0:8";
-        "mainRunLoop" => current_run_loop, c"@16@0:8";
+        "mainRunLoop" => main_run_loop, c"@16@0:8";
     });
     methods!(run_loop, {
+        "getCFRunLoop" => get_cf_run_loop, c"^{__CFRunLoop=}16@0:8";
         "addTimer:forMode:" => add_timer_for_mode, c"v32@0:8@16@24";
         "runMode:beforeDate:" => run_mode_before_date, c"B32@0:8@16@24";
         "runUntilDate:" => run_until_date, c"v24@0:8@16";
@@ -671,7 +720,7 @@ mod tests {
             if REPEATED.load(Ordering::SeqCst) >= 2 {
                 break;
             }
-            corefoundation::runloop::main().run_in_mode(
+            corefoundation::runloop::current().run_in_mode(
                 corefoundation::runloop::DEFAULT_MODE,
                 0.01,
                 false,
@@ -687,7 +736,7 @@ mod tests {
         assert_eq!(unsafe { is_valid(timer, objc::sel::get("isValid")) }, 0);
         let after = REPEATED.load(Ordering::SeqCst);
         for _ in 0..5 {
-            corefoundation::runloop::main().run_in_mode(
+            corefoundation::runloop::current().run_in_mode(
                 corefoundation::runloop::DEFAULT_MODE,
                 0.01,
                 false,
@@ -722,7 +771,7 @@ mod tests {
             if ONCE.load(Ordering::SeqCst) >= 1 {
                 break;
             }
-            corefoundation::runloop::main().run_in_mode(
+            corefoundation::runloop::current().run_in_mode(
                 corefoundation::runloop::DEFAULT_MODE,
                 0.01,
                 false,
