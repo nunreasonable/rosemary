@@ -10,6 +10,7 @@ use crate::window;
 /// about when the event names no window this crate made.
 pub fn pump(app: Id) {
     let _ = app;
+    trace_pump();
     // Before anything else: a thread waiting for a GL context this one holds is
     // a thread that is not drawing, and reaching here is what says this one has
     // finished with it. See `opengl::release_for_other_threads`.
@@ -1289,6 +1290,28 @@ pub(crate) fn object_for(id: u32) -> Id {
 /// path, so a breakpoint cannot answer it either. This is the answer: the name,
 /// the window, its delegate, and whether that delegate implements the method.
 pub const TRACE_ENV: &str = "ROSEMARY_TRACE_EVENT";
+
+/// `ROSEMARY_TRACE_PUMP=1`: say how often the event pump turns, once a second.
+///
+/// A window that never appears is, first of all, a question of whether this
+/// pump runs at all: it is what draws and presents every window, and a program
+/// that turns its main loop some way this runtime does not pump from leaves
+/// them all blank without any other symptom.
+fn trace_pump() {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("ROSEMARY_TRACE_PUMP").is_some()) {
+        return;
+    }
+    static STATE: std::sync::Mutex<Option<(std::time::Instant, u64)>> = std::sync::Mutex::new(None);
+    let mut state = STATE.lock().unwrap_or_else(|e| e.into_inner());
+    let (since, turns) = state.get_or_insert_with(|| (std::time::Instant::now(), 0));
+    *turns += 1;
+    if since.elapsed().as_secs_f64() >= 1.0 {
+        eprintln!("rosemary: appkit: event pump turned {turns} time(s) in the last second");
+        *since = std::time::Instant::now();
+        *turns = 0;
+    }
+}
 
 pub(crate) fn tracing() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();

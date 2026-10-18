@@ -1,7 +1,7 @@
 use std::ffi::c_void;
 use std::{cell::RefCell, ptr};
 
-use foundation::geometry::{NSRect, NSSize};
+use foundation::geometry::{NSPoint, NSRect, NSSize};
 use objc::object::Id;
 use objc::sel::Sel;
 
@@ -904,6 +904,18 @@ unsafe extern "C" fn draw_in_rect(
     draw(receiver, sel, destination, from, operation, fraction, false);
 }
 
+/// `-drawInRect:`: the whole image, source-over and opaque, respecting a
+/// flipped context - which is what AppKit documents it as shorthand for.
+unsafe extern "C" fn draw_in_rect_simple(receiver: Id, sel: Sel, destination: NSRect) {
+    /// `NSCompositingOperationSourceOver`.
+    const SOURCE_OVER: usize = 2;
+    let whole = NSRect {
+        origin: NSPoint { x: 0.0, y: 0.0 },
+        size: NSSize { width: 0.0, height: 0.0 },
+    };
+    draw(receiver, sel, destination, whole, SOURCE_OVER, 1.0, true);
+}
+
 /// Everything that still needs a decoded raster this module cannot produce.
 ///
 /// One implementation for the whole family, naming the selector it was reached
@@ -992,6 +1004,7 @@ pub(crate) fn install() {
     methods!(class, {
         "lockFocus" => lock_focus, c"v16@0:8";
         "unlockFocus" => unlock_focus, c"v16@0:8";
+        "drawInRect:" => draw_in_rect_simple, c"v48@0:8{CGRect={CGPoint=dd}{CGSize=dd}}16";
         "drawInRect:fromRect:operation:fraction:" => draw_in_rect,
             c"v96@0:8{CGRect={CGPoint=dd}{CGSize=dd}}16{CGRect={CGPoint=dd}{CGSize=dd}}48Q80d88";
         "drawInRect:fromRect:operation:fraction:respectFlipped:hints:" =>
@@ -1186,10 +1199,11 @@ pub mod bitmap {
         has_alpha: u8,
         is_planar: u8,
         _colour_space: Id,
-        _format: usize,
+        format: usize,
         bytes_per_row: isize,
         bits_per_pixel: isize,
     ) -> Id {
+        remember_format(receiver, format);
         if is_planar != 0 {
             objc::fail!(
                 "-[NSBitmapImageRep initWithBitmapDataPlanes:...]: a planar rep keeps each \
@@ -1333,6 +1347,33 @@ pub mod bitmap {
         }
     }
 
+/// Each rep's `NSBitmapFormat`, by address: kept beside the rep rather than in
+    /// it, so the instance size a guest subclass lays out after stays the same.
+    static FORMATS: std::sync::Mutex<Vec<(usize, usize)>> = std::sync::Mutex::new(Vec::new());
+
+    fn remember_format(receiver: Id, format: usize) {
+        let mut formats = FORMATS.lock().unwrap_or_else(|e| e.into_inner());
+        formats.retain(|(rep, _)| *rep != receiver as usize);
+        if format != 0 {
+            formats.push((receiver as usize, format));
+        }
+    }
+
+    /// The `NSBitmapFormat` a rep was made with: zero, AppKit's default, for
+    /// every rep but one made from planes with a format of its own.
+    pub fn format_of(receiver: Id) -> usize {
+        FORMATS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .find(|(rep, _)| *rep == receiver as usize)
+            .map_or(0, |(_, format)| *format)
+    }
+
+    unsafe extern "C" fn bitmap_format(receiver: Id, _sel: Sel) -> usize {
+        format_of(receiver)
+    }
+
     unsafe extern "C" fn pixels_wide(receiver: Id, _sel: Sel) -> isize {
         rep_of(receiver).width as isize
     }
@@ -1428,6 +1469,7 @@ pub mod bitmap {
             "bitmapData" => bitmap_data, c"^v16@0:8";
             "CGImage" => cg_image, c"^{CGImage=}16@0:8";
             "pixelsWide" => pixels_wide, c"q16@0:8";
+            "bitmapFormat" => bitmap_format, c"Q16@0:8";
             "pixelsHigh" => pixels_high, c"q16@0:8";
             "samplesPerPixel" => samples_per_pixel, c"q16@0:8";
             "bitsPerSample" => bits_per_sample, c"q16@0:8";

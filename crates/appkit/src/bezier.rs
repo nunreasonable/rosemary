@@ -87,6 +87,10 @@ unsafe extern "C" fn save_graphics_state(_receiver: Id, _sel: Sel) {
 }
 
 unsafe extern "C" fn restore_graphics_state(_receiver: Id, _sel: Sel) {
+    // The context a program made current between its save and this restore
+    // stops being current, which for a bitmap context is when its drawing
+    // lands in the rep.
+    crate::backing::end_capture();
     with_state(|states, _| {
         let n = states.len();
         // Only a state this focus saved: restoring past the start of a

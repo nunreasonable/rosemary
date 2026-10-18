@@ -1248,7 +1248,34 @@ unsafe extern "C" fn set_content_size(receiver: Id, _sel: Sel, size: NSSize) {
     }
 }
 
-unsafe extern "C" fn content_view(receiver: Id, _sel: Sel) -> Id {
+/// `-contentView`, which on a Mac is never nil for a window that was
+/// initialised: `-initWithContentRect:...` gives it a plain `NSView` the size
+/// of its content, and a program builds its interface by adding subviews to
+/// that. Made here, the first time it is asked for, rather than at init - so a
+/// program that sets its own content view first never has one made for it.
+/// Without it `[[window contentView] addSubview:]` is a message to nil, and
+/// the window stays empty and is never drawn, with nothing to say why.
+unsafe extern "C" fn content_view(receiver: Id, sel: Sel) -> Id {
+    let existing = window_of(receiver).content_view;
+    if !existing.is_null() || window_of(receiver).sdl.is_null() {
+        return existing;
+    }
+    // SAFETY: an initialised window of this crate's.
+    let content = unsafe { content_rect_for_frame(receiver, sel, frame(receiver, sel)) };
+    let bounds = NSRect {
+        origin: NSPoint { x: 0.0, y: 0.0 },
+        size: content.size,
+    };
+    let Some(class) = objc::class::lookup(c"NSView") else {
+        return existing;
+    };
+    let view = objc::object::create_instance(class, 0);
+    // SAFETY: `msg::entry` with `-initWithFrame:`, `id (id, SEL, NSRect)`.
+    let init: unsafe extern "C" fn(Id, Sel, NSRect) -> Id = unsafe { std::mem::transmute(objc::msg::entry()) };
+    let view = unsafe { init(view, objc::sel::get("initWithFrame:"), bounds) };
+    // SAFETY: a live window and view; the window takes its own reference.
+    unsafe { set_content_view(receiver, objc::sel::get("setContentView:"), view) };
+    objc::arc::release(view);
     window_of(receiver).content_view
 }
 

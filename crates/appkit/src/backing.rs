@@ -1847,7 +1847,23 @@ fn release_context_override_above(depth: usize) {
 }
 
 unsafe extern "C" fn set_current_context(_class: Id, _sel: Sel, context: Id) {
+    if CAPTURE.with(Cell::get).is_some_and(|(current, _)| current != context as usize) {
+        end_capture();
+    }
+    if !context.is_null()
+        && CAPTURE.with(Cell::get).is_none()
+        && let Some(rep) = rep_of_context(context)
+    {
+        begin_capture(context, rep);
+    }
     set_thread_current_context(context);
+}
+
+/// `-flushGraphics`: a bitmap context's drawing reaches its rep now.
+unsafe extern "C" fn flush_graphics(receiver: Id, _sel: Sel) {
+    if CAPTURE.with(Cell::get).is_some_and(|(current, _)| current == receiver as usize) {
+        flush_capture();
+    }
 }
 
 unsafe extern "C" fn current_context(_class: Id, _sel: Sel) -> Id {
@@ -1946,7 +1962,165 @@ unsafe extern "C" fn context_with_bitmap(_class: Id, _sel: Sel, rep: Id) -> Id {
     let context = context_over(cg);
     // SAFETY: the reference `CGBitmapContextCreate` gave; the context kept its own.
     unsafe { corefoundation::api::CFRelease(cg) };
+    BITMAP_REPS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push((context as usize, objc::arc::retain(rep) as usize));
     context
+}
+
+/// The rep each context made by `+graphicsContextWithBitmapImageRep:` draws
+/// into, retained, by the context's address.
+static BITMAP_REPS: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
+
+thread_local! {
+    /// The bitmap context this thread is drawing into now, and its rep: AppKit
+    /// drawing - strings, images, paths - goes to an offscreen store keyed by
+    /// the context while it is current, and back into the rep's pixels when it
+    /// stops being current.
+    static CAPTURE: Cell<Option<(usize, usize)>> = const { Cell::new(None) };
+}
+
+fn rep_of_context(context: Id) -> Option<usize> {
+    BITMAP_REPS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .rev()
+        .find(|(c, _)| *c == context as usize)
+        .map(|(_, rep)| *rep)
+}
+
+/// Where each of R, G, B and A sits in one of a rep's four-byte pixels, and
+/// whether its colours are premultiplied, from its `NSBitmapFormat`.
+fn rep_layout(format: usize) -> ([usize; 4], bool) {
+    const ALPHA_FIRST: usize = 1 << 0;
+    const NON_PREMULTIPLIED: usize = 1 << 1;
+    const LITTLE_ENDIAN_32: usize = 1 << 9;
+    // Byte order in memory for each channel, as R, G, B, A.
+    let mut order = match format & ALPHA_FIRST != 0 {
+        true => [1, 2, 3, 0],
+        false => [0, 1, 2, 3],
+    };
+    if format & LITTLE_ENDIAN_32 != 0 {
+        for at in &mut order {
+            *at = 3 - *at;
+        }
+    }
+    (order, format & NON_PREMULTIPLIED == 0)
+}
+
+/// A rep's pixels as a store's: premultiplied B, G, R, A, top row first.
+fn read_rep(rep: Id) -> Option<Store> {
+    let data: *mut u8 = send0(rep, "bitmapData");
+    let width: isize = send0(rep, "pixelsWide");
+    let height: isize = send0(rep, "pixelsHigh");
+    let stride: isize = send0(rep, "bytesPerRow");
+    let samples: isize = send0(rep, "samplesPerPixel");
+    if data.is_null() || width <= 0 || height <= 0 || !matches!(samples, 3 | 4) {
+        return None;
+    }
+    let (order, premultiplied) = rep_layout(crate::image::bitmap::format_of(rep));
+    let mut store = Store::new(width as u32, height as u32);
+    for y in 0..height as usize {
+        // SAFETY: a row of the rep's buffer, `stride` bytes.
+        let row = unsafe { std::slice::from_raw_parts(data.add(y * stride as usize), stride as usize) };
+        for x in 0..width as usize {
+            let at = &mut store.pixels[(y * width as usize + x) * 4..][..4];
+            let (r, g, b, a) = match samples {
+                3 => (row[x * 3], row[x * 3 + 1], row[x * 3 + 2], 255),
+                _ => {
+                    let pixel = &row[x * 4..x * 4 + 4];
+                    (pixel[order[0]], pixel[order[1]], pixel[order[2]], pixel[order[3]])
+                }
+            };
+            let scale = |c: u8| match premultiplied {
+                true => c,
+                false => ((u16::from(c) * u16::from(a) + 127) / 255) as u8,
+            };
+            at.copy_from_slice(&[scale(b), scale(g), scale(r), a]);
+        }
+    }
+    Some(store)
+}
+
+/// Write `store` back into the rep's own pixels, in the rep's layout.
+fn write_rep(rep: Id, store: &Store) {
+    let data: *mut u8 = send0(rep, "bitmapData");
+    let width: isize = send0(rep, "pixelsWide");
+    let height: isize = send0(rep, "pixelsHigh");
+    let stride: isize = send0(rep, "bytesPerRow");
+    let samples: isize = send0(rep, "samplesPerPixel");
+    if data.is_null()
+        || width as u32 != store.width
+        || height as u32 != store.height
+        || !matches!(samples, 3 | 4)
+    {
+        return;
+    }
+    let (order, premultiplied) = rep_layout(crate::image::bitmap::format_of(rep));
+    for y in 0..height as usize {
+        // SAFETY: a row of the rep's buffer, `stride` bytes.
+        let row = unsafe { std::slice::from_raw_parts_mut(data.add(y * stride as usize), stride as usize) };
+        for x in 0..width as usize {
+            let from = &store.pixels[(y * width as usize + x) * 4..][..4];
+            let (b, g, r, a) = (from[0], from[1], from[2], from[3]);
+            let scale = |c: u8| match (premultiplied, a) {
+                (true, _) | (false, 255) => c,
+                (false, 0) => 0,
+                (false, a) => ((u16::from(c) * 255 + u16::from(a) / 2) / u16::from(a)).min(255) as u8,
+            };
+            match samples {
+                3 => row[x * 3..x * 3 + 3].copy_from_slice(&[scale(r), scale(g), scale(b)]),
+                _ => {
+                    let pixel = &mut row[x * 4..x * 4 + 4];
+                    pixel[order[0]] = scale(r);
+                    pixel[order[1]] = scale(g);
+                    pixel[order[2]] = scale(b);
+                    pixel[order[3]] = a;
+                }
+            }
+        }
+    }
+}
+
+/// Begin sending this thread's AppKit drawing into `context`'s rep.
+fn begin_capture(context: Id, rep: usize) {
+    let Some(seed) = read_rep(rep as Id) else {
+        return;
+    };
+    let (width, height) = (seed.width, seed.height);
+    begin_offscreen(context as usize, width, height, 1.0, false);
+    if let Some(store) = OFFSCREEN
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_mut()
+        .and_then(|stores| stores.get_mut(&(context as usize)))
+    {
+        store.pixels = seed.pixels;
+    }
+    CAPTURE.with(|c| c.set(Some((context as usize, rep))));
+}
+
+/// Copy what has been drawn so far into the rep, keeping the capture.
+fn flush_capture() {
+    let Some((context, rep)) = CAPTURE.with(Cell::get) else {
+        return;
+    };
+    let offscreen = OFFSCREEN.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(store) = offscreen.as_ref().and_then(|stores| stores.get(&context)) {
+        write_rep(rep as Id, store);
+    }
+}
+
+/// Stop capturing, leaving what was drawn in the rep.
+pub(crate) fn end_capture() {
+    let Some((context, rep)) = CAPTURE.with(|c| c.take()) else {
+        return;
+    };
+    if let Some(store) = end_offscreen(context) {
+        write_rep(rep as Id, &store);
+    }
 }
 
 /// `+graphicsContextWithCGContext:flipped:`.
@@ -1968,8 +2142,6 @@ unsafe extern "C" fn cg_context(receiver: Id, _sel: Sel) -> *const c_void {
         .find(|(context, _)| *context == receiver as usize)
         .map_or(std::ptr::null(), |(_, cg)| *cg as *const c_void)
 }
-
-unsafe extern "C" fn ignored(_receiver: Id, _sel: Sel) {}
 
 unsafe extern "C" fn ignored_integer(_receiver: Id, _sel: Sel, _value: isize) {}
 
@@ -2013,7 +2185,7 @@ pub(crate) fn install() {
         "isFlipped" => context_is_flipped, c"c16@0:8";
         "CGContext" => cg_context, c"^v16@0:8";
         "graphicsPort" => cg_context, c"^v16@0:8";
-        "flushGraphics" => ignored, c"v16@0:8";
+        "flushGraphics" => flush_graphics, c"v16@0:8";
         "compositingOperation" => zero, c"q16@0:8";
         "setCompositingOperation:" => ignored_integer, c"v24@0:8q16";
     });
