@@ -24,6 +24,23 @@ unsafe extern "C" fn snprintf_l(
     unsafe { vsnprintf(buffer, size, format, args) }
 }
 
+/// `int vsnprintf_l(char *, size_t, locale_t, const char *, va_list)`
+///
+/// # Safety
+///
+/// As [`snprintf_l`], with the arguments already gathered in `args`.
+unsafe extern "C" fn vsnprintf_l(
+    buffer: *mut c_char,
+    size: usize,
+    locale: libc::locale_t,
+    format: *const c_char,
+    args: VaList,
+) -> c_int {
+    let _switched = crate::xlocale::switch(locale);
+    // SAFETY: the caller's buffer, format and argument list.
+    unsafe { vsnprintf(buffer, size, format, args) }
+}
+
 /// `int sscanf_l(const char *, locale_t, const char *, ...)`
 ///
 /// # Safety
@@ -89,6 +106,7 @@ unsafe extern "C" fn asprintf_l(
 exports::exports! {
     functions {
         "snprintf_l" => snprintf_l,
+        "vsnprintf_l" => vsnprintf_l,
         "sscanf_l" => sscanf_l,
         "asprintf_l" => asprintf_l,
     }

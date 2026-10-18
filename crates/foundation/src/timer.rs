@@ -484,6 +484,14 @@ unsafe extern "C" fn run_until_date(receiver: Id, sel: Sel, limit: Id) {
     unsafe { run_mode_before_date(receiver, sel, std::ptr::null_mut(), limit) };
 }
 
+/// `-setTolerance:`: how late the timer may fire, a hint for coalescing wake-ups
+/// that a timer here, which fires when it is due, has no use for.
+unsafe extern "C" fn set_tolerance(_receiver: Id, _sel: Sel, _tolerance: f64) {}
+
+unsafe extern "C" fn tolerance(_receiver: Id, _sel: Sel) -> f64 {
+    0.0
+}
+
 pub(crate) fn install() {
     let nsobject = objc::class::lookup(c"NSObject").expect("the runtime's own NSObject");
     methods!(nsobject, {
@@ -525,6 +533,8 @@ pub(crate) fn install() {
     });
     methods!(timer_class, {
         "invalidate" => invalidate, c"v16@0:8";
+        "setTolerance:" => set_tolerance, c"v24@0:8d16";
+        "tolerance" => tolerance, c"d16@0:8";
         "isValid" => is_valid, c"B16@0:8";
         "fire" => timer_fire, c"v16@0:8";
         "userInfo" => user_info, c"@16@0:8";

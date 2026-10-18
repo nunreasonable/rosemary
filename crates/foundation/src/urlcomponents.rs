@@ -267,6 +267,9 @@ unsafe extern "C" fn dealloc(receiver: Id, _sel: Sel) {
 }
 
 pub(crate) fn install() {
+    // Registered now rather than at first use, so that it is there when the
+    // class symbols are published.
+    query_item_class();
     let class = corefoundation::base::register(c"NSURLComponents", None, size_of::<Body>(), false);
     methods!(class, {
         "init" => init, c"@16@0:8";

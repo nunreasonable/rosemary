@@ -148,11 +148,66 @@ unsafe fn attribute(query: CFTypeRef, key: &str) -> Option<String> {
 ///
 /// `query` must be null or a `CFDictionary`.
 unsafe fn identity_of(query: CFTypeRef) -> Identity {
+    let class = unsafe { attribute(query, "class") }.unwrap_or_else(|| "genp".to_string());
+    if class == "keys" {
+        // A key is found by its application tag, which is bytes.
+        let tag = unsafe { crate::key::bytes_of(crate::key::value(query, "atag")) };
+        return key_identity(&tag.unwrap_or_default());
+    }
     Identity {
-        class: unsafe { attribute(query, "class") }.unwrap_or_else(|| "genp".to_string()),
+        class,
         service: unsafe { attribute(query, "svce") }.unwrap_or_default(),
         account: unsafe { attribute(query, "acct") }.unwrap_or_default(),
     }
+}
+
+fn key_identity(tag: &[u8]) -> Identity {
+    Identity {
+        class: "keys".to_string(),
+        service: String::new(),
+        account: to_hex(tag),
+    }
+}
+
+/// Store a permanent key under its tag, as `SecKeyCreateRandomKey` does for
+/// `kSecAttrIsPermanent`. An existing key under the tag is kept.
+pub(crate) fn store_key(tag: &[u8], pkcs8: &[u8]) {
+    let mut items = items();
+    if items.contains_key(&key_identity(tag)) {
+        return;
+    }
+    items.insert(key_identity(tag), pkcs8.to_vec());
+    save(&items);
+}
+
+/// The answer to a query for a key: the key itself for `kSecReturnRef`, its
+/// attributes for `kSecReturnAttributes`, and its external representation for
+/// `kSecReturnData`.
+///
+/// # Safety
+///
+/// `query` is a `CFDictionary`; `result` is writable.
+unsafe fn key_result(query: CFTypeRef, identity: &Identity, pkcs8: Vec<u8>, result: *mut CFTypeRef) -> OSStatus {
+    let tag = from_hex(&identity.account);
+    let key = crate::key::from_stored(pkcs8, tag);
+    if key.is_null() {
+        return ITEM_NOT_FOUND;
+    }
+    let object = if unsafe { flag(query, "r_Ref") } {
+        key
+    } else {
+        let object = if unsafe { flag(query, "r_Attributes") } {
+            unsafe { crate::key::copy_attributes(key) }
+        } else {
+            unsafe { crate::key::SecKeyCopyExternalRepresentation(key, std::ptr::null_mut()) }
+        };
+        // SAFETY: the key this call made.
+        unsafe { corefoundation::api::CFRelease(key) };
+        object
+    };
+    // SAFETY: writable, per the caller.
+    unsafe { result.write(object) };
+    SUCCESS
 }
 
 /// The bytes of the `kSecValueData` in `query`, if it has one.
@@ -161,6 +216,11 @@ unsafe fn identity_of(query: CFTypeRef) -> Identity {
 ///
 /// `query` must be null or a `CFDictionary`.
 unsafe fn value_data(query: CFTypeRef) -> Option<Vec<u8>> {
+    // A key is stored as its private key document.
+    let reference = unsafe { crate::key::value(query, "v_Ref") };
+    if let Some((pkcs8, _)) = unsafe { crate::key::private_parts(reference) } {
+        return Some(pkcs8);
+    }
     let name = foundation::string::from_str("v_Data");
     let value = unsafe { corefoundation::api::CFDictionaryGetValue(query, name as CFTypeRef) };
     // SAFETY: a fresh string this call owns.
@@ -247,6 +307,10 @@ pub unsafe extern "C" fn SecItemCopyMatching(query: CFTypeRef, result: *mut CFTy
         // A query with no out parameter is asking only whether the item is
         // there, which it is.
         return SUCCESS;
+    }
+    if identity.class == "keys" {
+        // SAFETY: the caller's obligation.
+        return unsafe { key_result(query, &identity, data, result) };
     }
     let object = corefoundation::collections::new_data(data);
     // SAFETY: a `Copy`, so the caller owns what it is handed.

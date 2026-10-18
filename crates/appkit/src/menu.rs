@@ -594,6 +594,10 @@ unsafe extern "C" fn zero_width(_receiver: Id, _sel: Sel) -> f64 {
     0.0
 }
 
+/// `-_setHasPadding:onEdge:`, private API Chromium calls to trim the space
+/// above and below a menu's items. Menus here have no padding to trim.
+unsafe extern "C" fn ignored_padding(_receiver: Id, _sel: Sel, _padding: u8, _edge: u64) {}
+
 pub(crate) fn install() {
     let menu = objc::class::lookup(c"NSMenu").expect("declared before its methods");
     class_methods!(menu, {
@@ -625,6 +629,7 @@ pub(crate) fn install() {
         "autoenablesItems" => autoenables_items, c"c16@0:8";
         "setAutoenablesItems:" => set_autoenables_items, c"v20@0:8c16";
         "setMinimumWidth:" => ignored_width, c"v24@0:8d16";
+        "_setHasPadding:onEdge:" => ignored_padding, c"v28@0:8c16Q20";
         "minimumWidth" => zero_width, c"d16@0:8";
         "update" => update, c"v16@0:8";
         "performKeyEquivalent:" => perform_key_equivalent, c"c24@0:8@16";

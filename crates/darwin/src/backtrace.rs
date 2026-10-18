@@ -11,6 +11,14 @@ use std::ptr;
 const MAX_FRAMES: usize = 1 << 16;
 
 #[inline(never)]
+/// `int backtrace_from_fp(void *startfp, void **array, int size)`: a walk from a
+/// frame the caller names, which crash reporters use on another thread's stack.
+/// No frames, as for a stack that could not be walked: the program's own
+/// reporter is then left with what it captured itself.
+pub unsafe extern "C" fn backtrace_from_fp(_frame: *mut c_void, _array: *mut *mut c_void, _size: c_int) -> c_int {
+    0
+}
+
 pub unsafe extern "C" fn backtrace(array: *mut *mut c_void, size: c_int) -> c_int {
     if array.is_null() || size <= 0 {
         return 0;
@@ -198,6 +206,7 @@ fn write_all(fd: c_int, mut bytes: &[u8]) {
 exports::exports! {
     functions {
         "backtrace" => backtrace,
+        "backtrace_from_fp" => backtrace_from_fp,
         "backtrace_symbols" => backtrace_symbols,
         "backtrace_symbols_fd" => backtrace_symbols_fd,
     }

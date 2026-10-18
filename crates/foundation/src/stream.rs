@@ -176,6 +176,7 @@ pub const CLASSES: &[&str] = &[
     "NSInputStream",
     "NSURLSessionConfiguration",
     "SBApplication",
+    "NSURLQueryItem",
 ];
 
 pub(crate) fn install() {

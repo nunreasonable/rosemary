@@ -26,6 +26,7 @@ pub mod classes;
 pub mod color;
 mod controls;
 mod coreanimation;
+pub mod accessibility;
 pub mod coretext;
 pub mod cursor;
 pub(crate) mod decode;
@@ -64,6 +65,7 @@ pub mod screen;
 pub mod script;
 mod scroll;
 mod segmented;
+mod statusbar;
 mod tab;
 mod table;
 pub mod text;
@@ -88,6 +90,7 @@ pub fn bootstrap() {
         application::install();
         nib::install();
         dock::install();
+        statusbar::install();
         workspace::install();
         color::install();
         graphics::install();
@@ -215,6 +218,11 @@ exports::exports! {
         "CGColorSpaceCopyPropertyList" => graphics::CGColorSpaceCopyPropertyList,
         "CGDataProviderCreateWithData" => graphics::CGDataProviderCreateWithData,
         "CGDataProviderCreateWithCFData" => graphics::CGDataProviderCreateWithCFData,
+        "AXIsProcessTrusted" => accessibility::AXIsProcessTrusted,
+        "AXIsProcessTrustedWithOptions" => accessibility::AXIsProcessTrustedWithOptions,
+        "CGEventTapCreate" => accessibility::CGEventTapCreate,
+        "CGEventTapEnable" => accessibility::CGEventTapEnable,
+        "CGEventGetIntegerValueField" => accessibility::CGEventGetIntegerValueField,
         "CGDataProviderRelease" => graphics::CGDataProviderRelease,
         "CGImageCreate" => graphics::CGImageCreate,
         "CGImageCreateCopyWithColorSpace" => graphics::CGImageCreateCopyWithColorSpace,
@@ -526,6 +534,7 @@ pub const STRING_GLOBALS: &[(&str, &str)] = &[
     ("_NSDeviceSize", "NSDeviceSize"),
     ("_NSModalPanelRunLoopMode", "NSModalPanelRunLoopMode"),
     ("_NSEventTrackingRunLoopMode", "NSEventTrackingRunLoopMode"),
+    ("_kAXTrustedCheckOptionPrompt", "AXTrustedCheckOptionPrompt"),
     // The pasteboard's plain-text type, under both its spellings: the modern one
     // is a uniform type identifier and the deprecated one is not, and a program
     // that writes with one and reads with the other has to name the same type.

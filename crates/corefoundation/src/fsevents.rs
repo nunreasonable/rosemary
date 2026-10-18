@@ -55,6 +55,11 @@ pub unsafe extern "C" fn create(
 
 pub unsafe extern "C" fn set_dispatch_queue(_stream: *const Stream, _queue: *mut c_void) {}
 
+/// `FSEventStreamScheduleWithRunLoop`, and its undoing: as with a dispatch
+/// queue, where the stream's callbacks would arrive is not used, since the
+/// stream reports what `start` reports.
+pub unsafe extern "C" fn schedule_with_run_loop(_stream: *const Stream, _run_loop: *mut c_void, _mode: *mut c_void) {}
+
 pub unsafe extern "C" fn start(stream: *const Stream) -> u8 {
     // SAFETY: FSEvents requires a live stream reference.
     let Some(stream) = (unsafe { stream.as_ref() }) else {
@@ -100,6 +105,8 @@ exports::exports! {
     functions {
         "FSEventStreamCreate" => create,
         "FSEventStreamSetDispatchQueue" => set_dispatch_queue,
+        "FSEventStreamScheduleWithRunLoop" => schedule_with_run_loop,
+        "FSEventStreamUnscheduleFromRunLoop" => schedule_with_run_loop,
         "FSEventStreamStart" => start,
         "FSEventStreamStop" => stop,
         "FSEventStreamFlushSync" => flush_sync,

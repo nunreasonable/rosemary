@@ -11,6 +11,7 @@ objc.workspace = true
 corefoundation.workspace = true
 foundation.workspace = true
 getrandom.workspace = true
+ring = "0.17"
 rustls-pki-types.workspace = true
 webpki.workspace = true
 webpki-roots.workspace = true

@@ -1,9 +1,11 @@
 pub mod codesign;
+pub mod key;
 pub mod keychain;
 pub mod trust;
 
 exports::group! {
     codesign,
+    key,
     keychain,
     trust,
 }
@@ -13,6 +15,7 @@ pub fn data_symbols() -> Vec<(String, u64)> {
     foundation::bootstrap();
     let mut symbols: Vec<_> = keychain::KEYS
         .iter()
+        .chain(key::KEYS)
         .map(|(symbol, text)| {
             (
                 (*symbol).to_string(),

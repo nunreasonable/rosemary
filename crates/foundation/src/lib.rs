@@ -40,6 +40,7 @@ pub mod proxy;
 pub mod runtime;
 mod signature;
 mod stream;
+mod network;
 pub mod string;
 pub mod strings;
 pub mod task;
@@ -115,6 +116,7 @@ exports::group! {
     timer::cf,
     appleevent,
     proxy,
+    network,
 }
 
 /// This user's home directory, as the guest spells it.

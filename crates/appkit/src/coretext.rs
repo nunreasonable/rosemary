@@ -834,6 +834,54 @@ pub unsafe extern "C" fn CTFontDescriptorCreateMatchingFontDescriptors(
     array
 }
 
+/// `CTFontCollectionRef CTFontCollectionCreateWithFontDescriptors(CFArrayRef,
+/// CFDictionaryRef options)`: a collection is its query descriptors, kept as
+/// the array they came in.
+pub unsafe extern "C" fn CTFontCollectionCreateWithFontDescriptors(
+    descriptors: CFTypeRef,
+    _options: CFTypeRef,
+) -> CFTypeRef {
+    let items: Vec<CFTypeRef> = match unsafe { collections::array(descriptors) } {
+        Some(array) => array.values.clone(),
+        None => Vec::new(),
+    };
+    collections::new_array(&items, type_policy(), false)
+}
+
+/// `CFArrayRef CTFontCollectionCreateMatchingFontDescriptors(CTFontCollectionRef)`:
+/// every installed face matching any of the collection's descriptors, or null
+/// when none does.
+pub unsafe extern "C" fn CTFontCollectionCreateMatchingFontDescriptors(
+    collection: CFTypeRef,
+) -> CFTypeRef {
+    let queries: Vec<CFTypeRef> = match unsafe { collections::array(collection) } {
+        Some(array) => array.values.clone(),
+        None => return std::ptr::null(),
+    };
+    let mut matches = Vec::new();
+    for query in queries {
+        let found =
+            unsafe { CTFontDescriptorCreateMatchingFontDescriptors(query, std::ptr::null()) };
+        if let Some(array) = unsafe { collections::array(found) } {
+            for face in array.values.iter().copied().filter(|d| !d.is_null()) {
+                // Kept alive past the release of `found` until the result
+                // takes its own reference.
+                unsafe { corefoundation::api::CFRetain(face) };
+                matches.push(face);
+            }
+        }
+        if !found.is_null() {
+            release(found);
+        }
+    }
+    if matches.is_empty() {
+        return std::ptr::null();
+    }
+    let array = collections::new_array(&matches, type_policy(), false);
+    matches.into_iter().for_each(release);
+    array
+}
+
 pub unsafe extern "C" fn CTFontDescriptorCreateCopyWithAttributes(
     original: CFTypeRef,
     attributes: CFTypeRef,
@@ -1114,6 +1162,8 @@ exports::exports! {
         "CTFontDescriptorCreateCopyWithAttributes" => CTFontDescriptorCreateCopyWithAttributes,
         "CTFontDescriptorCreateWithNameAndSize" => CTFontDescriptorCreateWithNameAndSize,
         "CTFontDescriptorCreateMatchingFontDescriptors" => CTFontDescriptorCreateMatchingFontDescriptors,
+        "CTFontCollectionCreateWithFontDescriptors" => CTFontCollectionCreateWithFontDescriptors,
+        "CTFontCollectionCreateMatchingFontDescriptors" => CTFontCollectionCreateMatchingFontDescriptors,
         "CTFontCreateCopyWithAttributes" => CTFontCreateCopyWithAttributes,
         "CTFontCreateWithGraphicsFont" => CTFontCreateWithGraphicsFont,
         "CTGetCoreTextVersion" => CTGetCoreTextVersion,

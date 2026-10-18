@@ -51,6 +51,8 @@ pub fn bootstrap() {
 exports::exports! {
     functions {
         "CFRetain" => api::CFRetain,
+        "CFMakeCollectable" => api::CFMakeCollectable,
+        "CFMachPortCreateRunLoopSource" => api::CFMachPortCreateRunLoopSource,
         "CFRelease" => api::CFRelease,
         "CFAutorelease" => api::CFAutorelease,
         "CFGetRetainCount" => api::CFGetRetainCount,

@@ -186,6 +186,7 @@ pub fn resolve(symbol: &str) -> Option<Resolved> {
         "vfprintf" => printf::vfprintf,
         "vsprintf" => printf::vsprintf,
         "vsnprintf" => printf::vsnprintf,
+        "vsnprintf_l" => printf::vsnprintf_l,
         // The wide form, which is how Unreal Engine 3 formats every string it
         // has.
         "vswprintf" => printf::vswprintf,
@@ -280,6 +281,7 @@ pub fn is_shimmed(symbol: &str) -> bool {
             | "vfprintf"
             | "vsprintf"
             | "vsnprintf"
+            | "vsnprintf_l"
             | "vswprintf"
             | "vasprintf"
             | "__vsnprintf_chk"

@@ -795,6 +795,33 @@ unsafe fn contents_of(receiver: Id, argument: Id, want_array: bool, url: bool, i
     }
 }
 
+/// `-writeToFile:atomically:` and `-writeToURL:atomically:` for a dictionary
+/// or an array: the receiver as an XML property list, which is what Foundation
+/// writes. `NO` for anything holding an object a property list cannot.
+unsafe fn write_plist(receiver: Id, argument: Id, url: bool, atomically: u8) -> u8 {
+    // SAFETY: as `file_argument` requires.
+    let Some(path) = (unsafe { file_argument(argument, url) }) else {
+        return 0;
+    };
+    // SAFETY: a live collection.
+    let Some(value) = (unsafe { corefoundation::propertylist::value_of(receiver as CFTypeRef) })
+    else {
+        return 0;
+    };
+    let bytes = corefoundation::plist::write_xml(&value);
+    write_bytes_to_file(&path, &bytes, atomically != 0).is_ok() as u8
+}
+
+unsafe extern "C" fn plist_write_to_file(receiver: Id, _sel: Sel, path: Id, atomically: u8) -> u8 {
+    // SAFETY: forwarded from the method of the same shape.
+    unsafe { write_plist(receiver, path, false, atomically) }
+}
+
+unsafe extern "C" fn plist_write_to_url(receiver: Id, _sel: Sel, url: Id, atomically: u8) -> u8 {
+    // SAFETY: forwarded from the method of the same shape.
+    unsafe { write_plist(receiver, url, true, atomically) }
+}
+
 macro_rules! contents_of {
     ($($name:ident => $array:literal, $url:literal, $init:literal;)*) => {$(
         unsafe extern "C" fn $name(receiver: Id, _sel: Sel, argument: Id) -> Id {
@@ -2528,6 +2555,8 @@ pub(crate) fn install() {
     let array = objc::class::lookup(c"NSArray").expect("CoreFoundation registered NSArray");
     let mutable_array = objc::class::lookup(c"NSMutableArray").expect("NSMutableArray");
     methods!(array, {
+        "writeToFile:atomically:" => plist_write_to_file, c"B28@0:8@16c24";
+        "writeToURL:atomically:" => plist_write_to_url, c"B28@0:8@16c24";
         "count" => count, c"Q16@0:8";
         "objectAtIndex:" => object_at_index, c"@24@0:8Q16";
         "subarrayWithRange:" => subarray_with_range, c"@32@0:8{_NSRange=QQ}16";
@@ -2628,6 +2657,8 @@ pub(crate) fn install() {
         "initWithContentsOfFile:" => dictionary_init_with_contents_of_file, c"@24@0:8@16";
         "initWithContentsOfURL:" => dictionary_init_with_contents_of_url, c"@24@0:8@16";
         "initWithContentsOfURL:error:" => dictionary_init_with_contents_of_url_error, c"@32@0:8@16^@24";
+        "writeToFile:atomically:" => plist_write_to_file, c"B28@0:8@16c24";
+        "writeToURL:atomically:" => plist_write_to_url, c"B28@0:8@16c24";
     });
     methods!(mutable_dictionary, {
         "init" => init_mutable_dictionary, c"@16@0:8";

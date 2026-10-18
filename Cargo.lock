@@ -2395,6 +2395,7 @@ dependencies = [
  "foundation",
  "getrandom 0.3.4",
  "objc",
+ "ring",
  "rustls-pki-types",
  "rustls-webpki",
  "webpki-roots",

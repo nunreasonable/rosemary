@@ -3559,3 +3559,20 @@ mod tests {
         assert!(unsafe { CFDataGetBytePtr(std::ptr::null()) }.is_null());
     }
 }
+
+/// `CFTypeRef CFMakeCollectable(CFTypeRef)`: the garbage collector it handed an
+/// object to is long gone, and without it this has always been the identity.
+pub unsafe extern "C" fn CFMakeCollectable(object: CFTypeRef) -> CFTypeRef {
+    object
+}
+
+/// `CFRunLoopSourceRef CFMachPortCreateRunLoopSource(CFAllocatorRef,
+/// CFMachPortRef, CFIndex)`: there are no Mach ports here to make sources for,
+/// so a port - which only an event tap would have given - has none.
+pub unsafe extern "C" fn CFMachPortCreateRunLoopSource(
+    _allocator: CFTypeRef,
+    _port: CFTypeRef,
+    _order: CFIndex,
+) -> CFTypeRef {
+    std::ptr::null()
+}

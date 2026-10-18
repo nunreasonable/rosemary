@@ -901,6 +901,13 @@ pub fn vsnprintf(symbol: &str, ctx: &mut RegisterContext, mem: &mut dyn GuestMem
     store_bounded(symbol, ctx, mem, ctx.rdi, ctx.rsi, out)
 }
 
+/// `vsnprintf_l(buf, size, locale, fmt, ap)`: `vsnprintf` with a locale, which
+/// formats the same here - every locale's decimal point is the C one's.
+pub fn vsnprintf_l(symbol: &str, ctx: &mut RegisterContext, mem: &mut dyn GuestMemory) -> Result<()> {
+    let out = format_from_list(symbol, ctx, mem, ctx.rcx, ctx.r8)?;
+    store_bounded(symbol, ctx, mem, ctx.rdi, ctx.rsi, out)
+}
+
 /// `__vsnprintf_chk(buf, maxlen, flag, os, fmt, ap)` - the fortified form, whose fourth
 /// argument is the destination's compile-time size.
 pub fn vsnprintf_chk(

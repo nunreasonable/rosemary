@@ -1431,6 +1431,36 @@ pub mod bitmap {
         };
     }
 
+    /// `-copyWithZone:`: another rep owning a copy of the pixels, so that
+    /// drawing into either leaves the other as it was - a copy of a rep over a
+    /// buffer the guest supplied included.
+    unsafe extern "C" fn copy_rep(receiver: Id, _sel: Sel, _zone: *mut c_void) -> Id {
+        // SAFETY: a live object this runtime allocated.
+        let Some(class) = (unsafe { objc::object::class_of(receiver) }) else {
+            return std::ptr::null_mut();
+        };
+        let copy = objc::object::create_instance(class, 0);
+        let (from, to) = (rep_of(receiver), rep_of(copy));
+        to.width = from.width;
+        to.height = from.height;
+        to.samples = from.samples;
+        to.bits_per_sample = from.bits_per_sample;
+        to.bits_per_pixel = from.bits_per_pixel;
+        to.bytes_per_row = from.bytes_per_row;
+        to.has_alpha = from.has_alpha;
+        to.declared = from.declared;
+        // SAFETY: `-bitmapData` is `void * (id, SEL)` and this module's own.
+        let data = unsafe { bitmap_data(receiver, objc::sel::get("bitmapData")) };
+        if !data.is_null() {
+            // SAFETY: the buffer is `bytes_per_row * height` bytes, as every
+            // initialiser established.
+            let pixels = unsafe { std::slice::from_raw_parts(data, from.bytes_per_row * from.height) };
+            to.pixels = Box::into_raw(Box::new(pixels.to_vec()));
+        }
+        remember_format(copy, format_of(receiver));
+        copy
+    }
+
     unsafe extern "C" fn tiff_representation(receiver: Id, _sel: Sel) -> Id {
         let rep = rep_of(receiver);
         // SAFETY: `-bitmapData` is `void * (id, SEL)` and this module's own.
@@ -1480,6 +1510,7 @@ pub mod bitmap {
             "size" => rep_size, c"{CGSize=dd}16@0:8";
             "setSize:" => set_rep_size, c"v32@0:8{CGSize=dd}16";
             "TIFFRepresentation" => tiff_representation, c"@16@0:8";
+            "copyWithZone:" => copy_rep, c"@24@0:8^v16";
         });
     }
 

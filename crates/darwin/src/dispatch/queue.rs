@@ -945,3 +945,81 @@ mod tests {
         }
     }
 }
+
+/// What `dispatch_queue_set_specific` stored, by queue and key: the context and
+/// the guest's destructor for it.
+static SPECIFIC: Mutex<Vec<(u64, usize, usize, usize)>> = Mutex::new(Vec::new());
+
+/// `void dispatch_queue_set_specific(dispatch_queue_t, const void *key, void
+/// *context, dispatch_function_t destructor)`.
+///
+/// # Safety
+///
+/// `destructor` is null or a function taking the context, callable from here.
+pub unsafe extern "C" fn queue_set_specific(queue: u64, key: usize, context: usize, destructor: usize) {
+    if key == 0 {
+        return;
+    }
+    let replaced = {
+        let mut specific = SPECIFIC.lock().unwrap_or_else(|e| e.into_inner());
+        let at = specific.iter().position(|(q, k, _, _)| *q == queue && *k == key);
+        let old = at.map(|at| specific.remove(at));
+        if context != 0 {
+            specific.push((queue, key, context, destructor));
+        }
+        old
+    };
+    if let Some((_, _, old, destructor)) = replaced
+        && destructor != 0
+    {
+        // SAFETY: the guest's destructor, with the context it was given for.
+        let f: unsafe extern "C" fn(usize) = unsafe { std::mem::transmute(destructor) };
+        unsafe { crate::call_as_darwin!(f(old)) };
+    }
+}
+
+fn specific_of(queue: u64, key: usize) -> Option<usize> {
+    SPECIFIC
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .find(|(q, k, _, _)| *q == queue && *k == key)
+        .map(|(_, _, context, _)| *context)
+}
+
+/// `void *dispatch_queue_get_specific(dispatch_queue_t, const void *key)`.
+pub unsafe extern "C" fn queue_get_specific(queue: u64, key: usize) -> usize {
+    specific_of(queue, key).unwrap_or(0)
+}
+
+/// `void *dispatch_get_specific(const void *key)`: the value for `key` on the
+/// queue this code is running on, or on the queues it targets. Code on the main
+/// thread outside any block is on the main queue, as Darwin counts it.
+pub unsafe extern "C" fn get_specific(key: usize) -> usize {
+    let mut stack = CURRENT.with(|c| c.borrow().clone());
+    if stack.is_empty() && on_main_thread() {
+        stack.push(main_queue());
+    }
+    for &handle in stack.iter().rev() {
+        let mut queue_handle = handle;
+        // Walk the target chain, which ends at a global queue.
+        for _ in 0..8 {
+            if let Some(context) = specific_of(queue_handle, key) {
+                return context;
+            }
+            // SAFETY: a handle this module made, live while it is current.
+            match unsafe { queue(queue_handle) } {
+                Some(q) if q.target != 0 && q.target != queue_handle => queue_handle = q.target,
+                _ => break,
+            }
+        }
+    }
+    0
+}
+
+/// `void dispatch_set_target_queue(dispatch_object_t, dispatch_queue_t)`.
+///
+/// FIXME (ACCURACY): accepted and not applied. A target's priority means
+/// nothing to this runtime's threads, but a serial target that several queues
+/// share also serialises their work against each other, and that is not done.
+pub unsafe extern "C" fn set_target_queue(_object: u64, _target: u64) {}

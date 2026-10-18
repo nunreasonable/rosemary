@@ -11,6 +11,7 @@ pub mod icons;
 pub mod process;
 pub mod resources;
 pub mod uti;
+mod urlhandlers;
 
 exports::group! {
     collator,
@@ -20,4 +21,5 @@ exports::group! {
     process,
     resources,
     uti,
+    urlhandlers,
 }

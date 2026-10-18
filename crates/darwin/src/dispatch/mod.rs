@@ -95,6 +95,10 @@ fn main_queue() -> u64 {
 exports::exports! {
     functions {
         "dispatch_queue_create" => queue::queue_create,
+        "dispatch_queue_set_specific" => queue::queue_set_specific,
+        "dispatch_queue_get_specific" => queue::queue_get_specific,
+        "dispatch_get_specific" => queue::get_specific,
+        "dispatch_set_target_queue" => queue::set_target_queue,
         "dispatch_queue_create_with_target" => queue::queue_create_with_target,
         "dispatch_queue_get_label" => queue::queue_get_label,
         "dispatch_get_global_queue" => queue::get_global_queue,

@@ -116,6 +116,12 @@ static HIERARCHY: &[(&str, Option<&str>, usize)] = &[
     ("NSNib", None, 0),
     ("NSTextInputContext", None, 0),
     ("NSDockTile", None, crate::dock::INSTANCE_SIZE),
+    ("NSStatusBar", None, 0),
+    (
+        "NSStatusItem",
+        None,
+        crate::statusbar::ITEM_INSTANCE_SIZE,
+    ),
     (
         "NSTrackingArea",
         None,
