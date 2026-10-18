@@ -24,6 +24,50 @@ pub unsafe extern "C" fn qsort(
 ///
 /// # Safety
 ///
+/// Darwin's comparator for `qsort_r`, which takes the caller's cookie first.
+type ThunkCompare = unsafe extern "C" fn(*mut c_void, *const c_void, *const c_void) -> c_int;
+
+struct QsortR {
+    thunk: *mut c_void,
+    compar: ThunkCompare,
+}
+
+/// glibc's `qsort_r` comparator, which takes the cookie last, calling Darwin's.
+unsafe extern "C" fn qsort_r_compare(a: *const c_void, b: *const c_void, arg: *mut c_void) -> c_int {
+    // SAFETY: `arg` is the `QsortR` on `qsort_r`'s stack, live for the sort.
+    let call = unsafe { &*(arg as *const QsortR) };
+    unsafe { (call.compar)(call.thunk, a, b) }
+}
+
+/// `void qsort_r(void *base, size_t nel, size_t width, void *thunk,
+/// int (*compar)(void *, const void *, const void *))`: the BSD order, cookie
+/// before comparator and passed first to it, where glibc's puts both last.
+///
+/// # Safety
+///
+/// `qsort`'s own contract, with `compar` taking `thunk` first.
+pub unsafe extern "C" fn qsort_r(
+    base: *mut c_void,
+    nel: usize,
+    width: usize,
+    thunk: *mut c_void,
+    compar: Option<ThunkCompare>,
+) {
+    let Some(compar) = compar else {
+        return;
+    };
+    let mut call = QsortR { thunk, compar };
+    unsafe {
+        crate::call_as_darwin!(libc::qsort_r(
+            base,
+            nel,
+            width,
+            Some(qsort_r_compare),
+            (&mut call as *mut QsortR).cast()
+        ))
+    }
+}
+
 /// As [`qsort`], with `key` readable.
 pub unsafe extern "C" fn bsearch(
     key: *const c_void,
@@ -38,6 +82,7 @@ pub unsafe extern "C" fn bsearch(
 exports::exports! {
     functions {
         "qsort" => qsort,
+        "qsort_r" => qsort_r,
         "bsearch" => bsearch,
     }
 }

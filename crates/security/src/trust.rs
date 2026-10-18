@@ -40,9 +40,13 @@ enum Payload {
     /// `SecPolicyCreateBasicX509`: a chain to a trusted root, no name and no
     /// extended key usage required.
     BasicX509,
+    /// `SecPolicyCreateSSL`: as the basic policy, and the leaf must name
+    /// `hostname` when one was given.
+    Ssl { hostname: Option<String> },
     Trust {
         chain: Vec<Vec<u8>>,
         options: u32,
+        hostname: Option<String>,
     },
 }
 
@@ -274,6 +278,25 @@ pub unsafe extern "C" fn SecPolicyCreateBasicX509() -> CFTypeRef {
     new(Payload::BasicX509)
 }
 
+/// `SecPolicyRef SecPolicyCreateSSL(Boolean server, CFStringRef hostname)`.
+///
+/// FIXME (ACCURACY): `server` false (a client certificate check) is evaluated
+/// as a server one; nothing here has asked for the other.
+///
+/// # Safety
+///
+/// `hostname` is null or a live string.
+pub unsafe extern "C" fn SecPolicyCreateSSL(_server: u8, hostname: CFTypeRef) -> CFTypeRef {
+    let hostname = (!hostname.is_null()).then(|| {
+        // SAFETY: the caller's guarantee.
+        let bytes = unsafe { foundation::string::bytes(hostname as Id) };
+        String::from_utf8_lossy(&bytes).into_owned()
+    });
+    new(Payload::Ssl {
+        hostname: hostname.filter(|h| !h.is_empty()),
+    })
+}
+
 /// `OSStatus SecTrustCreateWithCertificates(CFTypeRef certificates, CFTypeRef
 /// policies, SecTrustRef *trust)`.
 ///
@@ -301,21 +324,32 @@ pub unsafe extern "C" fn SecTrustCreateWithCertificates(
             _ => return PARAM,
         }
     }
+    let mut hostname = None;
     // SAFETY: the caller's guarantee.
     for policy in unsafe { one_or_many(policies) } {
         // SAFETY: as above.
-        if !matches!(unsafe { payload(policy) }, Some(Payload::BasicX509)) {
-            eprintln!(
-                "rosemary: security: SecTrustCreateWithCertificates: only the basic X.509 policy is supported"
-            );
-            return PARAM;
+        match unsafe { payload(policy) } {
+            Some(Payload::BasicX509) => {}
+            Some(Payload::Ssl { hostname: name }) => hostname = name.clone(),
+            _ => {
+                eprintln!(
+                    "rosemary: security: SecTrustCreateWithCertificates: only the basic X.509 and SSL policies are supported"
+                );
+                return PARAM;
+            }
         }
     }
     if chain.is_empty() {
         return PARAM;
     }
     // SAFETY: writable, checked above.
-    unsafe { trust.write(new(Payload::Trust { chain, options: 0 })) };
+    unsafe {
+        trust.write(new(Payload::Trust {
+            chain,
+            options: 0,
+            hostname,
+        }))
+    };
     SUCCESS
 }
 
@@ -350,7 +384,7 @@ impl webpki::ExtendedKeyUsageValidator for AnyUsage {
 /// FIXME (ACCURACY): the anchors are Mozilla's root program (`webpki-roots`),
 /// not the keychain's. The two sets largely agree for public servers; a root
 /// only Apple ships is untrusted here.
-fn evaluate(chain: &[Vec<u8>], options: u32) -> u32 {
+fn evaluate(chain: &[Vec<u8>], options: u32, hostname: Option<&str>) -> u32 {
     let Some((leaf, rest)) = chain.split_first() else {
         return result::FATAL;
     };
@@ -377,7 +411,17 @@ fn evaluate(chain: &[Vec<u8>], options: u32) -> u32 {
             None,
         );
         match verified {
-            Ok(_) => return result::UNSPECIFIED,
+            Ok(_) => {
+                let named = hostname.is_none_or(|name| {
+                    rustls_pki_types::ServerName::try_from(name)
+                        .ok()
+                        .is_some_and(|name| end_entity.verify_is_valid_for_subject_name(&name).is_ok())
+                });
+                return match named {
+                    true => result::UNSPECIFIED,
+                    false => result::RECOVERABLE,
+                };
+            }
             Err(webpki::Error::CertExpired { not_after, .. })
                 if options & (ALLOW_EXPIRED | ALLOW_EXPIRED_ROOT) != 0 =>
             {
@@ -396,15 +440,64 @@ fn evaluate(chain: &[Vec<u8>], options: u32) -> u32 {
 /// `trust` is null or a live object, and `out` is null or writable.
 pub unsafe extern "C" fn SecTrustEvaluate(trust: CFTypeRef, out: *mut u32) -> OSStatus {
     // SAFETY: the caller's guarantee.
-    let Some(Payload::Trust { chain, options }) = (unsafe { payload(trust) }) else {
+    let Some(Payload::Trust {
+        chain,
+        options,
+        hostname,
+    }) = (unsafe { payload(trust) })
+    else {
         return PARAM;
     };
-    let verdict = evaluate(chain, *options);
+    let verdict = evaluate(chain, *options, hostname.as_deref());
     if !out.is_null() {
         // SAFETY: writable, per the caller.
         unsafe { out.write(verdict) };
     }
     SUCCESS
+}
+
+/// `bool SecTrustEvaluateWithError(SecTrustRef, CFErrorRef *)`: the same
+/// evaluation, answered as yes or no.
+///
+/// FIXME (ACCURACY): a failure leaves `error` null rather than describing why.
+///
+/// # Safety
+///
+/// As [`SecTrustEvaluate`].
+pub unsafe extern "C" fn SecTrustEvaluateWithError(trust: CFTypeRef, error: *mut CFTypeRef) -> u8 {
+    if !error.is_null() {
+        // SAFETY: writable, per the caller.
+        unsafe { error.write(std::ptr::null()) };
+    }
+    let mut verdict = result::FATAL;
+    // SAFETY: the caller's guarantee.
+    if unsafe { SecTrustEvaluate(trust, &mut verdict) } != SUCCESS {
+        return 0;
+    }
+    u8::from(verdict == result::UNSPECIFIED)
+}
+
+/// `OSStatus SecTrustGetTrustResult(SecTrustRef, SecTrustResultType *)`.
+///
+/// Evaluated afresh, which is what a trust that was never evaluated does.
+///
+/// # Safety
+///
+/// As [`SecTrustEvaluate`].
+pub unsafe extern "C" fn SecTrustGetTrustResult(trust: CFTypeRef, out: *mut u32) -> OSStatus {
+    // SAFETY: the caller's guarantee.
+    unsafe { SecTrustEvaluate(trust, out) }
+}
+
+/// The certificates a keychain query for trusted certificates finds: the
+/// host's anchors, as DER.
+pub(crate) fn anchor_ders() -> &'static [Vec<u8>] {
+    host_anchors()
+}
+
+/// A certificate handle for `der`, owned by the caller.
+pub(crate) fn certificate(der: &[u8]) -> CFTypeRef {
+    new(Payload::Certificate(der.to_vec()))
 }
 
 /// `int SecRandomCopyBytes(SecRandomRef, size_t, void *)`. The generator
@@ -435,6 +528,9 @@ exports::exports! {
         "SecTrustCreateWithCertificates" => SecTrustCreateWithCertificates,
         "SecTrustSetOptions" => SecTrustSetOptions,
         "SecTrustEvaluate" => SecTrustEvaluate,
+        "SecTrustEvaluateWithError" => SecTrustEvaluateWithError,
+        "SecTrustGetTrustResult" => SecTrustGetTrustResult,
+        "SecPolicyCreateSSL" => SecPolicyCreateSSL,
         "SecRandomCopyBytes" => SecRandomCopyBytes,
         "SecTrustCopyAnchorCertificates" => SecTrustCopyAnchorCertificates,
         "SecCertificateCopyData" => SecCertificateCopyData,

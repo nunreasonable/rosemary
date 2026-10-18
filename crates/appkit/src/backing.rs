@@ -1883,8 +1883,89 @@ unsafe extern "C" fn context_is_flipped(_receiver: Id, _sel: Sel) -> u8 {
     current_focus().is_some_and(|focus| focus.flipped) as u8
 }
 
-unsafe extern "C" fn nil(_receiver: Id, _sel: Sel) -> Id {
-    std::ptr::null_mut()
+/// The `CGContext` behind each graphics context made over one, by the
+/// context's address. A context drawing into a view has none here; it draws
+/// through the focus stack instead.
+///
+/// FIXME (ACCURACY): entries outlive their contexts. A program makes a handful
+/// of these, so the leak is a few words each.
+static CG_CONTEXTS: std::sync::Mutex<Vec<(usize, usize)>> = std::sync::Mutex::new(Vec::new());
+
+fn send0<R>(receiver: Id, name: &str) -> R {
+    // SAFETY: `msg::entry` with a nullary selector whose method returns `R`.
+    let send: unsafe extern "C" fn(Id, Sel) -> R = unsafe { std::mem::transmute(objc::msg::entry()) };
+    unsafe { send(receiver, objc::sel::get(name)) }
+}
+
+/// A new, autoreleased `NSGraphicsContext` drawing into `cg`, which it retains.
+fn context_over(cg: *const c_void) -> Id {
+    let class = objc::class::lookup(c"NSGraphicsContext").expect("declared");
+    let context = objc::arc::autorelease(objc::object::create_instance(class, 0));
+    // SAFETY: a live CoreGraphics context the new object now holds a reference to.
+    unsafe { corefoundation::api::CFRetain(cg) };
+    CG_CONTEXTS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push((context as usize, cg as usize));
+    context
+}
+
+/// `+graphicsContextWithBitmapImageRep:`: a context drawing into the rep's
+/// own pixels, which it reads back as the drawing's result.
+unsafe extern "C" fn context_with_bitmap(_class: Id, _sel: Sel, rep: Id) -> Id {
+    if rep.is_null() {
+        return std::ptr::null_mut();
+    }
+    let data: *mut c_void = send0(rep, "bitmapData");
+    let width: isize = send0(rep, "pixelsWide");
+    let height: isize = send0(rep, "pixelsHigh");
+    let bytes_per_row: isize = send0(rep, "bytesPerRow");
+    if data.is_null() || width <= 0 || height <= 0 {
+        return std::ptr::null_mut();
+    }
+    // `kCGImageAlphaPremultipliedLast`, the layout `NSBitmapImageRep` keeps:
+    // RGBA in memory order.
+    const PREMULTIPLIED_LAST: u32 = 1;
+    // SAFETY: the rep's buffer, `bytes_per_row * height` bytes, which the rep
+    // keeps alive for as long as it lives.
+    let cg = unsafe {
+        crate::cgcontext::CGBitmapContextCreate(
+            data,
+            width as usize,
+            height as usize,
+            8,
+            bytes_per_row.max(0) as usize,
+            std::ptr::null(),
+            PREMULTIPLIED_LAST,
+        )
+    };
+    if cg.is_null() {
+        return std::ptr::null_mut();
+    }
+    let context = context_over(cg);
+    // SAFETY: the reference `CGBitmapContextCreate` gave; the context kept its own.
+    unsafe { corefoundation::api::CFRelease(cg) };
+    context
+}
+
+/// `+graphicsContextWithCGContext:flipped:`.
+unsafe extern "C" fn context_with_cg(_class: Id, _sel: Sel, cg: *const c_void, _flipped: u8) -> Id {
+    match cg.is_null() {
+        true => std::ptr::null_mut(),
+        false => context_over(cg),
+    }
+}
+
+/// `-CGContext` and `-graphicsPort`: the context this one draws into, if it was
+/// made over one.
+unsafe extern "C" fn cg_context(receiver: Id, _sel: Sel) -> *const c_void {
+    CG_CONTEXTS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .rev()
+        .find(|(context, _)| *context == receiver as usize)
+        .map_or(std::ptr::null(), |(_, cg)| *cg as *const c_void)
 }
 
 unsafe extern "C" fn ignored(_receiver: Id, _sel: Sel) {}
@@ -1924,11 +2005,13 @@ pub(crate) fn install() {
     class_methods!(context, {
         "currentContext" => current_context, c"@16@0:8";
         "setCurrentContext:" => set_current_context, c"v24@0:8@16";
+        "graphicsContextWithBitmapImageRep:" => context_with_bitmap, c"@24@0:8@16";
+        "graphicsContextWithCGContext:flipped:" => context_with_cg, c"@28@0:8^v16c24";
     });
     methods!(context, {
         "isFlipped" => context_is_flipped, c"c16@0:8";
-        "CGContext" => nil, c"^v16@0:8";
-        "graphicsPort" => nil, c"^v16@0:8";
+        "CGContext" => cg_context, c"^v16@0:8";
+        "graphicsPort" => cg_context, c"^v16@0:8";
         "flushGraphics" => ignored, c"v16@0:8";
         "compositingOperation" => zero, c"q16@0:8";
         "setCompositingOperation:" => ignored_integer, c"v24@0:8q16";

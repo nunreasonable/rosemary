@@ -1010,8 +1010,66 @@ pub unsafe extern "C" fn CTFontManagerCreateFontDescriptorFromData(data: CFTypeR
     face_attributes(first, 0.0)
 }
 
+/// `CGFontRef CGFontCreateWithDataProvider(CGDataProviderRef)`.
+///
+/// A graphics font here is a `CTFont` - `CTFontCreateWithGraphicsFont` already
+/// treats one as the other - made from the provider's font file, which is
+/// registered with the host so that name lookups find it too.
+///
+/// # Safety
+///
+/// `provider` is null or a live object.
+pub unsafe extern "C" fn CGFontCreateWithDataProvider(provider: CFTypeRef) -> CFTypeRef {
+    // SAFETY: the caller's guarantee.
+    let Some(bytes) = (unsafe { crate::graphics::provider_bytes(provider) }) else {
+        return std::ptr::null();
+    };
+    let data = collections::new_data(bytes.to_vec());
+    // SAFETY: a fresh `CFData`, released below.
+    let descriptor = unsafe { CTFontManagerCreateFontDescriptorFromData(data) };
+    unsafe { corefoundation::api::CFRelease(data) };
+    if descriptor.is_null() {
+        return std::ptr::null();
+    }
+    // SAFETY: a descriptor this call owns, released below.
+    let font = unsafe { CTFontCreateWithFontDescriptor(descriptor, 0.0, std::ptr::null()) };
+    unsafe { corefoundation::api::CFRelease(descriptor) };
+    font
+}
+
+/// `void CGFontRelease(CGFontRef)`.
+pub unsafe extern "C" fn CGFontRelease(font: CFTypeRef) {
+    if !font.is_null() {
+        // SAFETY: a font the caller owned.
+        unsafe { corefoundation::api::CFRelease(font) };
+    }
+}
+
+/// `bool CTFontManagerRegisterGraphicsFont(CGFontRef, CFErrorRef *)`: already
+/// done, when the graphics font was made from its data.
+pub unsafe extern "C" fn CTFontManagerRegisterGraphicsFont(font: CFTypeRef, error: *mut CFTypeRef) -> u8 {
+    if !error.is_null() {
+        // SAFETY: writable, per the caller.
+        unsafe { error.write(std::ptr::null()) };
+    }
+    u8::from(!font.is_null())
+}
+
+/// `bool CTFontManagerUnregisterGraphicsFont(CGFontRef, CFErrorRef *)`.
+///
+/// FIXME (ACCURACY): the face stays registered with the host for the rest of
+/// the process; a program that unregisters a font to stop using it is not
+/// affected by its staying findable.
+pub unsafe extern "C" fn CTFontManagerUnregisterGraphicsFont(font: CFTypeRef, error: *mut CFTypeRef) -> u8 {
+    unsafe { CTFontManagerRegisterGraphicsFont(font, error) }
+}
+
 exports::exports! {
     functions {
+        "CGFontCreateWithDataProvider" => CGFontCreateWithDataProvider,
+        "CGFontRelease" => CGFontRelease,
+        "CTFontManagerRegisterGraphicsFont" => CTFontManagerRegisterGraphicsFont,
+        "CTFontManagerUnregisterGraphicsFont" => CTFontManagerUnregisterGraphicsFont,
         "CTFontCreateUIFontForLanguage" => CTFontCreateUIFontForLanguage,
         "CTFontCreateWithName" => CTFontCreateWithName,
         "CTFontCopyFontDescriptor" => CTFontCopyFontDescriptor,

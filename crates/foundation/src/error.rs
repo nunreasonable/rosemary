@@ -266,3 +266,26 @@ pub(crate) fn install() {
         "errorWithDomain:code:userInfo:" => error_with_domain, c"@40@0:8@16q24@32";
     });
 }
+
+#[allow(non_snake_case)]
+pub mod cf {
+    use objc::object::Id;
+
+    /// `CFStringRef CFErrorCopyDescription(CFErrorRef)`: the error's description,
+    /// owned by the caller. Never null, as Apple's is not: an error this module
+    /// did not make gets the generic sentence.
+    unsafe extern "C" fn CFErrorCopyDescription(error: Id) -> Id {
+        // SAFETY: an error the caller holds, read only if this module made it.
+        let text = unsafe { super::contents(error) }
+            .map(|c| c.description.clone())
+            .filter(|d| !d.is_empty())
+            .unwrap_or_else(|| "The operation couldn\u{2019}t be completed.".to_string());
+        crate::string::from_str(&text)
+    }
+
+    exports::exports! {
+        functions {
+            "CFErrorCopyDescription" => CFErrorCopyDescription,
+        }
+    }
+}

@@ -121,11 +121,39 @@ unsafe extern "C" fn get_c_string(
     }
 }
 
-unsafe extern "C" fn length_of_bytes(receiver: Id, _sel: Sel, _ns: usize) -> usize {
-    // SAFETY: an `NSString`. Bytes rather than characters, which for an
-    // eight-bit encoding is the same number and for UTF-8 is the one the caller
-    // is about to allocate.
-    unsafe { bytes(receiver) }.len()
+/// `-lengthOfBytesUsingEncoding:`: how many bytes the receiver takes *in that
+/// encoding*. A caller allocates exactly this and then asks for the bytes in
+/// the same encoding, so the UTF-8 count for a UTF-16 request is a buffer half
+/// the size of what gets written into it.
+unsafe extern "C" fn length_of_bytes(receiver: Id, _sel: Sel, ns: usize) -> usize {
+    // SAFETY: an `NSString`.
+    let Some(string) = (unsafe { corefoundation::string::as_string(receiver as CFTypeRef) }) else {
+        return 0;
+    };
+    match cf_encoding(ns) {
+        encoding::UTF8 => string.utf8().len(),
+        encoding::UTF16 | encoding::UTF16_BE | encoding::UTF16_LE => string.units().len() * 2,
+        encoding::UTF32 | encoding::UTF32_BE | encoding::UTF32_LE => {
+            String::from_utf16_lossy(&string.units()).chars().count() * 4
+        }
+        // An eight-bit encoding: one byte a unit.
+        _ => string.units().len(),
+    }
+}
+
+/// `-maximumLengthOfBytesUsingEncoding:`: an upper bound, which for UTF-8 is
+/// three bytes a UTF-16 unit, as Apple's is.
+unsafe extern "C" fn maximum_length_of_bytes(receiver: Id, sel: Sel, ns: usize) -> usize {
+    // SAFETY: an `NSString`.
+    let Some(string) = (unsafe { corefoundation::string::as_string(receiver as CFTypeRef) }) else {
+        return 0;
+    };
+    match cf_encoding(ns) {
+        encoding::UTF8 => string.units().len() * 3,
+        encoding::UTF32 | encoding::UTF32_BE | encoding::UTF32_LE => string.units().len() * 4,
+        // SAFETY: as above.
+        _ => unsafe { length_of_bytes(receiver, sel, ns) },
+    }
 }
 
 unsafe extern "C" fn is_equal_to_string(receiver: Id, _sel: Sel, other: Id) -> bool {
@@ -1651,7 +1679,7 @@ pub(crate) fn install() {
         "dataUsingEncoding:allowLossyConversion:" => data_using_encoding_lossy, c"@32@0:8Q16B24";
         "writeToFile:atomically:encoding:error:" => write_to_file_with_encoding,
             c"B48@0:8@16B24Q32^@40";
-        "maximumLengthOfBytesUsingEncoding:" => length_of_bytes, c"Q24@0:8Q16";
+        "maximumLengthOfBytesUsingEncoding:" => maximum_length_of_bytes, c"Q24@0:8Q16";
         "isEqualToString:" => is_equal_to_string, c"B24@0:8@16";
         "characterAtIndex:" => character_at_index, c"S24@0:8Q16";
         "getCharacters:range:" => get_characters_range, c"v40@0:8^S16{_NSRange=QQ}24";

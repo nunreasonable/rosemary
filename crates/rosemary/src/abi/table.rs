@@ -491,6 +491,8 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("CFLocaleCopyCurrent", P),
     sig!("CFLocaleGetIdentifier", P, P),
     sig!("CFLocaleGetValue", P, P, P),
+    sig!("CFLocaleCopyPreferredLanguages", P),
+    sig!("CFErrorCopyDescription", P, P),
     sig!("CFNetworkCopySystemProxySettings", P),
     //
     // The callback is argument two and the host calls it on whatever thread
@@ -860,6 +862,11 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     // `CGImageAlphaInfo` is a `uint32_t` enum; the index into a source is a
     // `size_t`.
     sig!("CGDataProviderCreateWithData", P, P, P, U64, P),
+    sig!("CGDataProviderCreateWithCFData", P, P),
+    sig!("CGFontCreateWithDataProvider", P, P),
+    sig!("CGFontRelease", V, P),
+    sig!("CTFontManagerRegisterGraphicsFont", U8, P, P),
+    sig!("CTFontManagerUnregisterGraphicsFont", U8, P, P),
     sig!("CGDataProviderRelease", V, P),
     // `CGImageCreate(size_t width, size_t height, size_t bitsPerComponent,
     // size_t bitsPerPixel, size_t bytesPerRow, CGColorSpaceRef,
@@ -1401,6 +1408,9 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("SecTrustCreateWithCertificates", I32, P, P, P),
     sig!("SecTrustSetOptions", I32, P, U32),
     sig!("SecTrustEvaluate", I32, P, P),
+    sig!("SecTrustEvaluateWithError", U8, P, P),
+    sig!("SecTrustGetTrustResult", I32, P, P),
+    sig!("SecPolicyCreateSSL", P, U8, P),
     sig!("SecRandomCopyBytes", I32, P, U64, P),
     //
     // `SCDynamicStoreCreate`'s third argument is a callback the host invokes on
@@ -1622,6 +1632,7 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("aligned_alloc", P, U64, U64),
     sig!("arc4random", U32),
     sig!("arc4random_buf", V, P, U64),
+    sig!("CCRandomGenerateBytes", I32, P, U64),
     sig!("asin", F64, F64),
     sig!("asinf", F32, F32),
     sig!("asinh", F64, F64),

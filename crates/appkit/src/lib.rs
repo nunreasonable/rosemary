@@ -214,6 +214,7 @@ exports::exports! {
         "CGColorSpaceCopyName" => graphics::CGColorSpaceCopyName,
         "CGColorSpaceCopyPropertyList" => graphics::CGColorSpaceCopyPropertyList,
         "CGDataProviderCreateWithData" => graphics::CGDataProviderCreateWithData,
+        "CGDataProviderCreateWithCFData" => graphics::CGDataProviderCreateWithCFData,
         "CGDataProviderRelease" => graphics::CGDataProviderRelease,
         "CGImageCreate" => graphics::CGImageCreate,
         "CGImageCreateCopyWithColorSpace" => graphics::CGImageCreateCopyWithColorSpace,

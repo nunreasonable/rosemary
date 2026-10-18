@@ -18,8 +18,26 @@ unsafe extern "C" fn arc4random_buf(out: *mut u8, len: usize) {
     }
 }
 
+/// `CCRNGStatus CCRandomGenerateBytes(void *bytes, size_t count)`: CommonCrypto's
+/// way to the system generator, answering `kCCSuccess` (0).
+unsafe extern "C" fn cc_random_generate_bytes(out: *mut u8, len: usize) -> i32 {
+    if len == 0 {
+        return 0;
+    }
+    if out.is_null() {
+        // `kCCParamError`.
+        return -4300;
+    }
+    match getrandom::fill(unsafe { std::slice::from_raw_parts_mut(out, len) }) {
+        Ok(()) => 0,
+        // `kCCRNGFailure`.
+        Err(_) => -4309,
+    }
+}
+
 exports::exports! {
     functions {
+        "CCRandomGenerateBytes" => cc_random_generate_bytes,
         "arc4random" => arc4random,
         "arc4random_buf" => arc4random_buf,
     }

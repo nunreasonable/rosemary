@@ -39,6 +39,10 @@ pub const KEYS: &[(&str, &str)] = &[
     ("_kSecReturnAttributes", "r_Attributes"),
     ("_kSecMatchLimit", "m_Limit"),
     ("_kSecMatchLimitOne", "m_LimitOne"),
+    ("_kSecMatchLimitAll", "m_LimitAll"),
+    ("_kSecMatchTrustedOnly", "m_TrustedOnly"),
+    ("_kSecClassCertificate", "cert"),
+    ("_kSecReturnRef", "r_Ref"),
 ];
 
 /// What identifies an item: its class, its service and its account.
@@ -232,6 +236,10 @@ pub unsafe extern "C" fn SecItemCopyMatching(query: CFTypeRef, result: *mut CFTy
         return PARAM;
     }
     let identity = unsafe { identity_of(query) };
+    if identity.class == "cert" {
+        // SAFETY: the caller's obligation.
+        return unsafe { certificates(query, result) };
+    }
     let Some(data) = items().get(&identity).cloned() else {
         return ITEM_NOT_FOUND;
     };
@@ -243,6 +251,69 @@ pub unsafe extern "C" fn SecItemCopyMatching(query: CFTypeRef, result: *mut CFTy
     let object = corefoundation::collections::new_data(data);
     // SAFETY: a `Copy`, so the caller owns what it is handed.
     unsafe { result.write(object) };
+    SUCCESS
+}
+
+/// Whether `query` holds `kCFBooleanTrue` at `key`.
+///
+/// # Safety
+///
+/// `query` must be a `CFDictionary`.
+unsafe fn flag(query: CFTypeRef, key: &str) -> bool {
+    let name = foundation::string::from_str(key);
+    // SAFETY: the caller's obligation; `name` is a live string.
+    let value = unsafe { corefoundation::api::CFDictionaryGetValue(query, name as CFTypeRef) };
+    // SAFETY: a fresh string this call owns.
+    unsafe { corefoundation::api::CFRelease(name as CFTypeRef) };
+    // SAFETY: whatever was stored there; a `CFBoolean` reads as its value.
+    !value.is_null() && unsafe { corefoundation::api::CFBooleanGetValue(value) } != 0
+}
+
+/// A query for certificates. The only ones here are the host's trusted roots,
+/// which is what a program building its own TLS stack asks the keychain for:
+/// `kSecClassCertificate`, `kSecMatchTrustedOnly`, `kSecMatchLimitAll`.
+///
+/// Answered as `CFData` with `kSecReturnData`, and as certificate handles
+/// otherwise; an array for `kSecMatchLimitAll`, the first one for anything
+/// else.
+///
+/// # Safety
+///
+/// `query` is a `CFDictionary`; `result` is null or writable.
+unsafe fn certificates(query: CFTypeRef, result: *mut CFTypeRef) -> OSStatus {
+    let ders = crate::trust::anchor_ders();
+    if ders.is_empty() {
+        return ITEM_NOT_FOUND;
+    }
+    if result.is_null() {
+        return SUCCESS;
+    }
+    // SAFETY: the caller's obligation.
+    let as_data = unsafe { flag(query, "r_Data") };
+    let all = unsafe { attribute(query, "m_Limit") }.as_deref() == Some("m_LimitAll");
+    let make = |der: &Vec<u8>| -> CFTypeRef {
+        match as_data {
+            true => corefoundation::collections::new_data(der.clone()),
+            false => crate::trust::certificate(der),
+        }
+    };
+    if !all {
+        // SAFETY: writable, per the caller.
+        unsafe { result.write(make(&ders[0])) };
+        return SUCCESS;
+    }
+    let items: Vec<CFTypeRef> = ders.iter().map(make).filter(|i| !i.is_null()).collect();
+    let array = corefoundation::collections::new_array(
+        &items,
+        corefoundation::callbacks::Policy::from_type_callbacks(),
+        false,
+    );
+    for item in items {
+        // SAFETY: the array took its own reference.
+        unsafe { corefoundation::api::CFRelease(item) };
+    }
+    // SAFETY: writable, per the caller.
+    unsafe { result.write(array) };
     SUCCESS
 }
 

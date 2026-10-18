@@ -108,6 +108,7 @@ exports::group! {
     runtime,
     calculate,
     locale::cf,
+    error::cf,
     formatter::cf,
     timer::cf,
     appleevent,

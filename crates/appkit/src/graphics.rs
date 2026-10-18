@@ -194,6 +194,50 @@ pub unsafe extern "C" fn CGDataProviderCreateWithData(
     provider as CFTypeRef
 }
 
+/// Release callback for a provider over a `CFData`, which holds the data.
+unsafe extern "C" fn release_cf_data(info: *mut c_void, _data: *const c_void, _size: usize) {
+    if !info.is_null() {
+        // SAFETY: the reference `CGDataProviderCreateWithCFData` took.
+        unsafe { corefoundation::api::CFRelease(info as CFTypeRef) };
+    }
+}
+
+/// `CGDataProviderRef CGDataProviderCreateWithCFData(CFDataRef data)`: a
+/// provider over `data`'s bytes, holding a reference to it.
+///
+/// # Safety
+///
+/// `data` is null or a live `CFData`.
+pub unsafe extern "C" fn CGDataProviderCreateWithCFData(data: CFTypeRef) -> CFTypeRef {
+    if data.is_null() {
+        return std::ptr::null();
+    }
+    // SAFETY: a live `CFData`, per the caller, whose bytes live as long as it.
+    unsafe {
+        let bytes = corefoundation::api::CFDataGetBytePtr(data);
+        let size = corefoundation::api::CFDataGetLength(data).max(0) as usize;
+        corefoundation::api::CFRetain(data);
+        CGDataProviderCreateWithData(data as *mut c_void, bytes.cast(), size, Some(release_cf_data))
+    }
+}
+
+/// The bytes a provider was made over, for a reader that needs them all at
+/// once - a font file, say.
+///
+/// # Safety
+///
+/// `provider` is null or a live object.
+pub unsafe fn provider_bytes<'a>(provider: CFTypeRef) -> Option<&'a [u8]> {
+    let class = objc::class::lookup(c"__CGDataProvider")?;
+    // SAFETY: the caller's guarantee; the layout is checked by class.
+    if provider.is_null() || !unsafe { corefoundation::base::is_kind_of(provider, class) } {
+        return None;
+    }
+    let provider = provider as *const DataProvider;
+    // SAFETY: a provider of this class, whose bytes it keeps alive.
+    unsafe { ((*provider).size > 0).then(|| std::slice::from_raw_parts((*provider).data, (*provider).size)) }
+}
+
 pub unsafe extern "C" fn CGDataProviderRelease(provider: CFTypeRef) {
     if !provider.is_null() {
         unsafe { corefoundation::api::CFRelease(provider) };

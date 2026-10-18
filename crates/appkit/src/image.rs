@@ -1320,6 +1320,19 @@ pub mod bitmap {
         }
     }
 
+/// `-CGImage`: a snapshot of the pixels as they are now, which the caller
+    /// does not own.
+    unsafe extern "C" fn cg_image(receiver: Id, _sel: Sel) -> *const c_void {
+        match pixels_of(receiver) {
+            Some(bitmap) => {
+                let image = crate::graphics::image_from_bitmap(bitmap);
+                // SAFETY: a fresh image this call owns, handed back unowned.
+                unsafe { corefoundation::api::CFAutorelease(image) }
+            }
+            None => std::ptr::null(),
+        }
+    }
+
     unsafe extern "C" fn pixels_wide(receiver: Id, _sel: Sel) -> isize {
         rep_of(receiver).width as isize
     }
@@ -1413,6 +1426,7 @@ pub mod bitmap {
             "initWithBitmapDataPlanes:pixelsWide:pixelsHigh:bitsPerSample:samplesPerPixel:hasAlpha:isPlanar:colorSpaceName:bytesPerRow:bitsPerPixel:"
                 => init_with_planes_default_format, c"@96@0:8^*16q24q32q40q48c56c64@72q80q88";
             "bitmapData" => bitmap_data, c"^v16@0:8";
+            "CGImage" => cg_image, c"^{CGImage=}16@0:8";
             "pixelsWide" => pixels_wide, c"q16@0:8";
             "pixelsHigh" => pixels_high, c"q16@0:8";
             "samplesPerPixel" => samples_per_pixel, c"q16@0:8";
