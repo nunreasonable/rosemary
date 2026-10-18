@@ -71,11 +71,17 @@ fn class() -> &'static objc::class::Class {
     static CLASS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     let pointer = *CLASS.get_or_init(|| {
         let class = crate::base::register(c"__CFHost", None, size_of::<Body>(), true);
-        class.replace_method(objc::sel::get("dealloc"), dealloc as *const c_void, c"v16@0:8");
+        class.replace_method(
+            objc::sel::get("dealloc"),
+            dealloc as *const c_void,
+            c"v16@0:8",
+        );
         objc::class::ptr(class) as usize
     });
     // SAFETY: registered above and kept for the process.
-    unsafe { objc::class::from_ptr(pointer as *const objc::class::Class).expect("the CFHost class") }
+    unsafe {
+        objc::class::from_ptr(pointer as *const objc::class::Class).expect("the CFHost class")
+    }
 }
 
 unsafe extern "C" fn dealloc(receiver: objc::object::Id, _sel: objc::sel::Sel) {
@@ -167,7 +173,8 @@ fn resolve(name: &str) -> Result<Vec<Vec<u8>>, i32> {
         // SAFETY: a node of the list `getaddrinfo` made.
         let info = unsafe { &*entry };
         if !info.ai_addr.is_null()
-            && let Some(address) = darwin_sockaddr(unsafe { &*info.ai_addr }, info.ai_addrlen as usize)
+            && let Some(address) =
+                darwin_sockaddr(unsafe { &*info.ai_addr }, info.ai_addrlen as usize)
             && !addresses.contains(&address)
         {
             addresses.push(address);
@@ -209,7 +216,11 @@ unsafe extern "C" fn perform(info: *mut c_void) {
         return;
     };
     let failure = StreamError {
-        domain: if error == 0 { 0 } else { DOMAIN_NETDB as CFIndex },
+        domain: if error == 0 {
+            0
+        } else {
+            DOMAIN_NETDB as CFIndex
+        },
         error,
     };
     let handle = HANDLES
@@ -222,7 +233,14 @@ unsafe extern "C" fn perform(info: *mut c_void) {
         return;
     };
     // SAFETY: the client's callback and context, as `CFHostSetClient` gave them.
-    unsafe { callback(handle as CFTypeRef, ADDRESSES, &failure, context as *mut c_void) };
+    unsafe {
+        callback(
+            handle as CFTypeRef,
+            ADDRESSES,
+            &failure,
+            context as *mut c_void,
+        )
+    };
 }
 
 /// Which `CFHostRef` each scheduled host is, for the callback's first argument.
@@ -356,7 +374,11 @@ pub unsafe extern "C" fn CFHostSetClient(
 /// # Safety
 ///
 /// All three are null or live objects.
-pub unsafe extern "C" fn CFHostScheduleWithRunLoop(object: CFTypeRef, run_loop: CFTypeRef, mode: CFTypeRef) {
+pub unsafe extern "C" fn CFHostScheduleWithRunLoop(
+    object: CFTypeRef,
+    run_loop: CFTypeRef,
+    mode: CFTypeRef,
+) {
     // SAFETY: the caller's guarantee.
     let Some(host) = (unsafe { host_of(object) }) else {
         return;
@@ -364,7 +386,9 @@ pub unsafe extern "C" fn CFHostScheduleWithRunLoop(object: CFTypeRef, run_loop: 
     let mut state = host.state.lock().unwrap_or_else(|e| e.into_inner());
     let source = state
         .source
-        .get_or_insert_with(|| crate::runloop::new_source(Some(perform), Arc::as_ptr(&host) as usize))
+        .get_or_insert_with(|| {
+            crate::runloop::new_source(Some(perform), Arc::as_ptr(&host) as usize)
+        })
         .clone();
     HANDLES
         .lock()
@@ -380,7 +404,11 @@ pub unsafe extern "C" fn CFHostScheduleWithRunLoop(object: CFTypeRef, run_loop: 
 /// # Safety
 ///
 /// As [`CFHostScheduleWithRunLoop`].
-pub unsafe extern "C" fn CFHostUnscheduleFromRunLoop(object: CFTypeRef, run_loop: CFTypeRef, mode: CFTypeRef) {
+pub unsafe extern "C" fn CFHostUnscheduleFromRunLoop(
+    object: CFTypeRef,
+    run_loop: CFTypeRef,
+    mode: CFTypeRef,
+) {
     // SAFETY: the caller's guarantee.
     let Some(host) = (unsafe { host_of(object) }) else {
         return;
@@ -410,7 +438,10 @@ pub unsafe extern "C" fn CFHostUnscheduleFromRunLoop(object: CFTypeRef, run_loop
 pub unsafe extern "C" fn CFHostCancelInfoResolution(object: CFTypeRef, _info: i32) {
     // SAFETY: the caller's guarantee.
     if let Some(host) = unsafe { host_of(object) } {
-        host.state.lock().unwrap_or_else(|e| e.into_inner()).cancelled = true;
+        host.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .cancelled = true;
     }
 }
 

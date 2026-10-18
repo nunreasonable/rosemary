@@ -523,6 +523,24 @@ fn objects(result: Result<(Response, Vec<u8>), String>) -> (Id, Id, Id) {
     }
 }
 
+/// `-getTasksWithCompletionHandler:`: three empty arrays. Tasks here are not
+/// tracked by session once started, and a caller asks to cancel or resume what
+/// it finds - nothing, which is the answer it handles for an idle session.
+unsafe extern "C" fn get_tasks(_receiver: Id, _sel: Sel, block: Id) {
+    let empty = || {
+        let array = corefoundation::collections::new_array(
+            &[],
+            corefoundation::callbacks::Policy::from_type_callbacks(),
+            false,
+        );
+        // SAFETY: a fresh array, handed on autoreleased.
+        unsafe { corefoundation::api::CFAutorelease(array) as Id }
+    };
+    // SAFETY: a `void (^)(NSArray *, NSArray *, NSArray *)` block, the same
+    // shape as a completion handler's three objects.
+    unsafe { call_completion(block, empty(), empty(), empty()) };
+}
+
 /// Call a `void (^)(NSData *, NSURLResponse *, NSError *)` block.
 ///
 /// # Safety
@@ -1032,6 +1050,7 @@ pub(crate) fn install() {
         "downloadTaskWithRequest:" => download_task_with_request, c"@24@0:8@16";
         "downloadTaskWithRequest:completionHandler:"
             => download_task_with_request_handler, c"@32@0:8@16@?24";
+        "getTasksWithCompletionHandler:" => get_tasks, c"v24@0:8@?16";
         "invalidateAndCancel" => invalidate_session, c"v16@0:8";
         "finishTasksAndInvalidate" => invalidate_session, c"v16@0:8";
     });

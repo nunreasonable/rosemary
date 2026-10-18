@@ -217,7 +217,12 @@ pub unsafe extern "C" fn CGDataProviderCreateWithCFData(data: CFTypeRef) -> CFTy
         let bytes = corefoundation::api::CFDataGetBytePtr(data);
         let size = corefoundation::api::CFDataGetLength(data).max(0) as usize;
         corefoundation::api::CFRetain(data);
-        CGDataProviderCreateWithData(data as *mut c_void, bytes.cast(), size, Some(release_cf_data))
+        CGDataProviderCreateWithData(
+            data as *mut c_void,
+            bytes.cast(),
+            size,
+            Some(release_cf_data),
+        )
     }
 }
 
@@ -235,7 +240,10 @@ pub unsafe fn provider_bytes<'a>(provider: CFTypeRef) -> Option<&'a [u8]> {
     }
     let provider = provider as *const DataProvider;
     // SAFETY: a provider of this class, whose bytes it keeps alive.
-    unsafe { ((*provider).size > 0).then(|| std::slice::from_raw_parts((*provider).data, (*provider).size)) }
+    unsafe {
+        ((*provider).size > 0)
+            .then(|| std::slice::from_raw_parts((*provider).data, (*provider).size))
+    }
 }
 
 pub unsafe extern "C" fn CGDataProviderRelease(provider: CFTypeRef) {

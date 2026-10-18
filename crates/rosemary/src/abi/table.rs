@@ -2863,6 +2863,8 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("proc_pid_rusage", I32, I32, I32, P),
     sig!("kpersona_pidinfo", I32, I32, P),
     sig!("proc_listpids", I32, U32, U32, P, I32),
+    sig!("proc_listpidspath", I32, U32, U32, P, U32, P, I32),
+    sig!("proc_pidfdinfo", I32, I32, I32, I32, P, I32),
     sig!("proc_listallpids", I32, P, I32),
     sig!("memorystatus_control", I32, U32, I32, U32, P, U64),
     sig!("proc_pidpath", I32, I32, P, U32),
@@ -3867,6 +3869,11 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("tzset", V),
     sig!("frexpf", F32, F32, P),
     sig!("res_9_init", I32),
+    sig!("res_9_ninit", I32, P),
+    sig!("res_9_nclose", V, P),
+    sig!("res_9_nquery", I32, P, P, I32, I32, P, I32),
+    sig!("res_9_ns_initparse", I32, P, I32, P),
+    sig!("res_9_ns_parserr", I32, P, I32, I32, P),
     sig!("res_9_close", V),
 ];
 

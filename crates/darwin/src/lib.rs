@@ -54,6 +54,7 @@ pub mod fts;
 pub mod getopt;
 pub mod glob;
 pub mod heap;
+pub mod hostid;
 pub mod humanize;
 pub mod icu;
 pub mod idle;
@@ -374,6 +375,7 @@ static NONPORTABLE_MODULES: &[exports::Module] = &[
     termios::MODULE,
     sched::MODULE,
     random::MODULE,
+    hostid::MODULE,
     ioctl::MODULE,
     ulock::MODULE,
     data::MODULE,

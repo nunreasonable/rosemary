@@ -39,6 +39,7 @@ pub mod processinfo;
 pub mod proxy;
 pub mod runtime;
 mod signature;
+mod stream;
 pub mod string;
 pub mod strings;
 pub mod task;
@@ -89,6 +90,7 @@ pub fn bootstrap() {
         urlcomponents::install();
         json::install();
         urlsession::install();
+        stream::install();
         cookies::install();
         defaults::install();
         processinfo::install();
@@ -201,6 +203,7 @@ pub fn class_data() -> Vec<(String, u64)> {
         .iter()
         .chain(constant::CLASSES)
         .chain(urlsession::CLASSES)
+        .chain(stream::CLASSES)
         .copied()
     {
         let Some(class) = std::ffi::CString::new(name)

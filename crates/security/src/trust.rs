@@ -42,7 +42,9 @@ enum Payload {
     BasicX509,
     /// `SecPolicyCreateSSL`: as the basic policy, and the leaf must name
     /// `hostname` when one was given.
-    Ssl { hostname: Option<String> },
+    Ssl {
+        hostname: Option<String>,
+    },
     Trust {
         chain: Vec<Vec<u8>>,
         options: u32,
@@ -415,7 +417,9 @@ fn evaluate(chain: &[Vec<u8>], options: u32, hostname: Option<&str>) -> u32 {
                 let named = hostname.is_none_or(|name| {
                     rustls_pki_types::ServerName::try_from(name)
                         .ok()
-                        .is_some_and(|name| end_entity.verify_is_valid_for_subject_name(&name).is_ok())
+                        .is_some_and(|name| {
+                            end_entity.verify_is_valid_for_subject_name(&name).is_ok()
+                        })
                 });
                 return match named {
                     true => result::UNSPECIFIED,

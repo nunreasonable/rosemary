@@ -530,8 +530,94 @@ pub extern "C" fn kpersona_pidinfo(_pid: i32, _info: *mut c_void) -> c_int {
     -1
 }
 
+/// Whether `pid` has `path` open, as a file, its working directory or its
+/// executable. With `volume`, anything under `path` counts.
+fn references(pid: i32, path: &std::path::Path, volume: bool) -> bool {
+    let matches = |target: std::path::PathBuf| match volume {
+        true => target.starts_with(path),
+        false => target == path,
+    };
+    let base = std::path::PathBuf::from(format!("/proc/{pid}"));
+    if ["cwd", "exe"]
+        .iter()
+        .filter_map(|link| std::fs::read_link(base.join(link)).ok())
+        .any(matches)
+    {
+        return true;
+    }
+    std::fs::read_dir(base.join("fd"))
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter_map(|e| std::fs::read_link(e.path()).ok())
+                .any(matches)
+        })
+        .unwrap_or(false)
+}
+
+/// `int proc_listpidspath(uint32_t type, uint32_t typeinfo, const char *path,
+/// uint32_t pathflags, void *buffer, int buffersize)`: the processes among
+/// `type` that have `path` open, as bytes of pids written.
+///
+/// Only processes this user can inspect are seen, which on a Mac is also all
+/// an unprivileged caller gets.
+///
+/// # Safety
+///
+/// `path` is a C string; the buffer as [`copy_pids`].
+pub unsafe extern "C" fn proc_listpidspath(
+    kind: u32,
+    info: u32,
+    path: *const libc::c_char,
+    flags: u32,
+    buffer: *mut c_void,
+    size: c_int,
+) -> c_int {
+    /// `PROC_LISTPIDSPATH_PATH_IS_VOLUME`.
+    const PATH_IS_VOLUME: u32 = 1;
+    if path.is_null() {
+        crate::errno::set(libc::EINVAL);
+        return -1;
+    }
+    // SAFETY: a C string, per the caller.
+    let guest = unsafe { std::ffi::CStr::from_ptr(path) };
+    let host = prefix::ns::to_host(guest);
+    let host = std::path::Path::new(
+        <std::ffi::OsStr as std::os::unix::ffi::OsStrExt>::from_bytes(host.to_bytes()),
+    );
+    let Some(pids) = select_pids(kind, info) else {
+        crate::errno::set(libc::EINVAL);
+        return -1;
+    };
+    let open: Vec<i32> = pids
+        .into_iter()
+        .filter(|pid| references(*pid, host, flags & PATH_IS_VOLUME != 0))
+        .collect();
+    // SAFETY: the caller's buffer.
+    unsafe { copy_pids(&open, buffer, size) }
+}
+
+/// `int proc_pidfdinfo(int pid, int fd, int flavor, void *buffer, int
+/// buffersize)`.
+///
+/// FIXME (ACCURACY): no flavour is answered yet - the structures are Darwin's
+/// vnode and socket descriptions, filled from `/proc/<pid>/fdinfo` - so every
+/// call reports the descriptor as unknown, as for a process that went away.
+pub extern "C" fn proc_pidfdinfo(
+    _pid: c_int,
+    _fd: c_int,
+    _flavor: c_int,
+    _buffer: *mut c_void,
+    _size: c_int,
+) -> c_int {
+    crate::errno::set(libc::ESRCH);
+    0
+}
+
 exports::exports! {
     functions {
+        "proc_listpidspath" => proc_listpidspath,
+        "proc_pidfdinfo" => proc_pidfdinfo,
         "kpersona_pidinfo" => kpersona_pidinfo,
         "proc_pidinfo" => proc_pidinfo,
         "proc_name" => proc_name,

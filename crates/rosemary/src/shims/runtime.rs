@@ -122,6 +122,12 @@ unsafe extern "C" fn ns_get_executable_path(buf: *mut u8, bufsize: *mut u32) -> 
     0
 }
 
+/// `h_errno`: the resolver's error, a plain `int` in libSystem. Nothing here
+/// sets it - the resolver calls a guest makes answer through their return
+/// values - but a program that reads it after a failed lookup reads a zero
+/// rather than faulting on an unbound slot.
+static H_ERRNO: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
 /// Symbols the runtime supplies itself, consulted before the host.
 pub fn provider() -> SyntheticDylib {
     let mut lib = SyntheticDylib::new("<rosemary runtime>");
@@ -129,6 +135,7 @@ pub fn provider() -> SyntheticDylib {
         "___stack_chk_guard",
         &STACK_CHK_GUARD as *const u64 as usize as u64,
     );
+    lib.define_data("_h_errno", H_ERRNO.as_ptr() as usize as u64);
     // Reached only through a descriptor `tls::register` declined; dyld's TLV ABI
     // preserves every register except the return value.
     for name in machish::extensions::tlv::BOOTSTRAP_SYMBOLS {

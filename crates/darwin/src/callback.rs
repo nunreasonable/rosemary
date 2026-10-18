@@ -33,7 +33,11 @@ struct QsortR {
 }
 
 /// glibc's `qsort_r` comparator, which takes the cookie last, calling Darwin's.
-unsafe extern "C" fn qsort_r_compare(a: *const c_void, b: *const c_void, arg: *mut c_void) -> c_int {
+unsafe extern "C" fn qsort_r_compare(
+    a: *const c_void,
+    b: *const c_void,
+    arg: *mut c_void,
+) -> c_int {
     // SAFETY: `arg` is the `QsortR` on `qsort_r`'s stack, live for the sort.
     let call = unsafe { &*(arg as *const QsortR) };
     unsafe { (call.compar)(call.thunk, a, b) }

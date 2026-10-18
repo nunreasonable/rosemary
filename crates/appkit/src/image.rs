@@ -1320,7 +1320,7 @@ pub mod bitmap {
         }
     }
 
-/// `-CGImage`: a snapshot of the pixels as they are now, which the caller
+    /// `-CGImage`: a snapshot of the pixels as they are now, which the caller
     /// does not own.
     unsafe extern "C" fn cg_image(receiver: Id, _sel: Sel) -> *const c_void {
         match pixels_of(receiver) {

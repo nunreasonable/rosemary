@@ -17,8 +17,8 @@ pub mod eightbit;
 /// Only on Darwin: nowhere else is there another CoreFoundation to meet.
 #[cfg(target_os = "macos")]
 pub mod foreign;
-mod host;
 mod fsevents;
+mod host;
 pub mod plist;
 pub mod preferences;
 pub mod propertylist;

@@ -525,6 +525,7 @@ pub const STRING_GLOBALS: &[(&str, &str)] = &[
     ),
     ("_NSDeviceSize", "NSDeviceSize"),
     ("_NSModalPanelRunLoopMode", "NSModalPanelRunLoopMode"),
+    ("_NSEventTrackingRunLoopMode", "NSEventTrackingRunLoopMode"),
     // The pasteboard's plain-text type, under both its spellings: the modern one
     // is a uniform type identifier and the deprecated one is not, and a program
     // that writes with one and reads with the other has to name the same type.

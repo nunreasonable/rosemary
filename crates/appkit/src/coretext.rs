@@ -1047,7 +1047,10 @@ pub unsafe extern "C" fn CGFontRelease(font: CFTypeRef) {
 
 /// `bool CTFontManagerRegisterGraphicsFont(CGFontRef, CFErrorRef *)`: already
 /// done, when the graphics font was made from its data.
-pub unsafe extern "C" fn CTFontManagerRegisterGraphicsFont(font: CFTypeRef, error: *mut CFTypeRef) -> u8 {
+pub unsafe extern "C" fn CTFontManagerRegisterGraphicsFont(
+    font: CFTypeRef,
+    error: *mut CFTypeRef,
+) -> u8 {
     if !error.is_null() {
         // SAFETY: writable, per the caller.
         unsafe { error.write(std::ptr::null()) };
@@ -1060,7 +1063,10 @@ pub unsafe extern "C" fn CTFontManagerRegisterGraphicsFont(font: CFTypeRef, erro
 /// FIXME (ACCURACY): the face stays registered with the host for the rest of
 /// the process; a program that unregisters a font to stop using it is not
 /// affected by its staying findable.
-pub unsafe extern "C" fn CTFontManagerUnregisterGraphicsFont(font: CFTypeRef, error: *mut CFTypeRef) -> u8 {
+pub unsafe extern "C" fn CTFontManagerUnregisterGraphicsFont(
+    font: CFTypeRef,
+    error: *mut CFTypeRef,
+) -> u8 {
     unsafe { CTFontManagerRegisterGraphicsFont(font, error) }
 }
 

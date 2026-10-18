@@ -169,11 +169,20 @@ unsafe extern "C" fn zone_valloc(zone: *const Zone, size: usize) -> *mut c_void 
 unsafe extern "C" fn zone_free(_zone: *const Zone, ptr: *mut c_void) {
     unsafe { libc::free(ptr) }
 }
-unsafe extern "C" fn zone_realloc(_zone: *const Zone, ptr: *mut c_void, size: usize) -> *mut c_void {
+unsafe extern "C" fn zone_realloc(
+    _zone: *const Zone,
+    ptr: *mut c_void,
+    size: usize,
+) -> *mut c_void {
     unsafe { libc::realloc(ptr, size) }
 }
 unsafe extern "C" fn zone_destroy(_zone: *const Zone) {}
-unsafe extern "C" fn zone_batch_malloc(_zone: *const Zone, size: usize, out: *mut *mut c_void, count: u32) -> u32 {
+unsafe extern "C" fn zone_batch_malloc(
+    _zone: *const Zone,
+    size: usize,
+    out: *mut *mut c_void,
+    count: u32,
+) -> u32 {
     let mut made = 0;
     while made < count {
         let block = unsafe { libc::malloc(size) };
@@ -192,7 +201,11 @@ unsafe extern "C" fn zone_batch_free(_zone: *const Zone, blocks: *mut *mut c_voi
         unsafe { libc::free(*blocks.add(i)) };
     }
 }
-unsafe extern "C" fn zone_memalign(_zone: *const Zone, alignment: usize, size: usize) -> *mut c_void {
+unsafe extern "C" fn zone_memalign(
+    _zone: *const Zone,
+    alignment: usize,
+    size: usize,
+) -> *mut c_void {
     let mut out = std::ptr::null_mut();
     match unsafe { libc::posix_memalign(&mut out, alignment.max(size_of::<usize>()), size) } {
         0 => out,
@@ -277,12 +290,20 @@ pub unsafe extern "C" fn malloc_zone_malloc(_zone: *mut c_void, size: usize) -> 
 }
 
 /// `void *malloc_zone_calloc(malloc_zone_t *zone, size_t count, size_t size)`
-pub unsafe extern "C" fn malloc_zone_calloc(_zone: *mut c_void, count: usize, size: usize) -> *mut c_void {
+pub unsafe extern "C" fn malloc_zone_calloc(
+    _zone: *mut c_void,
+    count: usize,
+    size: usize,
+) -> *mut c_void {
     unsafe { libc::calloc(count, size) }
 }
 
 /// `void *malloc_zone_realloc(malloc_zone_t *zone, void *ptr, size_t size)`
-pub unsafe extern "C" fn malloc_zone_realloc(_zone: *mut c_void, ptr: *mut c_void, size: usize) -> *mut c_void {
+pub unsafe extern "C" fn malloc_zone_realloc(
+    _zone: *mut c_void,
+    ptr: *mut c_void,
+    size: usize,
+) -> *mut c_void {
     unsafe { libc::realloc(ptr, size) }
 }
 

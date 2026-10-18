@@ -1893,7 +1893,8 @@ static CG_CONTEXTS: std::sync::Mutex<Vec<(usize, usize)>> = std::sync::Mutex::ne
 
 fn send0<R>(receiver: Id, name: &str) -> R {
     // SAFETY: `msg::entry` with a nullary selector whose method returns `R`.
-    let send: unsafe extern "C" fn(Id, Sel) -> R = unsafe { std::mem::transmute(objc::msg::entry()) };
+    let send: unsafe extern "C" fn(Id, Sel) -> R =
+        unsafe { std::mem::transmute(objc::msg::entry()) };
     unsafe { send(receiver, objc::sel::get(name)) }
 }
 

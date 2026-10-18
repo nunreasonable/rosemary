@@ -306,7 +306,10 @@ pub mod cf {
         // SAFETY: a class method that ignores its receiver and selector, and
         // answers an autoreleased array this call takes a reference to.
         unsafe {
-            let array = super::preferred_languages(std::ptr::null_mut(), objc::sel::get("preferredLanguages"));
+            let array = super::preferred_languages(
+                std::ptr::null_mut(),
+                objc::sel::get("preferredLanguages"),
+            );
             objc::arc::retain(array)
         }
     }
