@@ -485,7 +485,32 @@ fn register_class(
 
     // SAFETY: `c_name` is NUL-terminated and outlives the call; `superclass` is
     // either null, a `Class` the host runtime gave us, or one it created above.
-    let cls = unsafe { host::objc_allocateClassPair(superclass, c_name.as_ptr(), 0) };
+    let mut cls = unsafe { host::objc_allocateClassPair(superclass, c_name.as_ptr(), 0) };
+    // A second image defining a class the first already did - a plugin that
+    // links its own copy of a helper, or a program and the library it loads
+    // both shipping `ClientAppDelegate`. Darwin keeps both, warns "Class X is
+    // implemented in both", and each image's references go on naming its own;
+    // a lookup by name finds one of them. The runtime here keys its table by
+    // name, so the second is registered under a name of its own, and this
+    // image's references are bound to it below like any other class. Left
+    // unrealized, those references point at the raw `class_t`, which nothing
+    // here can send a message to.
+    if cls.is_null()
+        // SAFETY: `c_name` as above.
+        && unsafe { !host::objc_lookUpClass(c_name.as_ptr()).is_null() }
+        && r.is_guest_address(class.va)
+        && let Some(unique) = host::c_string(&format!("{name}@{:x}", class.va))
+    {
+        // SAFETY: as above, under a name nothing else has.
+        cls = unsafe { host::objc_allocateClassPair(superclass, unique.as_ptr(), 0) };
+        if !cls.is_null() {
+            eprintln!(
+                "rosemary: objc: class {name} is implemented in more than one image; the one at \
+                 {:#x} is registered as {name}@{:x}",
+                class.va, class.va
+            );
+        }
+    }
     if cls.is_null() {
         // The runtime declines exactly one thing here, and it is worth telling
         // apart: a name already in use. A guest defining `NSString` is a
