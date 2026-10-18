@@ -524,6 +524,82 @@ fn announce_out_of_line() {
 
 /// Take the next message for `rcv_name`, and the port it actually arrived on -
 /// which is a member when the caller is receiving on a port set.
+/// `kern_return_t mach_msg_send(mach_msg_header_t *)`.
+///
+/// # Safety
+///
+/// As `mach_msg` with `MACH_SEND_MSG`.
+pub unsafe extern "C" fn mach_msg_send(msg: *mut c_void) -> i32 {
+    if msg.is_null() {
+        return MACH_SEND_INVALID_DATA;
+    }
+    // SAFETY: a header, whose second word is its size.
+    let size = unsafe { *(msg as *const u32).add(1) };
+    // SAFETY: the caller's message.
+    unsafe { mach_msg(msg, 1, size, 0, MACH_PORT_NULL, 0, MACH_PORT_NULL) }
+}
+
+/// `kern_return_t mach_port_peek(ipc_space_t, mach_port_name_t,
+/// mach_msg_trailer_type_t, mach_port_seqno_t *, mach_msg_size_t *,
+/// mach_msg_id_t *, mach_msg_trailer_info_t, mach_msg_type_number_t *)`: the
+/// size and id of the next message on a port, which stays queued.
+///
+/// # Safety
+///
+/// Each out pointer is null or writable.
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn mach_port_peek(
+    task: Name,
+    name: Name,
+    _trailer_type: i32,
+    seqno: *mut u32,
+    size: *mut u32,
+    id: *mut i32,
+    _trailer: *mut u8,
+    trailer_size: *mut u32,
+) -> i32 {
+    if task != space::TASK_SELF {
+        return KERN_INVALID_TASK;
+    }
+    let Some(port) = space::receiver(name) else {
+        return KERN_INVALID_RIGHT;
+    };
+    let message = match port.take_held() {
+        Some(held) => held,
+        None => match port.receive(0) {
+            Ok(Some(message)) => message,
+            _ => return KERN_FAILURE,
+        },
+    };
+    let bytes = &message.bytes;
+    let measured = (bytes.len() >= envelope::FIXED).then(|| {
+        let count = word(bytes, 16) as usize;
+        let complex = count > 0 || word(bytes, 8) & BITS_COMPLEX != 0;
+        let body = if complex { BODY + count * DESCRIPTOR } else { 0 };
+        ((HEADER + body + word(bytes, 20) as usize) as u32, word(bytes, 12) as i32)
+    });
+    port.hold(message);
+    let Some((length, message_id)) = measured else {
+        return KERN_FAILURE;
+    };
+    // SAFETY: each null or writable, per the caller.
+    unsafe {
+        if !seqno.is_null() {
+            seqno.write(0);
+        }
+        if !size.is_null() {
+            size.write(length);
+        }
+        if !id.is_null() {
+            id.write(message_id);
+        }
+        if !trailer_size.is_null() {
+            trailer_size.write(0);
+        }
+    }
+    KERN_SUCCESS
+}
+
 fn next_message(rcv_name: Name, timeout_ms: i32) -> Result<(Datagram, Name), i32> {
     if let Some(port) = space::receiver(rcv_name) {
         return match port.receive(timeout_ms) {

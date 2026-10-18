@@ -2246,6 +2246,43 @@ pub(crate) mod entry {
         super::load_command_in(header, segment.to_bytes(), Some(section.to_bytes()))
     }
 
+    /// `uint8_t *getsectdatafromheader_64(const struct mach_header_64 *,
+    /// const char *segname, const char *sectname, uint64_t *size)`: the
+    /// section's `addr` as the file states it, unslid, as Darwin's is - the
+    /// caller adds the image's slide.
+    ///
+    /// # Safety
+    ///
+    /// As [`getsectbynamefromheader_64`]; `size` is null or writable.
+    pub unsafe extern "C" fn getsectdatafromheader_64(
+        header: u64,
+        segment: *const c_char,
+        section: *const c_char,
+        size: *mut u64,
+    ) -> u64 {
+        // SAFETY: the caller's guarantees, passed on.
+        let found = unsafe { getsectbynamefromheader_64(header, segment, section) } as *const u8;
+        if found.is_null() {
+            if !size.is_null() {
+                // SAFETY: writable, per the caller.
+                unsafe { size.write(0) };
+            }
+            return 0;
+        }
+        // SAFETY: a `section_64`, whose `addr` and `size` are at 32 and 40.
+        let (addr, length) = unsafe {
+            (
+                found.add(32).cast::<u64>().read_unaligned(),
+                found.add(40).cast::<u64>().read_unaligned(),
+            )
+        };
+        if !size.is_null() {
+            // SAFETY: writable, per the caller.
+            unsafe { size.write(length) };
+        }
+        addr
+    }
+
     /// `unsigned long get_etext(void)`: the end of the main image's
     /// `__TEXT,__text`, slid - which is where its writable data starts as far
     /// as a collector registering roots is concerned.
@@ -2412,7 +2449,7 @@ pub(crate) mod entry {
 }
 
 /// Every name [`provider`] defines, and the function it binds to.
-fn entries() -> [(&'static str, *const ()); 18] {
+fn entries() -> [(&'static str, *const ()); 19] {
     [
         ("_dlopen", entry::dlopen as *const ()),
         ("_dlsym", entry::dlsym as *const ()),
@@ -2453,6 +2490,10 @@ fn entries() -> [(&'static str, *const ()); 18] {
         (
             "_getsectbynamefromheader_64",
             entry::getsectbynamefromheader_64 as *const (),
+        ),
+        (
+            "_getsectdatafromheader_64",
+            entry::getsectdatafromheader_64 as *const (),
         ),
         ("_get_etext", entry::get_etext as *const ()),
         ("_get_end", entry::get_end as *const ()),

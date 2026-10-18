@@ -2,6 +2,7 @@ pub mod block;
 pub mod data;
 pub mod object;
 pub mod queue;
+pub mod source;
 pub mod sync;
 pub mod time;
 
@@ -92,6 +93,49 @@ fn main_queue() -> u64 {
     queue::main_queue()
 }
 
+/// `void dispatch_resume(dispatch_object_t)`. Only sources are ever
+/// suspended here: a queue's suspend count is not kept, so resuming one has
+/// nothing to undo.
+unsafe extern "C" fn resume(object: u64) {
+    source::resume(object);
+}
+
+/// `void dispatch_suspend(dispatch_object_t)`.
+///
+/// FIXME (ACCURACY): a queue is not suspended - its work keeps running.
+unsafe extern "C" fn suspend(object: u64) {
+    source::suspend(object);
+}
+
+/// `void dispatch_activate(dispatch_object_t)`: an inactive object is a
+/// suspended one that this resumes once.
+unsafe extern "C" fn activate(object: u64) {
+    source::resume(object);
+}
+
+/// `dispatch_queue_attr_t dispatch_queue_attr_make_with_qos_class(attr,
+/// dispatch_qos_class_t, int)`: the attribute as given. Every queue here runs
+/// at the one priority the host gives its threads.
+unsafe extern "C" fn queue_attr_make_with_qos_class(attr: u64, _qos: u32, _priority: i32) -> u64 {
+    attr
+}
+
+/// `dispatch_time_t dispatch_walltime(const struct timespec *, int64_t)`:
+/// a wall-clock time, held as the monotonic deadline it falls on, since that
+/// is the clock every deadline here is kept in.
+unsafe extern "C" fn walltime(when: *const libc::timespec, delta: i64) -> u64 {
+    let wall_now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos() as i128);
+    let wall = match when.is_null() {
+        true => wall_now,
+        // SAFETY: a `timespec`, per the caller.
+        false => unsafe { (*when).tv_sec as i128 * 1_000_000_000 + (*when).tv_nsec as i128 },
+    };
+    let target = time::now() as i128 + (wall - wall_now) + delta as i128;
+    target.clamp(1, i64::MAX as i128) as u64
+}
+
 exports::exports! {
     functions {
         "dispatch_queue_create" => queue::queue_create,
@@ -130,11 +174,42 @@ exports::exports! {
         "dispatch_set_context" => object::set_context,
         "dispatch_get_context" => object::get_context,
         "dispatch_set_finalizer_f" => object::set_finalizer_f,
+        "dispatch_resume" => resume,
+        "dispatch_suspend" => suspend,
+        "dispatch_activate" => activate,
+        "dispatch_queue_attr_make_with_qos_class" => queue_attr_make_with_qos_class,
+        "dispatch_walltime" => walltime,
+        "dispatch_source_create" => source::source_create,
+        "dispatch_source_set_event_handler" => source::set_event_handler,
+        "dispatch_source_set_event_handler_f" => source::set_event_handler_f,
+        "dispatch_source_set_cancel_handler" => source::set_cancel_handler,
+        "dispatch_source_set_cancel_handler_f" => source::set_cancel_handler_f,
+        "dispatch_source_set_registration_handler" => source::set_registration_handler,
+        "dispatch_source_set_registration_handler_f" => source::set_registration_handler_f,
+        "dispatch_source_set_timer" => source::set_timer,
+        "dispatch_source_merge_data" => source::merge_data,
+        "dispatch_source_get_data" => source::get_data,
+        "dispatch_source_get_handle" => source::get_handle,
+        "dispatch_source_get_mask" => source::get_mask,
+        "dispatch_source_cancel" => source::cancel,
+        "dispatch_source_testcancel" => source::testcancel,
     }
     data {
         "__dispatch_main_q" => main_queue(),
         "__dispatch_queue_attr_concurrent" => queue::concurrent_attr(),
         "__dispatch_data_destructor_free" => data::destructor_free(),
+        "__dispatch_source_type_data_add" => source::type_address("__dispatch_source_type_data_add"),
+        "__dispatch_source_type_data_or" => source::type_address("__dispatch_source_type_data_or"),
+        "__dispatch_source_type_data_replace" => source::type_address("__dispatch_source_type_data_replace"),
+        "__dispatch_source_type_mach_send" => source::type_address("__dispatch_source_type_mach_send"),
+        "__dispatch_source_type_mach_recv" => source::type_address("__dispatch_source_type_mach_recv"),
+        "__dispatch_source_type_memorypressure" => source::type_address("__dispatch_source_type_memorypressure"),
+        "__dispatch_source_type_proc" => source::type_address("__dispatch_source_type_proc"),
+        "__dispatch_source_type_read" => source::type_address("__dispatch_source_type_read"),
+        "__dispatch_source_type_signal" => source::type_address("__dispatch_source_type_signal"),
+        "__dispatch_source_type_timer" => source::type_address("__dispatch_source_type_timer"),
+        "__dispatch_source_type_vnode" => source::type_address("__dispatch_source_type_vnode"),
+        "__dispatch_source_type_write" => source::type_address("__dispatch_source_type_write"),
     }
 }
 

@@ -70,6 +70,13 @@ fn block_for(
         return Ok(std::ptr::null_mut());
     }
     let block = allocate(image).ok_or("out of memory for a thread-local block")?;
+    if std::env::var_os("ROSEMARY_TRACE_TLV").is_some() {
+        eprintln!(
+            "rosemary: tlv: thread {} key {index} gets block {block:p} ({} bytes)",
+            darwin::pthread::id(),
+            image.total_size,
+        );
+    }
     image.key.set(block as *mut c_void);
 
     let constructed = image.init_funcs.iter().rev().try_for_each(|&f| call(f));

@@ -12,6 +12,7 @@ pub enum Kind {
     Group,
     Semaphore,
     Data,
+    Source,
 }
 
 /// The header every dispatch object begins with.
@@ -156,6 +157,11 @@ pub unsafe fn release(handle: u64) {
             Kind::Group => drop(Box::from_raw(handle as *mut super::sync::Group)),
             Kind::Semaphore => drop(Box::from_raw(handle as *mut super::sync::Semaphore)),
             Kind::Data => drop(Box::from_raw(handle as *mut super::data::Data)),
+            Kind::Source => {
+                let source = Box::from_raw(handle as *mut super::source::Source);
+                super::source::finalize(&source);
+                drop(source);
+            }
         }
     }
     if finalizer != 0 && context != 0 {

@@ -295,6 +295,159 @@ pub fn unbound_imports(report: &LinkReport) -> Vec<(&str, &machish::report::Miss
         .collect()
 }
 
+/// The names [`lenient_imports`] stood in for, by thunk index, and whether each
+/// has been reported called.
+static LENIENT: std::sync::Mutex<Vec<(String, bool)>> = std::sync::Mutex::new(Vec::new());
+
+/// What every lenient thunk jumps to: report the import the first time, and
+/// answer zero.
+extern "C" fn lenient_called(index: u64) -> u64 {
+    let mut names = LENIENT.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((name, said)) = names.get_mut(index as usize)
+        && !*said
+    {
+        *said = true;
+        eprintln!("rosemary: lenient: {name} called; answered 0");
+    }
+    0
+}
+
+/// Whether a data import is, by its name, a string constant: a key, a
+/// notification or exception name, a type identifier.
+fn looks_like_string_constant(symbol: &str) -> bool {
+    const SUFFIXES: [&str; 9] = [
+        "Key",
+        "Notification",
+        "Exception",
+        "Domain",
+        "Attribute",
+        "Option",
+        "Name",
+        "Identifier",
+        "Mode",
+    ];
+    const PREFIXES: [&str; 12] = [
+        "_kUTType",
+        "_kUTTag",
+        "_kCGColorSpace",
+        "_kCGWindow",
+        "_kCGDisplayStream",
+        "_kIOSurface",
+        "_kSCPropNet",
+        "_kSecAttr",
+        "_kSecClass",
+        "_kSecKeyAlgorithm",
+        "_kSecPolicy",
+        "_kLSSharedFileList",
+    ];
+    !symbol.starts_with("_OBJC_")
+        && (SUFFIXES.iter().any(|s| symbol.ends_with(s))
+            || PREFIXES.iter().any(|p| symbol.starts_with(p))
+            || symbol.starts_with("_kSecUse")
+            || symbol.starts_with("_kSecMatch")
+            || symbol.starts_with("_kCATransaction"))
+}
+
+/// `ROSEMARY_LENIENT_IMPORTS=1`: a diagnostic for finding out which of a large
+/// program's missing imports it actually reaches.
+///
+/// Every unbound *function* answers zero - null, `NO`, `noErr`,
+/// `KERN_SUCCESS` - and says its name on stderr the first time it is called.
+/// Every unbound data import that looks like a string constant reads as a
+/// string of its own name, and any other reads as a pointer to zeroes. Off by
+/// default, because zero is a guess: a program told "success" with its out
+/// parameters unwritten fails later, somewhere else. What it is for is the
+/// list: the imports a run actually called, to implement for real.
+fn lenient_imports(unbound: &[(&str, &machish::report::MissingSymbol)]) {
+    if std::env::var_os("ROSEMARY_LENIENT_IMPORTS").is_none() {
+        return;
+    }
+    let zeroes = {
+        static ZEROES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        *ZEROES.get_or_init(|| {
+            // SAFETY: an anonymous private mapping, never unmapped.
+            let p = unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    64 * 1024,
+                    libc::PROT_READ,
+                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                    -1,
+                    0,
+                )
+            };
+            match p == libc::MAP_FAILED {
+                true => 0,
+                false => p as usize,
+            }
+        })
+    };
+    let functions: Vec<_> = unbound.iter().filter(|(_, m)| m.stub_va.is_some()).collect();
+    const THUNK: usize = 32;
+    let length = (functions.len() * THUNK).div_ceil(4096).max(1) * 4096;
+    // SAFETY: a fresh mapping for the thunks, made executable once written.
+    let code = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            length,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+            -1,
+            0,
+        )
+    };
+    if code == libc::MAP_FAILED {
+        eprintln!("rosemary: ROSEMARY_LENIENT_IMPORTS: no memory for thunks");
+        return;
+    }
+    let mut names = LENIENT.lock().unwrap_or_else(|e| e.into_inner());
+    for (i, (_, m)) in functions.iter().enumerate() {
+        let index = names.len() as u64;
+        names.push((m.symbol.clone(), false));
+        let mut thunk = Vec::with_capacity(THUNK);
+        // mov rdi, index; mov rax, lenient_called; jmp rax
+        thunk.extend_from_slice(&[0x48, 0xbf]);
+        thunk.extend_from_slice(&index.to_le_bytes());
+        thunk.extend_from_slice(&[0x48, 0xb8]);
+        thunk.extend_from_slice(&(lenient_called as *const () as u64).to_le_bytes());
+        thunk.extend_from_slice(&[0xff, 0xe0]);
+        thunk.resize(THUNK, 0xcc);
+        let at = code as usize + i * THUNK;
+        // SAFETY: inside the mapping just made; the slot is in an image this
+        // runtime mapped writable, as `fill_unbound_data`'s are.
+        unsafe {
+            std::ptr::copy_nonoverlapping(thunk.as_ptr(), at as *mut u8, THUNK);
+            (m.slot_va as *mut usize).write(at);
+        }
+    }
+    drop(names);
+    // SAFETY: the thunk mapping, now complete.
+    unsafe { libc::mprotect(code, length, libc::PROT_READ | libc::PROT_EXEC) };
+    let mut strings = 0;
+    for (_, m) in unbound.iter().filter(|(_, m)| m.stub_va.is_none()) {
+        if m.symbol.starts_with("_OBJC_") {
+            continue;
+        }
+        let value = if looks_like_string_constant(&m.symbol) {
+            strings += 1;
+            let text = foundation::string::from_str(m.symbol.trim_start_matches('_'));
+            objc::arc::make_immortal(text);
+            corefoundation::base::global_cell(&m.symbol, text as u64)
+        } else if zeroes != 0 {
+            zeroes as u64
+        } else {
+            continue;
+        };
+        // SAFETY: as above.
+        unsafe { (m.slot_va as *mut usize).write(value as usize) };
+    }
+    eprintln!(
+        "rosemary: ROSEMARY_LENIENT_IMPORTS: {} function(s) answer 0, {strings} string \
+         constant(s) read as their names",
+        functions.len()
+    );
+}
+
 /// `ROSEMARY_FILL_UNBOUND_DATA=1`: put a readable address in every unbound
 /// data slot instead of leaving it zero.
 fn fill_unbound_data(unbound: &[(&str, &machish::report::MissingSymbol)]) {
@@ -457,6 +610,7 @@ pub fn announce_unbound_imports<'r>(
     }
     fill_unbound_data(&unbound);
     name_missing_classes(&unbound);
+    lenient_imports(&unbound);
     unbound
 }
 

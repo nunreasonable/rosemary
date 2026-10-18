@@ -4,6 +4,7 @@ pub mod bootstrap;
 pub mod clock;
 pub mod info;
 pub mod kern;
+pub mod memory;
 pub mod msg;
 pub mod senders;
 pub mod space;
@@ -141,6 +142,15 @@ exports::exports! {
             | "thread_swap_exception_ports" => task::task_swap_exception_ports,
 
         "mach_port_allocate" => space::mach_port_allocate,
+        "mach_port_construct" => space::mach_port_construct,
+        "mach_port_destruct" => space::mach_port_destruct,
+        "mach_port_peek" => msg::mach_port_peek,
+        "mach_msg_send" => msg::mach_msg_send,
+        "mach_make_memory_entry_64" => memory::mach_make_memory_entry_64,
+        "mach_vm_map" | "vm_map" => memory::mach_vm_map,
+        "mach_vm_remap" => memory::mach_vm_remap,
+        "mach_vm_protect" | "vm_protect" => memory::mach_vm_protect,
+        "mach_vm_read" | "vm_read" => memory::mach_vm_read,
         "mach_port_deallocate" => space::mach_port_deallocate,
         "mach_port_destroy" => space::mach_port_destroy,
         "mach_port_mod_refs" => space::mach_port_mod_refs,

@@ -133,6 +133,56 @@ unsafe extern "C" fn thread_dictionary(receiver: Id, _sel: Sel) -> Id {
     dictionary as Id
 }
 
+/// `-threadPriority` and `+threadPriority`: the default, 0.5. Priorities
+/// are hints the host scheduler is not asked to honour, so one that was set
+/// is not kept either.
+unsafe extern "C" fn thread_priority(_receiver: Id, _sel: Sel) -> f64 {
+    0.5
+}
+
+/// `-setThreadPriority:` and `+setThreadPriority:`, which report success.
+unsafe extern "C" fn set_thread_priority(_receiver: Id, _sel: Sel, _priority: f64) -> u8 {
+    1
+}
+
+/// `-qualityOfService`: `NSQualityOfServiceDefault`.
+unsafe extern "C" fn quality_of_service(_receiver: Id, _sel: Sel) -> i64 {
+    -1
+}
+
+unsafe extern "C" fn set_quality_of_service(_receiver: Id, _sel: Sel, _qos: i64) {}
+
+/// Thread names, beside the objects for the same reason as the dictionaries.
+static NAMES: std::sync::Mutex<Vec<(usize, usize)>> = std::sync::Mutex::new(Vec::new());
+
+unsafe extern "C" fn name(receiver: Id, _sel: Sel) -> Id {
+    NAMES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .find(|(t, _)| *t == receiver as usize)
+        .map_or(std::ptr::null_mut(), |(_, n)| *n as Id)
+}
+
+/// `-setName:`, a copy, as the property is declared.
+unsafe extern "C" fn set_name(receiver: Id, _sel: Sel, name: Id) {
+    // SAFETY: an `NSString` or nil.
+    let text = unsafe { crate::string::bytes(name) };
+    let copy = crate::string::from_str(&String::from_utf8_lossy(&text)) as usize;
+    let mut names = NAMES.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(entry) = names.iter_mut().find(|(t, _)| *t == receiver as usize) {
+        objc::arc::release(std::mem::replace(&mut entry.1, copy) as Id);
+    } else {
+        names.push((receiver as usize, copy));
+    }
+}
+
+unsafe extern "C" fn stack_size(_receiver: Id, _sel: Sel) -> u64 {
+    512 * 1024
+}
+
+unsafe extern "C" fn set_stack_size(_receiver: Id, _sel: Sel, _size: u64) {}
+
 pub(crate) fn install() {
     let class = objc::class::lookup(c"NSThread").expect("declared abstract by this crate");
     class_methods!(class, {
@@ -142,9 +192,19 @@ pub(crate) fn install() {
         "isMainThread" => is_main_thread, c"B16@0:8";
         "currentThread" => current_thread, c"@16@0:8";
         "mainThread" => main_thread, c"@16@0:8";
+        "threadPriority" => thread_priority, c"d16@0:8";
+        "setThreadPriority:" => set_thread_priority, c"B24@0:8d16";
     });
     methods!(class, {
         "isMainThread" => is_main_thread, c"B16@0:8";
         "threadDictionary" => thread_dictionary, c"@16@0:8";
+        "threadPriority" => thread_priority, c"d16@0:8";
+        "setThreadPriority:" => set_thread_priority, c"v24@0:8d16";
+        "qualityOfService" => quality_of_service, c"q16@0:8";
+        "setQualityOfService:" => set_quality_of_service, c"v24@0:8q16";
+        "name" => name, c"@16@0:8";
+        "setName:" => set_name, c"v24@0:8@16";
+        "stackSize" => stack_size, c"Q16@0:8";
+        "setStackSize:" => set_stack_size, c"v24@0:8Q16";
     });
 }

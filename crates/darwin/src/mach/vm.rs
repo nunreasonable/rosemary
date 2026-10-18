@@ -468,7 +468,10 @@ pub unsafe extern "C" fn vm_deallocate(task: Name, address: u64, size: u64) -> i
     // SAFETY: the caller states this is its own mapping.
     let out = unsafe { libc::munmap(address as *mut c_void, size as usize) };
     match out {
-        0 => KERN_SUCCESS,
+        0 => {
+            super::memory::forget(address, size);
+            KERN_SUCCESS
+        }
         _ => KERN_INVALID_ADDRESS,
     }
 }

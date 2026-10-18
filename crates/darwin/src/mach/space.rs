@@ -81,6 +81,18 @@ pub enum Right {
     /// A name this runtime answers for without a port behind it: the task, the
     /// host, the bootstrap server, a clock, the processor set.
     Special,
+    /// A named memory entry, from `mach_make_memory_entry_64`: a send right
+    /// to a memory object, which here is a memory file. `offset` and `size`
+    /// are the part of it the entry covers.
+    Memory {
+        file: Arc<OwnedFd>,
+        offset: u64,
+        size: u64,
+        refs: u32,
+    },
+    /// A fileport: a send right standing for an open file, from
+    /// `fileport_makeport`.
+    File { file: Arc<OwnedFd>, refs: u32 },
 }
 
 impl Right {
@@ -96,7 +108,12 @@ impl Right {
             // it as a send right because that is what the task and host ports
             // are on a real system.
             Right::Semaphore(_) | Right::Special => type_of(RIGHT_SEND),
-            Right::Task { .. } | Right::Thread { .. } => type_of(RIGHT_SEND),
+            Right::Task { .. }
+            | Right::Thread { .. }
+            | Right::Memory { .. }
+            | Right::File { .. } => {
+                type_of(RIGHT_SEND)
+            }
         }
     }
 }
@@ -386,7 +403,9 @@ fn release(space: &mut Space, name: Name) -> i32 {
         Right::Send { refs, .. }
         | Right::Dead { refs }
         | Right::Task { refs, .. }
-        | Right::Thread { refs, .. } => {
+        | Right::Thread { refs, .. }
+        | Right::Memory { refs, .. }
+        | Right::File { refs, .. } => {
             *refs -= 1;
             if *refs == 0 {
                 space.names.remove(&name);
@@ -447,6 +466,75 @@ pub unsafe extern "C" fn mach_port_allocate(task: Name, right: u32, out: *mut Na
     KERN_SUCCESS
 }
 
+/// `mach_port_options_t`.
+#[repr(C)]
+pub struct PortOptions {
+    flags: u32,
+    queue_limit: u32,
+    reserved: [u64; 2],
+}
+
+/// `MPO_INSERT_SEND_RIGHT`.
+const MPO_INSERT_SEND_RIGHT: u32 = 0x10;
+
+/// `kern_return_t mach_port_construct(ipc_space_t, mach_port_options_ptr_t,
+/// mach_port_context_t, mach_port_name_t *)`: a receive right, with the
+/// options this runtime has a meaning for.
+///
+/// A send right asked for with `MPO_INSERT_SEND_RIGHT` is the receive right's
+/// own name, which sends here already: a message to a receive right's name
+/// reaches its queue. The queue limit, the guard and the importance flags
+/// change nothing a single process can observe.
+///
+/// # Safety
+///
+/// `options` is null or a `mach_port_options_t`; `out` is writable.
+pub unsafe extern "C" fn mach_port_construct(
+    task: Name,
+    options: *const PortOptions,
+    _context: u64,
+    out: *mut Name,
+) -> i32 {
+    let _send_too = !options.is_null() && unsafe { (*options).flags } & MPO_INSERT_SEND_RIGHT != 0;
+    // SAFETY: the caller's `out`.
+    unsafe { mach_port_allocate(task, RIGHT_RECEIVE, out) }
+}
+
+/// `kern_return_t mach_port_destruct(ipc_space_t, mach_port_name_t,
+/// mach_port_delta_t srdelta, mach_port_context_t guard)`: the receive right
+/// goes, and with it the send rights its name carried.
+pub extern "C" fn mach_port_destruct(task: Name, name: Name, _srdelta: i32, _guard: u64) -> i32 {
+    if task != TASK_SELF {
+        return KERN_INVALID_TASK;
+    }
+    with(|space| match space.names.get(&name) {
+        Some(Right::Receive(_)) => {
+            space.names.remove(&name);
+            KERN_SUCCESS
+        }
+        Some(_) => KERN_INVALID_RIGHT,
+        None => KERN_INVALID_NAME,
+    })
+}
+
+/// The open file a fileport stands for, if `name` is one.
+pub fn file(name: Name) -> Option<Arc<OwnedFd>> {
+    let guard = space().read().unwrap_or_else(|e| e.into_inner());
+    match guard.names.get(&name) {
+        Some(Right::File { file, .. }) => Some(file.clone()),
+        _ => None,
+    }
+}
+
+/// The memory object `name` is a send right to, if it is one.
+pub fn memory(name: Name) -> Option<(Arc<OwnedFd>, u64, u64)> {
+    let guard = space().read().unwrap_or_else(|e| e.into_inner());
+    match guard.names.get(&name) {
+        Some(Right::Memory { file, offset, size, .. }) => Some((file.clone(), *offset, *size)),
+        _ => None,
+    }
+}
+
 /// `kern_return_t mach_port_deallocate(ipc_space_t, mach_port_name_t)`
 pub extern "C" fn mach_port_deallocate(task: Name, name: Name) -> i32 {
     if task != TASK_SELF {
@@ -483,7 +571,9 @@ pub extern "C" fn mach_port_mod_refs(task: Name, name: Name, right: u32, delta: 
             Right::Send { refs, .. }
             | Right::Dead { refs }
             | Right::Task { refs, .. }
-            | Right::Thread { refs, .. } => {
+            | Right::Thread { refs, .. }
+            | Right::Memory { refs, .. }
+            | Right::File { refs, .. } => {
                 let updated = *refs as i64 + delta as i64;
                 if updated < 0 {
                     return KERN_INVALID_VALUE;
@@ -563,6 +653,15 @@ pub extern "C" fn mach_port_insert_right(
     with(|space| {
         if space.names.contains_key(&name) && name != right {
             return KERN_RIGHT_EXISTS;
+        }
+        // A send right made under the receive right's own name: the name
+        // already sends to the port, and replacing the entry would lose the
+        // receive right the caller is about to listen on.
+        if name == right
+            && matches!(space.names.get(&name), Some(Right::Receive(_)))
+            && disposition == super::msg::MAKE_SEND
+        {
+            return KERN_SUCCESS;
         }
         let inserted = match disposition {
             super::msg::MAKE_SEND | super::msg::COPY_SEND | super::msg::MOVE_SEND => Right::Send {

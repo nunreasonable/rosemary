@@ -28,6 +28,18 @@ unsafe extern "C" fn load_named(
     let Some(path) = path else {
         return 0;
     };
+    // SAFETY: the caller's output slot, null or writable.
+    unsafe { instantiate_at(&path, owner, top_level) }
+}
+
+/// Load the nib at `path` with `owner` as File's Owner, handing the
+/// top-level objects back through `top_level` when it is not null.
+///
+/// # Safety
+///
+/// `top_level` is null or a writable `NSArray **`.
+unsafe fn instantiate_at(path: &Path, owner: Id, top_level: *mut Id) -> u8 {
+    let path = path.to_path_buf();
     let loaded = match load(&path, owner) {
         Ok(loaded) => loaded,
         Err(why) => {
@@ -54,6 +66,65 @@ unsafe extern "C" fn load_named(
     1
 }
 
+/// Each `NSNib`'s file, beside the object: the class is subclassable, so its
+/// instance size stays Apple's.
+static NIBS: std::sync::Mutex<Vec<(usize, std::path::PathBuf)>> = std::sync::Mutex::new(Vec::new());
+
+/// `-[NSNib initWithNibNamed:bundle:]`: nil when the bundle - the main one
+/// for nil - has no nib of that name, as AppKit answers.
+unsafe extern "C" fn nib_init_named(receiver: Id, _sel: objc::sel::Sel, name: Id, bundle: Id) -> Id {
+    // SAFETY: `+mainBundle` is `id (Class, SEL)`.
+    let bundle = match bundle.is_null() {
+        false => bundle,
+        true => unsafe {
+            let class = objc::class::lookup(c"NSBundle").map_or(std::ptr::null_mut(), |c| {
+                objc::class::ptr(c) as Id
+            });
+            let f: unsafe extern "C" fn(Id, objc::sel::Sel) -> Id =
+                std::mem::transmute(objc::msg::entry());
+            f(class, objc::sel::get("mainBundle"))
+        },
+    };
+    // SAFETY: an NSString or nil.
+    let name = String::from_utf8(unsafe { foundation::string::bytes(name) }).unwrap_or_default();
+    let path = unsafe { foundation::bundle::resource_for_object(bundle, &name, "nib") }
+        .or_else(|| unsafe { foundation::bundle::resource_for_object(bundle, &name, "") });
+    let Some(path) = path else {
+        objc::arc::release(receiver);
+        return std::ptr::null_mut();
+    };
+    let mut nibs = NIBS.lock().unwrap_or_else(|e| e.into_inner());
+    nibs.retain(|(n, _)| *n != receiver as usize);
+    nibs.push((receiver as usize, path));
+    receiver
+}
+
+/// `-[NSNib instantiateWithOwner:topLevelObjects:]`.
+unsafe extern "C" fn nib_instantiate(receiver: Id, _sel: objc::sel::Sel, owner: Id, top_level: *mut Id) -> u8 {
+    if !top_level.is_null() {
+        // SAFETY: the caller passed a writable `NSArray **`.
+        unsafe { *top_level = std::ptr::null_mut() };
+    }
+    let path = NIBS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .find(|(n, _)| *n == receiver as usize)
+        .map(|(_, p)| p.clone());
+    match path {
+        // SAFETY: the caller's output slot.
+        Some(path) => unsafe { instantiate_at(&path, owner, top_level) },
+        None => 0,
+    }
+}
+
+unsafe extern "C" fn nib_dealloc(receiver: Id, _sel: objc::sel::Sel) {
+    NIBS.lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .retain(|(n, _)| *n != receiver as usize);
+    objc::arc::finalize(receiver);
+}
+
 /// `+[NSBundle loadNibNamed:owner:]`, the pre-10.8 spelling. It searches the
 /// bundle of the owner's class. The top-level objects stay retained for the owner to release, which
 /// is what the old API promised and what [`load`] already does.
@@ -78,6 +149,13 @@ pub(crate) fn install() {
     });
     class_methods!(bundle, {
         "loadNibNamed:owner:" => load_named_class, c"c32@0:8@16@24";
+    });
+    let nib = objc::class::lookup(c"NSNib").expect("declared before its methods");
+    methods!(nib, {
+        "initWithNibNamed:bundle:" => nib_init_named, c"@32@0:8@16@24";
+        "instantiateWithOwner:topLevelObjects:" => nib_instantiate, c"B32@0:8@16^@24";
+        "instantiateNibWithOwner:topLevelObjects:" => nib_instantiate, c"B32@0:8@16^@24";
+        "dealloc" => nib_dealloc, c"v16@0:8";
     });
 }
 

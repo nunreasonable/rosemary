@@ -198,6 +198,10 @@ mod guest_slot {
     }
 }
 
+/// What the host's `errno` holds after a reconciliation: no host call sets it.
+#[cfg(not(target_os = "macos"))]
+const UNSET: libc::c_int = 0x7ffe;
+
 /// `int *__error(void)`, as the guest imports it.
 ///
 /// A real function rather than a rebound host symbol, so the guest gets the same
@@ -214,8 +218,9 @@ mod guest_slot {
 ///    call changed it; the guest's slot is refreshed from it.
 /// 2. Otherwise the guest's slot is left alone, which is what makes `errno = 0`
 ///    stick across an intervening host call that succeeded quietly.
-/// 3. The guest's value is pushed back to the host's slot and remembered, so
-///    that a shim in this crate reading [`get`] sees what the guest set.
+/// 3. The host's slot is set to a number no host call produces, so that any
+///    host failure after this, whatever its number, shows as a change. A shim
+///    in this crate that wants the guest's value reads [`guest_errno`].
 ///
 /// The one case it cannot get right is a guest write and a host write between
 /// the same pair of calls, where the host's wins. There is no `errno` read
@@ -243,9 +248,14 @@ pub fn guest_location() -> *mut libc::c_int {
                 if host != pushed.get() {
                     value.set(from_host(host));
                 }
-                let now = to_host(value.get());
-                pushed.set(now);
-                set(now);
+                // A number no host call sets, rather than the guest's own:
+                // with the guest's value there, a host call failing with that
+                // same number after the guest cleared `errno` would leave the
+                // host's slot unchanged and the failure unseen - `errno = 0`,
+                // then `access` failing with the `ENOENT` the slot already
+                // held, reads back as success.
+                pushed.set(UNSET);
+                set(UNSET);
                 value.as_ptr()
             })
         })

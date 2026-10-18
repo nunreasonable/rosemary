@@ -46,6 +46,38 @@ pub unsafe extern "C" fn OSAtomicAdd32Barrier(amount: i32, value: *mut c_void) -
 }
 
 #[allow(non_snake_case)]
+pub unsafe extern "C" fn OSAtomicIncrement32(value: *mut c_void) -> i32 {
+    unsafe { OSAtomicAdd32(1, value) }
+}
+
+#[allow(non_snake_case)]
+pub unsafe extern "C" fn OSAtomicIncrement32Barrier(value: *mut c_void) -> i32 {
+    unsafe { OSAtomicAdd32Barrier(1, value) }
+}
+
+#[allow(non_snake_case)]
+pub unsafe extern "C" fn OSAtomicDecrement32(value: *mut c_void) -> i32 {
+    unsafe { OSAtomicAdd32(-1, value) }
+}
+
+#[allow(non_snake_case)]
+pub unsafe extern "C" fn OSAtomicDecrement32Barrier(value: *mut c_void) -> i32 {
+    unsafe { OSAtomicAdd32Barrier(-1, value) }
+}
+
+/// `int32_t OSAtomicAnd32Barrier(uint32_t mask, volatile uint32_t *)`: the new value.
+#[allow(non_snake_case)]
+pub unsafe extern "C" fn OSAtomicAnd32Barrier(mask: u32, value: *mut c_void) -> i32 {
+    unsafe { atomic_i32(value) }.fetch_and(mask as i32, Ordering::SeqCst) & mask as i32
+}
+
+/// `int32_t OSAtomicOr32Barrier(uint32_t mask, volatile uint32_t *)`: the new value.
+#[allow(non_snake_case)]
+pub unsafe extern "C" fn OSAtomicOr32Barrier(mask: u32, value: *mut c_void) -> i32 {
+    unsafe { atomic_i32(value) }.fetch_or(mask as i32, Ordering::SeqCst) | mask as i32
+}
+
+#[allow(non_snake_case)]
 pub unsafe extern "C" fn OSAtomicAdd64(amount: i64, value: *mut c_void) -> i64 {
     unsafe { atomic_i64(value) }
         .fetch_add(amount, Ordering::Relaxed)
@@ -211,6 +243,12 @@ exports::exports! {
     functions {
         "OSAtomicAdd32" => OSAtomicAdd32,
         "OSAtomicAdd32Barrier" => OSAtomicAdd32Barrier,
+        "OSAtomicIncrement32" => OSAtomicIncrement32,
+        "OSAtomicIncrement32Barrier" => OSAtomicIncrement32Barrier,
+        "OSAtomicDecrement32" => OSAtomicDecrement32,
+        "OSAtomicDecrement32Barrier" => OSAtomicDecrement32Barrier,
+        "OSAtomicAnd32Barrier" => OSAtomicAnd32Barrier,
+        "OSAtomicOr32Barrier" => OSAtomicOr32Barrier,
         "OSAtomicAdd64" => OSAtomicAdd64,
         "OSAtomicAdd64Barrier" => OSAtomicAdd64Barrier,
         "OSAtomicCompareAndSwap32" => OSAtomicCompareAndSwap32,

@@ -335,7 +335,15 @@ pub fn install() {
     // `abort`, with no pc, no image and no registers. The handler restores the
     // previous disposition and returns, so the abort still happens - this only
     // adds the sentence in front of it.
-    for signal in [libc::SIGSEGV, libc::SIGBUS, libc::SIGABRT] {
+    // `SIGTRAP` too when the guest's handlers are being kept out: it is how a
+    // release build's `CHECK` dies - an `int3` - and otherwise it leaves no
+    // report at all.
+    let keep = std::env::var_os(KEEP_FAULT_HANDLER_ENV).is_some_and(|v| v != "0");
+    let signals: &[libc::c_int] = match keep {
+        true => &[libc::SIGSEGV, libc::SIGBUS, libc::SIGABRT, libc::SIGTRAP],
+        false => &[libc::SIGSEGV, libc::SIGBUS, libc::SIGABRT],
+    };
+    for &signal in signals {
         // SAFETY: `action` and `old` are live locals of the right type;
         // `sa_sigaction` holds a handler with the `SA_SIGINFO` signature, which
         // is what `SA_SIGINFO` in the flags declares it to be. Installing a
@@ -383,7 +391,7 @@ fn keep_the_fault_signals() {
     if !std::env::var_os(KEEP_FAULT_HANDLER_ENV).is_some_and(|v| v != "0") {
         return;
     }
-    for signal in [libc::SIGSEGV, libc::SIGBUS, libc::SIGABRT, libc::SIGILL] {
+    for signal in [libc::SIGSEGV, libc::SIGBUS, libc::SIGABRT, libc::SIGILL, libc::SIGTRAP] {
         // The registry is keyed by Darwin's numbering, which is what the guest's
         // `sigaction` is given. `SIGBUS` is 10 there and 7 here.
         if let Some(darwin) = darwin::signal::signal_from_host(signal) {
@@ -393,7 +401,7 @@ fn keep_the_fault_signals() {
     install_alternate_stack();
     darwin::signal::retain_altstack();
     eprintln!(
-        "rosemary: the guest's own handlers for SIGSEGV, SIGBUS, SIGABRT and SIGILL will be \
+        "rosemary: the guest's own handlers for SIGSEGV, SIGBUS, SIGABRT, SIGILL and SIGTRAP will be \
          accepted and ignored ({KEEP_FAULT_HANDLER_ENV} is set)"
     );
 }
@@ -461,11 +469,13 @@ const fn saved() -> Saved {
 static SEGV: Saved = saved();
 static BUS: Saved = saved();
 static ABRT: Saved = saved();
+static TRAP: Saved = saved();
 
 fn saved_for(signal: i32) -> &'static Saved {
     match signal {
         libc::SIGBUS => &BUS,
         libc::SIGABRT => &ABRT,
+        libc::SIGTRAP => &TRAP,
         _ => &SEGV,
     }
 }
@@ -614,6 +624,7 @@ extern "C" fn report(signal: i32, info: *mut libc::siginfo_t, context: *mut libc
             libc::SIGBUS => "SIGBUS",
             libc::SIGSEGV => "SIGSEGV",
             libc::SIGABRT => "SIGABRT",
+            libc::SIGTRAP => "SIGTRAP",
             _ => "signal",
         });
         line.str(" on thread ");
@@ -638,6 +649,7 @@ extern "C" fn report(signal: i32, info: *mut libc::siginfo_t, context: *mut libc
         libc::SIGBUS => "SIGBUS",
         libc::SIGSEGV => "SIGSEGV",
         libc::SIGABRT => "SIGABRT",
+        libc::SIGTRAP => "SIGTRAP",
         _ => "signal",
     });
 
@@ -674,6 +686,13 @@ extern "C" fn report(signal: i32, info: *mut libc::siginfo_t, context: *mut libc
     // than not at all - [`salvage`] covers the case where the handler dies
     // before it can add the rest.
     out.flush();
+    if signal == libc::SIGTRAP
+        || std::env::var_os(KEEP_FAULT_HANDLER_ENV).is_some_and(|v| v != "0")
+    {
+        say_frame_chain(out, context);
+        say_stack_scan(out, context);
+        out.flush();
+    }
 
     if let Some(pc) = host_pc(context) {
         // Before the frame walk, because when it applies it is the answer and
@@ -1080,6 +1099,17 @@ fn say_image(out: &mut Buffer, addr: u64) -> bool {
 fn say_thread(out: &mut Buffer) {
     out.str("\n  thread ");
     out.hex(u64::from(crate::thread::key()));
+    #[cfg(target_os = "linux")]
+    {
+        let mut name = [0u8; 17];
+        // SAFETY: `PR_GET_NAME` writes at most sixteen bytes and a NUL.
+        if unsafe { libc::prctl(libc::PR_GET_NAME, name.as_mut_ptr()) } == 0 {
+            let end = name.iter().position(|b| *b == 0).unwrap_or(16);
+            out.str(" \"");
+            out.str(std::str::from_utf8(&name[..end]).unwrap_or("?"));
+            out.str("\"");
+        }
+    }
     let Some(state) = crate::thread::current() else {
         out.str(" - not a guest thread; the fault is in this runtime or in a host library");
         return;
@@ -1261,6 +1291,102 @@ fn say_registers(out: &mut Buffer, context: *mut libc::c_void) {
 
 #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
 fn say_registers(_out: &mut Buffer, _context: *mut libc::c_void) {}
+
+/// The return addresses up the frame-pointer chain from the trap, each named
+/// by its mapping: a `CHECK` in a release build is an `int3` in a function
+/// the linker folded with every other one, so the frame above is the only
+/// thing that says which check it was.
+///
+/// Every link is checked to lie a little above the last and within a few
+/// megabytes of the stack pointer before it is read, which keeps the walk on
+/// the stack it started on.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn say_frame_chain(out: &mut Buffer, context: *mut libc::c_void) {
+    if context.is_null() {
+        return;
+    }
+    // SAFETY: as in `say_registers`.
+    let gregs = unsafe { &(*(context as *const libc::ucontext_t)).uc_mcontext.gregs };
+    let rsp = gregs[libc::REG_RSP as usize] as u64;
+    let mut rbp = gregs[libc::REG_RBP as usize] as u64;
+    let limit = rsp.saturating_add(8 << 20);
+    for _ in 0..16 {
+        if rbp < rsp || rbp >= limit || rbp % 8 != 0 {
+            break;
+        }
+        // SAFETY: a word inside the stack range just checked.
+        let (next, ret) = unsafe { (*(rbp as *const u64), *((rbp + 8) as *const u64)) };
+        if ret == 0 {
+            break;
+        }
+        out.str("\n  frame return ");
+        out.hex(ret);
+        say_host_mapping(out, ret);
+        if next <= rbp {
+            break;
+        }
+        rbp = next;
+    }
+}
+
+#[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+fn say_frame_chain(_out: &mut Buffer, _context: *mut libc::c_void) {}
+
+/// `ROSEMARY_FAULT_STACK_SCAN=1`: every word near the faulting stack pointer
+/// that points into this runtime's own code, named by mapping and offset.
+///
+/// A scan, not an unwind: what it finds are candidates, some of them stale.
+/// What it is for is the frames the frame-pointer walk cannot cross - this
+/// runtime's own, built without frame pointers - so that a guest callback run
+/// from the wrong place can be traced back to the code that ran it.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn say_stack_scan(out: &mut Buffer, context: *mut libc::c_void) {
+    if context.is_null() || std::env::var_os("ROSEMARY_FAULT_STACK_SCAN").is_none() {
+        return;
+    }
+    unsafe extern "C" {
+        static __executable_start: u8;
+        static etext: u8;
+    }
+    // SAFETY: linker-provided symbols, read for their addresses only.
+    let (start, end) = unsafe {
+        (
+            &raw const __executable_start as u64,
+            &raw const etext as u64,
+        )
+    };
+    // SAFETY: as in `say_registers`.
+    let gregs = unsafe { &(*(context as *const libc::ucontext_t)).uc_mcontext.gregs };
+    let rsp = gregs[libc::REG_RSP as usize] as u64;
+    let mut found = 0;
+    for i in 0..4096u64 {
+        let at = rsp + i * 8;
+        // Stop at the first unreadable page rather than fault on it.
+        if at % 4096 == 0 {
+            let mut probe = 0u8;
+            // SAFETY: `mincore` only reports residency, and fails for an
+            // unmapped page instead of faulting.
+            if unsafe { libc::mincore(at as *mut libc::c_void, 1, &mut probe) } != 0 {
+                break;
+            }
+        }
+        // SAFETY: inside a page `mincore` just accepted, or the one `rsp` is in.
+        let word = unsafe { *(at as *const u64) };
+        if (start..end).contains(&word) {
+            out.str("\n  stack word ");
+            out.hex(word);
+            out.str(" = rosemary + ");
+            out.hex(word - start);
+            found += 1;
+            if found == 48 {
+                break;
+            }
+        }
+    }
+}
+
+#[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+fn say_stack_scan(_out: &mut Buffer, _context: *mut libc::c_void) {}
 
 /// Name the host mapping a `pc` outside any translation fell in.
 ///

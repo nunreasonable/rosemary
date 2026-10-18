@@ -1017,9 +1017,25 @@ pub unsafe extern "C" fn get_specific(key: usize) -> usize {
     0
 }
 
-/// `void dispatch_set_target_queue(dispatch_object_t, dispatch_queue_t)`.
+/// `void dispatch_set_target_queue(dispatch_object_t, dispatch_queue_t)`: the
+/// queue a queue's work, or a source's handlers, runs on. Null is the default
+/// global queue, which is where an untargeted queue's work runs anyway.
 ///
-/// FIXME (ACCURACY): accepted and not applied. A target's priority means
-/// nothing to this runtime's threads, but a serial target that several queues
-/// share also serialises their work against each other, and that is not done.
-pub unsafe extern "C" fn set_target_queue(_object: u64, _target: u64) {}
+/// # Safety
+///
+/// Both are null or live dispatch objects, and - as Darwin requires - the
+/// object is not running work while its target changes.
+pub unsafe extern "C" fn set_target_queue(object: u64, target: u64) {
+    if super::source::set_queue(object, target) {
+        return;
+    }
+    // SAFETY: the caller's guarantee for `object`.
+    if unsafe { queue(object) }.is_none() {
+        return;
+    }
+    object::retain(target);
+    // SAFETY: a live queue, not running work, per the caller.
+    let old = unsafe { std::mem::replace(&mut (*(object as *mut Queue)).target, target) };
+    // SAFETY: the reference the old target held.
+    unsafe { object::release(old) };
+}

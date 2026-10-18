@@ -29,6 +29,8 @@ const _: () = {
 
 const EVFILT_READ: i16 = -1;
 const EVFILT_WRITE: i16 = -2;
+const EVFILT_PROC: i16 = -5;
+const EVFILT_TIMER: i16 = -7;
 const EVFILT_SIGNAL: i16 = -6;
 const EVFILT_MACHPORT: i16 = -8;
 const EVFILT_USER: i16 = -10;
@@ -43,6 +45,67 @@ const EV_RECEIPT: u16 = 0x0040;
 const EV_DISPATCH: u16 = 0x0080;
 const EV_ERROR: u16 = 0x4000;
 const EV_EOF: u16 = 0x8000;
+
+/// `EVFILT_TIMER`'s units and clock, in its `fflags`.
+const NOTE_SECONDS: u32 = 0x1;
+const NOTE_USECONDS: u32 = 0x2;
+const NOTE_NSECONDS: u32 = 0x4;
+const NOTE_ABSOLUTE: u32 = 0x8;
+const NOTE_MACHTIME: u32 = 0x100;
+
+/// An `EVFILT_TIMER` registration's schedule, in nanoseconds of the
+/// monotonic clock, which is also what `mach_absolute_time` counts.
+#[derive(Clone, Copy)]
+struct Timer {
+    deadline: u64,
+    /// The interval to re-arm with, for a periodic timer.
+    period: Option<u64>,
+}
+
+fn monotonic_ns() -> u64 {
+    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    // SAFETY: writes the one `timespec` it is given.
+    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+    ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
+}
+
+/// The schedule a timer registration asks for.
+///
+/// `NOTE_ABSOLUTE` is a deadline - in mach ticks with `NOTE_MACHTIME`, which
+/// here are nanoseconds, and otherwise in the wall clock's units since the
+/// epoch - and anything else a period, which `EV_ONESHOT` fires once.
+fn timer_for(change: &Kevent) -> Timer {
+    let units = |value: u64| -> u64 {
+        match change.fflags {
+            f if f & NOTE_SECONDS != 0 => value.saturating_mul(1_000_000_000),
+            f if f & NOTE_USECONDS != 0 => value.saturating_mul(1_000),
+            f if f & (NOTE_NSECONDS | NOTE_MACHTIME) != 0 => value,
+            _ => value.saturating_mul(1_000_000),
+        }
+    };
+    let value = change.data.max(0) as u64;
+    let now = monotonic_ns();
+    if change.fflags & NOTE_ABSOLUTE != 0 {
+        let deadline = match change.fflags & NOTE_MACHTIME {
+            0 => {
+                let wall = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_nanos() as u64);
+                now.saturating_add(units(value).saturating_sub(wall))
+            }
+            _ => value,
+        };
+        return Timer { deadline, period: None };
+    }
+    let period = units(value).max(1);
+    Timer {
+        deadline: now.saturating_add(period),
+        period: (change.flags & EV_ONESHOT == 0).then_some(period),
+    }
+}
+
+/// `NOTE_EXIT`, the `EVFILT_PROC` event this kqueue reports.
+const NOTE_EXIT: u32 = 0x8000_0000;
 
 /// `NOTE_TRIGGER`, the one `fflags` bit `EVFILT_USER` acts on.
 const NOTE_TRIGGER: u32 = 0x0100_0000;
@@ -95,6 +158,11 @@ struct Queue<B> {
     /// delivered is one event, not two.
     triggered: VecDeque<usize>,
     triggered_set: HashSet<usize>,
+    /// Processes an `EVFILT_PROC` registration watches that have exited and
+    /// not yet been reported, by pid.
+    exited: VecDeque<usize>,
+    /// `EVFILT_TIMER` schedules, by ident.
+    timers: HashMap<usize, Timer>,
     backend: Arc<B>,
 }
 
@@ -115,6 +183,8 @@ impl<B> Queue<B> {
             port_watch: HashMap::new(),
             triggered: VecDeque::new(),
             triggered_set: HashSet::new(),
+            exited: VecDeque::new(),
+            timers: HashMap::new(),
             backend: Arc::new(backend),
         }
     }
@@ -942,6 +1012,54 @@ pub(crate) fn signalled() {
     }
 }
 
+/// Watch `pid` for its exit on a thread of its own, through a pidfd, and
+/// record it in every queue registered for it once it has gone.
+///
+/// `ESRCH` for a process that does not exist, which is BSD's answer at
+/// registration and the one a caller tests for.
+fn watch_exit(pid: i32) -> Result<(), c_int> {
+    // SAFETY: `pidfd_open` takes a pid and flags and returns a descriptor.
+    let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) } as c_int;
+    if pidfd < 0 {
+        return Err(crate::errno::from_host(crate::errno::get()));
+    }
+    let spawned = std::thread::Builder::new()
+        .name("kqueue-proc".into())
+        .stack_size(64 * 1024)
+        .spawn(move || {
+            let mut entry = libc::pollfd {
+                fd: pidfd,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: one `pollfd` on this stack; the pidfd is this thread's.
+            while unsafe { libc::poll(&mut entry, 1, -1) } < 0
+                && crate::errno::get() == libc::EINTR
+            {}
+            // SAFETY: closing the pidfd this thread owns.
+            unsafe { libc::close(pidfd) };
+            let all: Vec<_> = queues()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .values()
+                .cloned()
+                .collect();
+            for queue in all {
+                let mut state = queue.lock().unwrap_or_else(|e| e.into_inner());
+                if state.registrations.contains_key(&(pid as usize, EVFILT_PROC)) {
+                    state.exited.push_back(pid as usize);
+                    state.backend.wake();
+                }
+            }
+        });
+    if spawned.is_err() {
+        // SAFETY: the pidfd no thread took.
+        unsafe { libc::close(pidfd) };
+        return Err(crate::errno::from_host(libc::ENOMEM));
+    }
+    Ok(())
+}
+
 /// Drain the wakeup channel, which is level-triggered and would otherwise
 /// return from every later `poll` at once.
 fn drain_fd(queue: c_int) {
@@ -959,7 +1077,8 @@ fn drain_fd(queue: c_int) {
 fn apply<B: ReadinessBackend>(state: &mut Queue<B>, change: &Kevent) -> Result<(), c_int> {
     if !matches!(
         change.filter,
-        EVFILT_READ | EVFILT_WRITE | EVFILT_USER | EVFILT_SIGNAL | EVFILT_MACHPORT
+        EVFILT_READ | EVFILT_WRITE | EVFILT_USER | EVFILT_SIGNAL | EVFILT_MACHPORT | EVFILT_PROC
+            | EVFILT_TIMER
     ) {
         return Err(crate::errno::from_host(libc::EINVAL));
     }
@@ -981,6 +1100,9 @@ fn apply<B: ReadinessBackend>(state: &mut Queue<B>, change: &Kevent) -> Result<(
         state.triggered_set = triggered_set;
         if change.filter == EVFILT_SIGNAL {
             let _ = crate::signal::observe(change.ident as i32, false);
+        }
+        if change.filter == EVFILT_TIMER {
+            state.timers.remove(&change.ident);
         }
         return Ok(());
     }
@@ -1020,6 +1142,17 @@ fn apply<B: ReadinessBackend>(state: &mut Queue<B>, change: &Kevent) -> Result<(
                 Name::try_from(change.ident).map_err(|_| crate::errno::from_host(libc::EINVAL))?;
             if space::receiver(name).is_none() && space::members(name).is_none() {
                 return Err(crate::errno::from_host(libc::EINVAL));
+            }
+        } else if change.filter == EVFILT_TIMER {
+            // Adding again replaces the schedule, as Darwin's does.
+            state.timers.insert(change.ident, timer_for(change));
+        } else if change.filter == EVFILT_PROC {
+            // Only the exit is reported; a registration for anything else
+            // is accepted and never fires, as for a process that does not
+            // fork or exec.
+            let pid = i32::try_from(change.ident).map_err(|_| crate::errno::from_host(libc::ESRCH))?;
+            if registrations.get(&key).is_none() && change.fflags & NOTE_EXIT != 0 {
+                watch_exit(pid)?;
             }
         } else if change.filter != EVFILT_USER {
             let fd =
@@ -1141,7 +1274,10 @@ fn sync_interest<B: ReadinessBackend>(
     filter: i16,
     ident: usize,
 ) -> Result<(), c_int> {
-    if matches!(filter, EVFILT_USER | EVFILT_SIGNAL | EVFILT_MACHPORT) {
+    if matches!(
+        filter,
+        EVFILT_USER | EVFILT_SIGNAL | EVFILT_MACHPORT | EVFILT_PROC | EVFILT_TIMER
+    ) {
         return Ok(());
     }
     let fd = c_int::try_from(ident).map_err(|_| crate::errno::from_host(libc::EBADF))?;
@@ -1153,6 +1289,24 @@ fn sync_interest<B: ReadinessBackend>(
             interest_for(registrations, fd),
         )
         .map_err(crate::errno::from_host)
+}
+
+/// Nanoseconds until the earliest enabled timer is due - zero for one already
+/// due - or `None` with no timer armed.
+fn next_timer(
+    timers: &HashMap<usize, Timer>,
+    registrations: &HashMap<(usize, i16), Registration>,
+) -> Option<u64> {
+    let now = monotonic_ns();
+    timers
+        .iter()
+        .filter(|(ident, _)| {
+            registrations
+                .get(&(**ident, EVFILT_TIMER))
+                .is_some_and(|r| r.enabled)
+        })
+        .map(|(_, t)| t.deadline.saturating_sub(now))
+        .min()
 }
 
 /// The `poll` timeout in milliseconds, or -1 for "wait forever".
@@ -1187,7 +1341,7 @@ fn poll_set(
         if !registration.enabled
             || matches!(
                 registration.filter,
-                EVFILT_USER | EVFILT_SIGNAL | EVFILT_MACHPORT
+                EVFILT_USER | EVFILT_SIGNAL | EVFILT_MACHPORT | EVFILT_PROC | EVFILT_TIMER
             )
         {
             continue;
@@ -1303,6 +1457,8 @@ pub unsafe extern "C" fn kevent(
     let triggered = {
         let state = state.lock().unwrap_or_else(|e| e.into_inner());
         !state.triggered.is_empty()
+            || !state.exited.is_empty()
+            || next_timer(&state.timers, &state.registrations) == Some(0)
             || signals_pending(&state.registrations)
             || ports.iter().any(|port| port.ready())
     };
@@ -1310,7 +1466,20 @@ pub unsafe extern "C" fn kevent(
     let wait = match triggered {
         true => 0,
         false => match timeout_ms(timeout) {
-            Ok(ms) => ms,
+            Ok(ms) => {
+                let state = state.lock().unwrap_or_else(|e| e.into_inner());
+                match next_timer(&state.timers, &state.registrations) {
+                    // Rounded up, so the wait does not end just short of it.
+                    Some(ns) => {
+                        let timer = ns.div_ceil(1_000_000).min(c_int::MAX as u64) as c_int;
+                        match ms {
+                            -1 => timer,
+                            ms => ms.min(timer),
+                        }
+                    }
+                    None => ms,
+                }
+            }
             Err(errno) => {
                 crate::errno::set(crate::errno::to_host(errno));
                 return -1;
@@ -1348,6 +1517,77 @@ pub unsafe extern "C" fn kevent(
             && registration.enabled
         {
             out.push(registration.fired());
+        }
+    }
+
+    while out.len() < capacity {
+        let Some(pid) = state.exited.pop_front() else {
+            break;
+        };
+        let key = (pid, EVFILT_PROC);
+        let Some(registration) = state.registrations.get_mut(&key) else {
+            continue;
+        };
+        if !registration.enabled {
+            continue;
+        }
+        let mut event = registration.fired();
+        event.fflags = NOTE_EXIT;
+        out.push(event);
+        if registration.flags & EV_ONESHOT != 0 {
+            state.registrations.remove(&key);
+        } else if registration.flags & EV_DISPATCH != 0 {
+            registration.enabled = false;
+        }
+    }
+
+    let now = monotonic_ns();
+    let timers_state = &mut *state;
+    let mut due: Vec<usize> = timers_state
+        .timers
+        .iter()
+        .filter(|(_, t)| t.deadline <= now)
+        .map(|(ident, _)| *ident)
+        .collect();
+    due.sort_unstable();
+    for ident in due {
+        if out.len() == capacity {
+            break;
+        }
+        let key = (ident, EVFILT_TIMER);
+        let Some(registration) = timers_state.registrations.get_mut(&key) else {
+            timers_state.timers.remove(&ident);
+            continue;
+        };
+        if !registration.enabled {
+            continue;
+        }
+        let timer = timers_state.timers[&ident];
+        let fired = match timer.period {
+            Some(period) => {
+                let count = (now - timer.deadline) / period + 1;
+                timers_state.timers.insert(
+                    ident,
+                    Timer {
+                        deadline: timer.deadline.saturating_add(count * period),
+                        period: Some(period),
+                    },
+                );
+                count
+            }
+            None => {
+                timers_state.timers.remove(&ident);
+                1
+            }
+        };
+        let mut event = registration.fired();
+        event.data = fired as isize;
+        out.push(event);
+        if registration.flags & EV_ONESHOT != 0 || timer.period.is_none() {
+            timers_state.registrations.remove(&key);
+            timers_state.timers.remove(&ident);
+        } else if registration.flags & EV_DISPATCH != 0 {
+            registration.enabled = false;
         }
     }
 
@@ -1570,13 +1810,168 @@ fn signals_pending(registrations: &HashMap<(usize, i16), Registration>) -> bool 
     })
 }
 
-/// `kevent64` and the filters `poll` cannot answer; see the module note.
-pub const REFUSED: &[&str] = &["kevent64", "kevent_qos"];
+/// `struct kevent64_s`: `kevent`'s fields widened, and two more words.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct Kevent64 {
+    pub ident: u64,
+    pub filter: i16,
+    pub flags: u16,
+    pub fflags: u32,
+    pub data: i64,
+    pub udata: u64,
+    pub ext: [u64; 2],
+}
+
+const _: () = assert!(size_of::<Kevent64>() == 48);
+
+/// `KEVENT_FLAG_IMMEDIATE`: do not wait, as a zero timeout.
+const KEVENT_FLAG_IMMEDIATE: u32 = 0x1;
+
+/// `MACH_RCV_TIMEOUT`, for the receive that empties a port into its event.
+const MACH_RCV_TIMEOUT: i32 = 0x0000_0100;
+
+/// `EVFILT_MACHPORT` registrations that receive into the event: the buffer
+/// and its size, by queue and port.
+static RECEIVE_INTO: Mutex<Vec<((c_int, u64), (u64, u64))>> = Mutex::new(Vec::new());
+
+/// `int kevent64(int kq, const struct kevent64_s *changelist, int nchanges,
+/// struct kevent64_s *eventlist, int nevents, unsigned int flags,
+/// const struct timespec *timeout)`.
+///
+/// `kevent` underneath, with one thing it cannot do done here: an
+/// `EVFILT_MACHPORT` registration with `MACH_RCV_MSG` has the message
+/// received into the buffer its `ext` words name when the event is
+/// delivered, which is how a run loop takes a wakeup message without a second
+/// call. The receive's status is the event's `fflags` and the message size
+/// its `ext[1]`, as Darwin reports them.
+///
+/// # Safety
+///
+/// As `kevent`, for arrays of `kevent64_s`; a receive buffer must be writable
+/// for its size.
+pub unsafe extern "C" fn kevent64(
+    queue: c_int,
+    changes: *const Kevent64,
+    nchanges: c_int,
+    events: *mut Kevent64,
+    nevents: c_int,
+    flags: u32,
+    timeout: *const libc::timespec,
+) -> c_int {
+    if nchanges < 0 || nevents < 0 {
+        crate::errno::set(libc::EINVAL);
+        return -1;
+    }
+    let changes: &[Kevent64] = match (nchanges, changes.is_null()) {
+        (0, _) => &[],
+        (_, true) => {
+            crate::errno::set(libc::EINVAL);
+            return -1;
+        }
+        // SAFETY: the caller states there are `nchanges` of them.
+        (n, false) => unsafe { std::slice::from_raw_parts(changes, n as usize) },
+    };
+    let narrow: Vec<Kevent> = changes
+        .iter()
+        .map(|c| {
+            if c.filter == EVFILT_MACHPORT && c.fflags & MACH_RCV_MSG != 0 {
+                let mut into = RECEIVE_INTO.lock().unwrap_or_else(|e| e.into_inner());
+                into.retain(|(key, _)| *key != (queue, c.ident));
+                if c.flags & EV_DELETE == 0 {
+                    into.push(((queue, c.ident), (c.ext[0], c.ext[1])));
+                }
+            }
+            Kevent {
+                ident: c.ident as usize,
+                filter: c.filter,
+                flags: c.flags,
+                fflags: match c.filter {
+                    EVFILT_MACHPORT => c.fflags & !MACH_RCV_MSG,
+                    _ => c.fflags,
+                },
+                data: c.data as isize,
+                udata: c.udata as usize,
+            }
+        })
+        .collect();
+    let immediate = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    let timeout = match flags & KEVENT_FLAG_IMMEDIATE {
+        0 => timeout,
+        _ => &immediate as *const libc::timespec,
+    };
+    let mut out = vec![Kevent::default(); nevents as usize];
+    // SAFETY: arrays of the lengths given, and the caller's timeout.
+    let count = unsafe {
+        kevent(
+            queue,
+            narrow.as_ptr(),
+            narrow.len() as c_int,
+            out.as_mut_ptr(),
+            nevents,
+            timeout,
+        )
+    };
+    if count <= 0 {
+        return count;
+    }
+    for (i, event) in out.iter().take(count as usize).enumerate() {
+        let mut wide = Kevent64 {
+            ident: event.ident as u64,
+            filter: event.filter,
+            flags: event.flags,
+            fflags: event.fflags,
+            data: event.data as i64,
+            udata: event.udata as u64,
+            ext: [0; 2],
+        };
+        let receive = (event.filter == EVFILT_MACHPORT && event.flags & EV_ERROR == 0)
+            .then(|| {
+                RECEIVE_INTO
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .iter()
+                    .find(|(key, _)| *key == (queue, event.ident as u64))
+                    .map(|(_, into)| *into)
+            })
+            .flatten();
+        if let Some((buffer, size)) = receive {
+            // SAFETY: the buffer the registration named, writable for `size`.
+            let status = unsafe {
+                crate::mach::msg::mach_msg(
+                    buffer as *mut c_void,
+                    MACH_RCV_MSG as i32 | MACH_RCV_TIMEOUT,
+                    0,
+                    size as u32,
+                    event.ident as Name,
+                    0,
+                    0,
+                )
+            };
+            wide.fflags = status as u32;
+            wide.ext = [buffer, match status {
+                // SAFETY: a received header begins with its bits and size.
+                0 => (unsafe { *((buffer + 4) as *const u32) }) as u64,
+                _ => 0,
+            }];
+        }
+        // SAFETY: the caller states there is room for `nevents`.
+        unsafe { events.add(i).write(wide) };
+    }
+    count
+}
+
+/// `kevent_qos` and the filters `poll` cannot answer; see the module note.
+pub const REFUSED: &[&str] = &["kevent_qos"];
 
 exports::exports! {
     functions {
         "kqueue" => kqueue,
         "kevent" => kevent,
+        "kevent64" => kevent64,
     }
 }
 

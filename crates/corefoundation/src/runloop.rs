@@ -278,6 +278,16 @@ impl RunLoop {
     }
 
     pub fn add_source(&self, source: &Arc<Source>, mode: &str) {
+        if std::env::var_os("ROSEMARY_TRACE_RUNLOOP").is_some() {
+            eprintln!(
+                "rosemary: runloop: thread {} adds source {:p} (info {:#x}, perform {:?}) to {:p} in {mode}",
+                darwin::pthread::id(),
+                Arc::as_ptr(source),
+                source.info,
+                source.perform.map(|p| p as usize as *const ()),
+                self as *const Self,
+            );
+        }
         self.note_common(mode, |common| {
             if !common.sources.iter().any(|s| Arc::ptr_eq(s, source)) {
                 common.sources.push(Arc::clone(source));
@@ -690,10 +700,19 @@ pub fn current() -> Arc<RunLoop> {
     CURRENT.with(|cell| {
         Arc::clone(cell.get_or_init(|| {
             // SAFETY: no arguments; answers from thread ids.
-            match unsafe { darwin::pthread::main_np() } != 0 {
+            let made = match unsafe { darwin::pthread::main_np() } != 0 {
                 true => main(),
                 false => fresh(),
+            };
+            if std::env::var_os("ROSEMARY_TRACE_RUNLOOP").is_some() {
+                eprintln!(
+                    "rosemary: runloop: thread {} gets {:p} (main {:p})",
+                    darwin::pthread::id(),
+                    Arc::as_ptr(&made),
+                    Arc::as_ptr(&main()),
+                );
             }
+            made
         }))
     })
 }

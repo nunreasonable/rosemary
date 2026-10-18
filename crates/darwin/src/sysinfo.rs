@@ -1,3 +1,4 @@
+use std::os::unix::ffi::OsStrExt;
 use crate::sysctl::{
     CTL_HW, CTL_KERN, HW_MACHINE, KERN_HOSTNAME, KERN_OSRELEASE, KERN_OSTYPE, KERN_VERSION,
 };
@@ -93,13 +94,43 @@ unsafe extern "C" fn fpathconf(fd: i32, name: i32) -> i64 {
     }
 }
 
+/// `_CS_DARWIN_USER_DIR`, `_CS_DARWIN_USER_TEMP_DIR` and
+/// `_CS_DARWIN_USER_CACHE_DIR`: the per-user directories under
+/// `/var/folders`, by the leaf Darwin gives each.
+const DARWIN_USER_DIRS: [(i32, &str); 3] = [(65536, "0"), (65537, "T"), (65538, "C")];
+
+/// The guest path of one of the per-user directories, made on first ask so
+/// that a caller opening it - Chromium canonicalises them for its sandbox
+/// profile - finds it there.
+fn darwin_user_dir(leaf: &str) -> String {
+    let guest = format!("/private/var/folders/rs/rosemary/{leaf}/");
+    let spelled = std::ffi::CString::new(guest.as_str()).expect("no NUL");
+    let host = prefix::ns::to_host(&spelled);
+    let host = std::path::Path::new(std::ffi::OsStr::from_bytes(host.to_bytes()));
+    match std::fs::create_dir_all(host) {
+        Ok(()) => guest,
+        Err(_) => "/tmp/".to_owned(),
+    }
+}
+
 unsafe extern "C" fn confstr(name: i32, out: *mut libc::c_char, len: usize) -> usize {
     if name == 1 {
-        unsafe { libc::confstr(libc::_CS_PATH, out, len) }
-    } else {
-        crate::errno::set(libc::EINVAL);
-        0
+        return unsafe { libc::confstr(libc::_CS_PATH, out, len) };
     }
+    let Some((_, leaf)) = DARWIN_USER_DIRS.iter().find(|(n, _)| *n == name) else {
+        crate::errno::set(libc::EINVAL);
+        return 0;
+    };
+    let value = darwin_user_dir(leaf);
+    if !out.is_null() && len > 0 {
+        let count = value.len().min(len - 1);
+        // SAFETY: `len` bytes of the caller's buffer, NUL included.
+        unsafe {
+            std::ptr::copy_nonoverlapping(value.as_ptr().cast(), out, count);
+            *out.add(count) = 0;
+        }
+    }
+    value.len() + 1
 }
 
 /// `_SYS_NAMELEN`, the width of every field in Darwin's `struct utsname`.

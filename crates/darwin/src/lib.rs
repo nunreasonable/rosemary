@@ -91,6 +91,7 @@ pub mod signal;
 pub mod sip;
 pub mod sockpath;
 pub mod spawn;
+mod spi;
 pub mod stackprobe;
 pub mod stat;
 pub mod stdio;
@@ -376,6 +377,7 @@ static NONPORTABLE_MODULES: &[exports::Module] = &[
     sched::MODULE,
     random::MODULE,
     hostid::MODULE,
+    spi::MODULE,
     ioctl::MODULE,
     ulock::MODULE,
     data::MODULE,

@@ -313,11 +313,24 @@ impl Layout {
     /// `-preferredLocalizations`: the `.lproj` names strings are read from,
     /// most preferred first, restricted to the ones that exist.
     pub fn preferred_localizations(&self) -> Vec<String> {
-        self.string_localizations()
+        let found: Vec<String> = self
+            .string_localizations()
             .into_iter()
             .filter(|path| path.is_dir())
             .filter_map(|path| Some(path.file_stem()?.to_str()?.to_owned()))
-            .collect()
+            .collect();
+        if !found.is_empty() {
+            return found;
+        }
+        // A bundle with no `.lproj` at all is still in its development
+        // localization, and CFBundle says so rather than answering with
+        // nothing: a program takes the first entry as its language.
+        vec![
+            self.info_string("CFBundleDevelopmentRegion")
+                .filter(|region| !region.is_empty())
+                .unwrap_or("en")
+                .to_owned(),
+        ]
     }
 
     /// `-pathsForResourcesOfType:inDirectory:`: every entry with that extension
