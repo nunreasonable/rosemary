@@ -1026,26 +1026,87 @@ unsafe extern "C" fn inet_ntop(
     unsafe { host_inet_ntop(af, src, dst, size) }
 }
 
+/// Make a failure's `errno` the guest's, in Darwin's numbering.
+///
+/// [`crate::errno::guest_location`] reconciles the two slots by noticing that
+/// the host's changed since it last looked. A socket that fails the same way
+/// twice - `EAGAIN` on a non-blocking read, which an event loop meets every
+/// time it drains one - leaves the host's slot *unchanged*, and a guest that
+/// cleared `errno` in between reads its own zero back: libcurl's
+/// "Recv failure: Success". The calls an I/O loop retries on say so directly.
+fn reported<T: Copy + PartialOrd + Default>(result: T) -> T {
+    if result < T::default() {
+        crate::errno::set_guest(crate::errno::from_host(crate::errno::get()));
+    }
+    result
+}
+
+mod guest {
+    use super::*;
+
+    pub unsafe extern "C" fn write(fd: i32, buf: *const c_void, len: usize) -> isize {
+        reported(unsafe { super::write(fd, buf, len) })
+    }
+    pub unsafe extern "C" fn connect(fd: i32, address: *const c_void, len: u32) -> i32 {
+        reported(unsafe { super::connect(fd, address, len) })
+    }
+    pub unsafe extern "C" fn accept(fd: i32, address: *mut c_void, len: *mut u32) -> i32 {
+        reported(unsafe { super::accept(fd, address, len) })
+    }
+    pub unsafe extern "C" fn send(fd: i32, buf: *const c_void, len: usize, flags: i32) -> isize {
+        reported(unsafe { super::send(fd, buf, len, flags) })
+    }
+    pub unsafe extern "C" fn recv(fd: i32, buf: *mut c_void, len: usize, flags: i32) -> isize {
+        reported(unsafe { super::recv(fd, buf, len, flags) })
+    }
+    pub unsafe extern "C" fn sendto(
+        fd: i32,
+        buf: *const c_void,
+        len: usize,
+        flags: i32,
+        address: *const c_void,
+        addrlen: u32,
+    ) -> isize {
+        reported(unsafe { super::sendto(fd, buf, len, flags, address, addrlen) })
+    }
+    pub unsafe extern "C" fn recvfrom(
+        fd: i32,
+        buf: *mut c_void,
+        len: usize,
+        flags: i32,
+        address: *mut c_void,
+        addrlen: *mut u32,
+    ) -> isize {
+        reported(unsafe { super::recvfrom(fd, buf, len, flags, address, addrlen) })
+    }
+    pub unsafe extern "C" fn sendmsg(fd: i32, message: *const c_void, flags: i32) -> isize {
+        reported(unsafe { super::sendmsg(fd, message, flags) })
+    }
+    pub unsafe extern "C" fn recvmsg(fd: i32, message: *mut c_void, flags: i32) -> isize {
+        reported(unsafe { super::recvmsg(fd, message, flags) })
+    }
+}
+
 exports::exports! {
     functions {
-        "write" => write,
+        "write" => guest::write,
         "writev" => writev,
         "sendfile" => sendfile,
         "connectx" => connectx,
         "socket" => socket,
         "socketpair" => socketpair,
         "bind" => bind,
-        "connect" => connect,
-        "accept" => accept,
+        "connect" => guest::connect,
+        "accept" => guest::accept,
         "getsockname" => getsockname,
         "getpeername" => getpeername,
         "getpeereid" => getpeereid,
-        "send" => send,
-        "recv" => recv,
-        "sendto" => sendto,
-        "recvfrom" => recvfrom,
-        "sendmsg" => sendmsg,
-        "recvmsg" => recvmsg,
+        "send" => guest::send,
+        "recv" => guest::recv,
+        "sendto" => guest::sendto,
+        "recvfrom" => guest::recvfrom,
+        "sendmsg" => guest::sendmsg,
+        "recvmsg" => guest::recvmsg,
         "inet_pton" => inet_pton,
         "inet_ntop" => inet_ntop,
     }

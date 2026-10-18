@@ -17,6 +17,7 @@ pub mod eightbit;
 /// Only on Darwin: nowhere else is there another CoreFoundation to meet.
 #[cfg(target_os = "macos")]
 pub mod foreign;
+mod host;
 mod fsevents;
 pub mod plist;
 pub mod preferences;
@@ -209,6 +210,13 @@ exports::exports! {
         "CFRunLoopRemoveObserver" => api::CFRunLoopRemoveObserver,
         "CFRunLoopContainsObserver" => api::CFRunLoopContainsObserver,
         "CFRunLoopAddCommonMode" => api::CFRunLoopAddCommonMode,
+        "CFHostCreateWithName" => host::CFHostCreateWithName,
+        "CFHostStartInfoResolution" => host::CFHostStartInfoResolution,
+        "CFHostGetAddressing" => host::CFHostGetAddressing,
+        "CFHostSetClient" => host::CFHostSetClient,
+        "CFHostScheduleWithRunLoop" => host::CFHostScheduleWithRunLoop,
+        "CFHostUnscheduleFromRunLoop" => host::CFHostUnscheduleFromRunLoop,
+        "CFHostCancelInfoResolution" => host::CFHostCancelInfoResolution,
         "CFSocketCreateWithNative" => socket::create_with_native,
         "CFSocketCreateRunLoopSource" => socket::create_run_loop_source,
         "CFSocketGetNative" => socket::get_native,
@@ -394,6 +402,7 @@ pub fn data_symbols() -> Vec<(String, u64)> {
     out.extend(diskarbitration::data_symbols());
     out.extend(urlresource::data_symbols());
     out.extend(sysconfig::data_symbols());
+    out.extend(host::data_symbols());
     out
 }
 
