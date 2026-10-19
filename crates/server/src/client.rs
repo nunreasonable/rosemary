@@ -232,7 +232,49 @@ fn ensure(session: &mut Session, launch: bool) -> Option<()> {
     if session.failed_at.is_some_and(|at| at.elapsed() < RETRY) {
         return None;
     }
-    let attempt = open(config, launch).and_then(|mut client| {
+    // A server that is winding down refuses new check-ins, and goes away soon
+    // after; this process waits for it to, and then launches its successor,
+    // rather than running without one. Two runs back to back meet exactly
+    // that: the first's server lingers a few seconds and then stops just as
+    // the second starts.
+    let deadline = Instant::now() + SHUTDOWN_WAIT;
+    let mut attempt = connect_and_check_in(session, config, launch);
+    while let Err(e) = &attempt
+        && e.to_string() == SHUTTING_DOWN
+        && Instant::now() < deadline
+    {
+        std::thread::sleep(Duration::from_millis(100));
+        attempt = connect_and_check_in(session, config, launch);
+    }
+    match attempt {
+        Ok(client) => {
+            session.client = Some(client);
+            session.failed_at = None;
+            Some(())
+        }
+        Err(e) => {
+            session.failed_at = Some(Instant::now());
+            if !session.warned {
+                session.warned = true;
+                eprintln!(
+                    "rosemary: the process server is unavailable ({e}); this process cannot \
+                     see any other"
+                );
+            }
+            None
+        }
+    }
+}
+
+/// The refusal a server that is shutting down gives a new check-in.
+const SHUTTING_DOWN: &str = "the prefix is shutting down";
+
+/// How long a process waits for a server that is shutting down to go.
+const SHUTDOWN_WAIT: Duration = Duration::from_secs(20);
+
+/// Connect, launching a server if `launch` allows, and check in.
+fn connect_and_check_in(session: &mut Session, config: &Config, launch: bool) -> io::Result<Client> {
+    open(config, launch).and_then(|mut client| {
         if let Some(checkin) = &mut session.checkin {
             checkin.pid = pid();
             match client.call(&Request::Checkin(checkin.clone()))? {
@@ -254,25 +296,7 @@ fn ensure(session: &mut Session, launch: bool) -> Option<()> {
             }
         }
         Ok(client)
-    });
-    match attempt {
-        Ok(client) => {
-            session.client = Some(client);
-            session.failed_at = None;
-            Some(())
-        }
-        Err(e) => {
-            session.failed_at = Some(Instant::now());
-            if !session.warned {
-                session.warned = true;
-                eprintln!(
-                    "rosemary: the process server is unavailable ({e}); this process cannot \
-                     see any other"
-                );
-            }
-            None
-        }
-    }
+    })
 }
 
 /// Send `request`, reconnecting once if the connection broke.

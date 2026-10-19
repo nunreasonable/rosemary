@@ -339,7 +339,26 @@ fn main() -> ExitCode {
 }
 
 /// Load `path` as a program and execute it.
-fn launch(path: OsString, options: &RunOptions, args: Vec<OsString>) -> ExitCode {
+/// `ROSEMARY_APPEND_ARGS=<text>::<arguments>`: a diagnostic that adds
+/// `<arguments>`, split on spaces, after the arguments of any program whose
+/// path contains `<text>` - for turning on a program's own logging in a child
+/// another process starts with arguments of its choosing.
+fn append_args(path: &OsString, args: &mut Vec<OsString>) {
+    let Ok(spec) = std::env::var("ROSEMARY_APPEND_ARGS") else {
+        return;
+    };
+    let Some((wanted, extra)) = spec.split_once("::") else {
+        return;
+    };
+    if !path.to_string_lossy().contains(wanted) {
+        return;
+    }
+    eprintln!("rosemary: ROSEMARY_APPEND_ARGS: adding {extra:?}");
+    args.extend(extra.split_whitespace().map(OsString::from));
+}
+
+fn launch(path: OsString, options: &RunOptions, mut args: Vec<OsString>) -> ExitCode {
+    append_args(&path, &mut args);
     // Before anything can ask which prefix this is, including the paths
     // published below.
     prefix_cli::settle_prefix();
