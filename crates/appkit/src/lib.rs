@@ -295,6 +295,7 @@ exports::exports! {
         "CGLLockContext" => opengl::CGLLockContext,
         "CGLUnlockContext" => opengl::CGLUnlockContext,
         "CGLGetShareGroup" => opengl::CGLGetShareGroup,
+        "CGLTexImageIOSurface2D" => opengl::surface::CGLTexImageIOSurface2D,
     }
     groups {
         pasteboard_manager,

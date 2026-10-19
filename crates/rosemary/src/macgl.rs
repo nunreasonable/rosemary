@@ -269,6 +269,7 @@ fn real_finish() -> Option<Flush> {
 /// A single-buffered Mac context presents on a flush; see
 /// `appkit::opengl::present_single_buffered`.
 unsafe extern "C" fn flush() {
+    appkit::opengl::surface::write_back();
     if let Some(real) = real_flush() {
         // SAFETY: the guest's call, passed on.
         unsafe { real() };
@@ -277,6 +278,7 @@ unsafe extern "C" fn flush() {
 }
 
 unsafe extern "C" fn finish() {
+    appkit::opengl::surface::write_back();
     if let Some(real) = real_finish() {
         // SAFETY: the guest's call, passed on.
         unsafe { real() };
@@ -284,11 +286,28 @@ unsafe extern "C" fn finish() {
     appkit::opengl::present_single_buffered();
 }
 
+type DeleteTextures = unsafe extern "C" fn(i32, *const u32);
+
+/// A texture going away stops being copied back into the surface it had.
+unsafe extern "C" fn delete_textures(count: i32, textures: *const u32) {
+    static SLOT: OnceLock<usize> = OnceLock::new();
+    // SAFETY: the guest's names, as `glDeleteTextures` takes them.
+    unsafe { appkit::opengl::surface::forget(count, textures) };
+    // SAFETY: `void glDeleteTextures(GLsizei, const GLuint *)`.
+    let real = driver(c"glDeleteTextures", &SLOT)
+        .map(|a| unsafe { std::mem::transmute::<usize, DeleteTextures>(a) });
+    if let Some(real) = real {
+        // SAFETY: the guest's call, passed on.
+        unsafe { real(count, textures) };
+    }
+}
+
 /// This module's replacement for `name`, if it has one.
 pub fn address(name: &str) -> Option<u64> {
     let f = match name {
         "glFlush" if crate::frameworks::using_builtin() => flush as *const (),
         "glFinish" if crate::frameworks::using_builtin() => finish as *const (),
+        "glDeleteTextures" if crate::frameworks::using_builtin() => delete_textures as *const (),
         "glGetString" => get_string as *const (),
         "glGetStringi" => get_stringi as *const (),
         "glGetIntegerv" => get_integerv as *const (),

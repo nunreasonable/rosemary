@@ -115,6 +115,8 @@ fn gl_view_of<'a>(receiver: Id) -> &'a mut OpenGLView {
 /// The list is not the whole header. An attribute nobody has used is one whose
 /// SDL counterpart has not been checked, and guessing at it would ask SDL for a
 /// visual the program did not request.
+pub mod surface;
+
 mod attribute {
     // Every `NSOpenGLPixelFormatAttribute` in `NSOpenGL.h`, whether or not it
     // maps to anything. The list has to be complete rather than convenient:

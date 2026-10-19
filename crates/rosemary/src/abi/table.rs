@@ -853,6 +853,7 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("CGLGetParameter", I32, P, U32, P),
     sig!("CGLGetPixelFormat", P, P),
     sig!("CGLGetShareGroup", P, P),
+    sig!("CGLTexImageIOSurface2D", I32, P, U32, U32, I32, I32, U32, U32, P, U32),
     sig!("CGLGetVirtualScreen", I32, P, P),
     sig!("CGLLockContext", I32, P),
     sig!("CGLQueryRendererInfo", I32, U32, P, P),
