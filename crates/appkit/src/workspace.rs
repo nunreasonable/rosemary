@@ -347,6 +347,57 @@ unsafe extern "C" fn launch_application(
     objc::arc::autorelease(object)
 }
 
+/// `+[NSRunningApplication runningApplicationWithProcessIdentifier:]`: an
+/// object for a guest process that is running, or nil. One object per pid,
+/// kept for the process like the ones `-launchApplicationAtURL:` makes.
+unsafe extern "C" fn running_application_with_pid(class: Id, sel: Sel, pid: i32) -> Id {
+    if pid as u32 == std::process::id() {
+        // SAFETY: the same class and a nullary selector's arguments.
+        return unsafe { current_application(class, sel) };
+    }
+    if !darwin::process::visible(pid) {
+        return std::ptr::null_mut();
+    }
+    let mut launched = LAUNCHED.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((object, _)) = launched.iter().find(|(_, app)| app.pid == pid) {
+        return *object as Id;
+    }
+    let class = objc::class::lookup(c"NSRunningApplication").expect("declared before its methods");
+    let object = objc::object::create_instance(class, 0);
+    launched.push((
+        object as usize,
+        Launched {
+            pid,
+            identifier: None,
+            name: None,
+        },
+    ));
+    objc::arc::retain(object);
+    object
+}
+
+/// `-isTerminated`: the process has gone, or never was one of this prefix's.
+unsafe extern "C" fn is_terminated(receiver: Id, _sel: Sel) -> u8 {
+    u8::from(launched(receiver, |app| !darwin::process::visible(app.pid)).unwrap_or(false))
+}
+
+/// Signal the process an `NSRunningApplication` names, Darwin's numbering:
+/// 15 for `-terminate`, 9 for `-forceTerminate`.
+fn signal_application(receiver: Id, signal: i32) -> u8 {
+    let Some(pid) = launched(receiver, |app| app.pid) else {
+        return 0;
+    };
+    u8::from(darwin::signal::entry::kill_(pid, signal) == 0)
+}
+
+unsafe extern "C" fn terminate(receiver: Id, _sel: Sel) -> u8 {
+    signal_application(receiver, 15)
+}
+
+unsafe extern "C" fn force_terminate(receiver: Id, _sel: Sel) -> u8 {
+    signal_application(receiver, 9)
+}
+
 /// `+[NSRunningApplication runningApplicationsWithBundleIdentifier:]`.
 ///
 /// Host processes are not registered applications in this Darwin workspace.
@@ -425,6 +476,7 @@ pub(crate) fn install() {
     class_methods!(running, {
         "runningApplicationsWithBundleIdentifier:" => running_applications, c"@24@0:8@16";
         "currentApplication" => current_application, c"@16@0:8";
+        "runningApplicationWithProcessIdentifier:" => running_application_with_pid, c"@20@0:8i16";
     });
     methods!(running, {
         "processIdentifier" => process_identifier, c"i16@0:8";
@@ -432,6 +484,9 @@ pub(crate) fn install() {
         "localizedName" => localized_name, c"@16@0:8";
         "isActive" => running_is_active, c"c16@0:8";
         "activateWithOptions:" => activate_with_options, c"c24@0:8Q16";
+        "isTerminated" => is_terminated, c"c16@0:8";
+        "terminate" => terminate, c"c16@0:8";
+        "forceTerminate" => force_terminate, c"c16@0:8";
     });
 }
 
