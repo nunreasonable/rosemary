@@ -370,6 +370,7 @@ exports::exports! {
         "VTIsHardwareDecodeSupported" => decode::VTIsHardwareDecodeSupported,
         "CMVideoFormatDescriptionGetCleanAperture" => decode::CMVideoFormatDescriptionGetCleanAperture,
         "VTDecompressionSessionCreate" => decode::VTDecompressionSessionCreate,
+        "VTCompressionSessionCreate" => decode::VTCompressionSessionCreate,
         "CMVideoFormatDescriptionCreateFromH264ParameterSets" => decode::CMVideoFormatDescriptionCreateFromH264ParameterSets,
         "CVDisplayLinkCreateWithCGDisplay" => CVDisplayLinkCreateWithCGDisplay,
         "CVDisplayLinkCreateWithActiveCGDisplays" => CVDisplayLinkCreateWithActiveCGDisplays,

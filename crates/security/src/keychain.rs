@@ -425,6 +425,26 @@ pub unsafe extern "C" fn SecItemUpdate(query: CFTypeRef, changes: CFTypeRef) -> 
     SUCCESS
 }
 
+/// `OSStatus SecKeychainCopySearchList(CFArrayRef *)`: an empty list, owned by
+/// the caller - there are no keychain files here to search.
+///
+/// # Safety
+///
+/// `out` is null or writable.
+pub unsafe extern "C" fn SecKeychainCopySearchList(out: *mut CFTypeRef) -> i32 {
+    if out.is_null() {
+        return -50;
+    }
+    let empty = corefoundation::collections::new_array(
+        &[],
+        corefoundation::callbacks::Policy::from_type_callbacks(),
+        false,
+    );
+    // SAFETY: writable, checked above.
+    unsafe { out.write(empty) };
+    0
+}
+
 /// `OSStatus SecKeychainAddCallback(SecKeychainCallback, SecKeychainEventMask,
 /// void *)`: registered, and never called - nothing outside the program
 /// changes this keychain while it runs.
@@ -453,6 +473,7 @@ exports::exports! {
     functions {
         "SecItemAdd" => SecItemAdd,
         "SecKeychainAddCallback" => SecKeychainAddCallback,
+        "SecKeychainCopySearchList" => SecKeychainCopySearchList,
         "SecKeychainRemoveCallback" => SecKeychainRemoveCallback,
         "SecTaskCreateFromSelf" => SecTaskCreateFromSelf,
         "SecItemCopyMatching" => SecItemCopyMatching,

@@ -524,6 +524,20 @@ pub unsafe extern "C" fn CGColorSpaceCreateDeviceRGB() -> CFTypeRef {
     unsafe { CGColorSpaceCreateWithName(std::ptr::null()) }
 }
 
+/// `CGColorSpaceRef CGDisplayCopyColorSpace(CGDirectDisplayID)`: sRGB, owned
+/// by the caller.
+/// FIXME (ACCURACY): the monitor's own profile is not read.
+pub unsafe extern "C" fn CGDisplayCopyColorSpace(_display: u32) -> CFTypeRef {
+    // SAFETY: a plain constructor.
+    unsafe { CGColorSpaceCreateDeviceRGB() }
+}
+
+/// `CFDataRef CGColorSpaceCopyICCData(CGColorSpaceRef)`: none, which callers
+/// take as a space with no embedded profile.
+pub extern "C" fn CGColorSpaceCopyICCData(_space: CFTypeRef) -> CFTypeRef {
+    std::ptr::null()
+}
+
 pub unsafe extern "C" fn CGColorSpaceRelease(space: CFTypeRef) {
     if !space.is_null() {
         unsafe { corefoundation::api::CFRelease(space) };

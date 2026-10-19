@@ -45,11 +45,47 @@ enum Payload {
     Ssl {
         hostname: Option<String>,
     },
+    /// `SecPolicyCreateRevocation`: accepted alongside another policy.
+    /// FIXME (ACCURACY): nothing here checks revocation.
+    Revocation,
     Trust {
         chain: Vec<Vec<u8>>,
         options: u32,
         hostname: Option<String>,
+        held: Held,
     },
+}
+
+/// What a trust hands out by `Get` and so must keep alive itself: the
+/// certificate handles `SecTrustGetCertificateAtIndex` returns and the
+/// evidence array `SecTrustGetResult` points at.
+#[derive(Default)]
+struct Held {
+    certificates: Vec<Owned>,
+    evidence: Vec<Evidence>,
+}
+
+/// A reference this module owns and gives back when dropped.
+struct Owned(CFTypeRef);
+
+impl Drop for Owned {
+    fn drop(&mut self) {
+        // SAFETY: a reference taken when this was made.
+        unsafe { corefoundation::api::CFRelease(self.0) };
+    }
+}
+
+/// `CSSM_TP_APPLE_EVIDENCE_INFO`, all zero: no status bits and no status
+/// codes for any certificate.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct Evidence {
+    status_bits: u32,
+    status_code_count: u32,
+    status_codes: usize,
+    index: u32,
+    database: [usize; 2],
+    record: usize,
 }
 
 #[repr(C)]
@@ -333,6 +369,7 @@ pub unsafe extern "C" fn SecTrustCreateWithCertificates(
         match unsafe { payload(policy) } {
             Some(Payload::BasicX509) => {}
             Some(Payload::Ssl { hostname: name }) => hostname = name.clone(),
+            Some(Payload::Revocation) => {}
             _ => {
                 eprintln!(
                     "rosemary: security: SecTrustCreateWithCertificates: only the basic X.509 and SSL policies are supported"
@@ -350,6 +387,7 @@ pub unsafe extern "C" fn SecTrustCreateWithCertificates(
             chain,
             options: 0,
             hostname,
+            held: Held::default(),
         }))
     };
     SUCCESS
@@ -448,6 +486,7 @@ pub unsafe extern "C" fn SecTrustEvaluate(trust: CFTypeRef, out: *mut u32) -> OS
         chain,
         options,
         hostname,
+        ..
     }) = (unsafe { payload(trust) })
     else {
         return PARAM;
@@ -540,6 +579,192 @@ pub unsafe extern "C" fn SecTrustSetSignedCertificateTimestamps(
     SUCCESS
 }
 
+/// `SecPolicyRef SecPolicyCreateRevocation(CFOptionFlags)`.
+pub extern "C" fn SecPolicyCreateRevocation(_flags: usize) -> CFTypeRef {
+    new(Payload::Revocation)
+}
+
+/// `CFDictionaryRef SecPolicyCopyProperties(SecPolicyRef)`: empty, owned by
+/// the caller.
+/// FIXME (ACCURACY): no `kSecPolicyOid` or name is reported.
+pub unsafe extern "C" fn SecPolicyCopyProperties(policy: CFTypeRef) -> CFTypeRef {
+    // SAFETY: the caller's guarantee.
+    match unsafe { payload(policy) } {
+        Some(Payload::BasicX509 | Payload::Ssl { .. } | Payload::Revocation) => {
+            corefoundation::collections::new_dictionary(
+                &[],
+                corefoundation::callbacks::Policy::from_type_callbacks(),
+                corefoundation::callbacks::Policy::from_type_callbacks(),
+                false,
+            )
+        }
+        _ => std::ptr::null(),
+    }
+}
+
+/// The type ID every handle here answers to, certificates and policies alike.
+/// FIXME (ACCURACY): one class serves all three, so their IDs are equal.
+fn type_id() -> usize {
+    static ID: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *ID.get_or_init(|| {
+        let probe = new(Payload::Revocation);
+        // SAFETY: an object just made, released straight after.
+        unsafe {
+            let id = corefoundation::api::CFGetTypeID(probe);
+            corefoundation::api::CFRelease(probe);
+            id as usize
+        }
+    })
+}
+
+/// `CFTypeID SecPolicyGetTypeID(void)`.
+pub extern "C" fn SecPolicyGetTypeID() -> usize {
+    type_id()
+}
+
+/// `CFTypeID SecCertificateGetTypeID(void)`.
+pub extern "C" fn SecCertificateGetTypeID() -> usize {
+    type_id()
+}
+
+/// `CFIndex SecTrustGetCertificateCount(SecTrustRef)`.
+pub unsafe extern "C" fn SecTrustGetCertificateCount(trust: CFTypeRef) -> isize {
+    // SAFETY: the caller's guarantee.
+    match unsafe { payload(trust) } {
+        Some(Payload::Trust { chain, .. }) => chain.len() as isize,
+        _ => 0,
+    }
+}
+
+/// `SecCertificateRef SecTrustGetCertificateAtIndex(SecTrustRef, CFIndex)`:
+/// not owned by the caller; the trust keeps it.
+pub unsafe extern "C" fn SecTrustGetCertificateAtIndex(trust: CFTypeRef, index: isize) -> CFTypeRef {
+    // SAFETY: the caller's guarantee.
+    let Some(Payload::Trust { chain, held, .. }) = (unsafe { payload(trust) }) else {
+        return std::ptr::null();
+    };
+    if held.certificates.len() != chain.len() {
+        held.certificates = chain.iter().map(|der| Owned(certificate(der))).collect();
+    }
+    usize::try_from(index)
+        .ok()
+        .and_then(|i| held.certificates.get(i))
+        .map_or(std::ptr::null(), |c| c.0)
+}
+
+/// `OSStatus SecTrustGetResult(SecTrustRef, SecTrustResultType *, CFArrayRef
+/// *certChain, CSSM_TP_APPLE_EVIDENCE_INFO **statusChain)`: the chain is the
+/// caller's to release; the evidence belongs to the trust.
+pub unsafe extern "C" fn SecTrustGetResult(
+    trust: CFTypeRef,
+    out: *mut u32,
+    chain_out: *mut CFTypeRef,
+    evidence_out: *mut *const c_void,
+) -> OSStatus {
+    // SAFETY: the caller's guarantee.
+    let status = unsafe { SecTrustEvaluate(trust, out) };
+    if status != SUCCESS {
+        return status;
+    }
+    if !chain_out.is_null() {
+        // SAFETY: writable, per the caller.
+        unsafe { chain_out.write(SecTrustCopyCertificateChain(trust)) };
+    }
+    if !evidence_out.is_null() {
+        // SAFETY: a trust, checked by the evaluation above.
+        let Some(Payload::Trust { chain, held, .. }) = (unsafe { payload(trust) }) else {
+            return PARAM;
+        };
+        held.evidence = (0..chain.len())
+            .map(|i| Evidence {
+                index: i as u32,
+                ..Evidence::default()
+            })
+            .collect();
+        // SAFETY: writable, per the caller; the trust keeps the array.
+        unsafe { evidence_out.write(held.evidence.as_ptr().cast()) };
+    }
+    SUCCESS
+}
+
+/// `OSStatus SecTrustGetCssmResultCode(SecTrustRef, OSStatus *)`: zero for a
+/// trusted chain, `CSSMERR_TP_NOT_TRUSTED` otherwise.
+pub unsafe extern "C" fn SecTrustGetCssmResultCode(trust: CFTypeRef, code: *mut OSStatus) -> OSStatus {
+    const NOT_TRUSTED: OSStatus = 0x8001_212A_u32 as OSStatus;
+    let mut verdict = result::FATAL;
+    // SAFETY: the caller's guarantee.
+    let status = unsafe { SecTrustEvaluate(trust, &mut verdict) };
+    if status == SUCCESS && !code.is_null() {
+        let value = match verdict {
+            result::UNSPECIFIED => SUCCESS,
+            _ => NOT_TRUSTED,
+        };
+        // SAFETY: writable, per the caller.
+        unsafe { code.write(value) };
+    }
+    status
+}
+
+/// `SecTrustSetAnchorCertificates`, `SecTrustSetAnchorCertificatesOnly`,
+/// `SecTrustSetKeychains`, `SecTrustSetOCSPResponse` and
+/// `SecTrustSetParameters`: accepted.
+/// FIXME (ACCURACY): custom anchors, keychains, stapled OCSP and CSSM
+/// parameters change nothing; the built-in roots decide.
+pub unsafe extern "C" fn trust_setting_accepted(trust: CFTypeRef, _a: usize, _b: usize) -> OSStatus {
+    // SAFETY: the caller's guarantee.
+    match unsafe { payload(trust) } {
+        Some(Payload::Trust { .. }) => SUCCESS,
+        _ => PARAM,
+    }
+}
+
+/// `OSStatus SecTrustSettingsCopyCertificates(SecTrustSettingsDomain,
+/// CFArrayRef *)`: no domain holds trust settings here.
+pub unsafe extern "C" fn SecTrustSettingsCopyCertificates(_domain: u32, out: *mut CFTypeRef) -> OSStatus {
+    /// `errSecNoTrustSettings`.
+    const NO_TRUST_SETTINGS: OSStatus = -25263;
+    if !out.is_null() {
+        // SAFETY: writable, per the caller.
+        unsafe { out.write(std::ptr::null()) };
+    }
+    NO_TRUST_SETTINGS
+}
+
+/// `OSStatus SecTrustSettingsCopyTrustSettings(SecCertificateRef,
+/// SecTrustSettingsDomain, CFArrayRef *)`: none, for any certificate.
+pub unsafe extern "C" fn SecTrustSettingsCopyTrustSettings(
+    _certificate: CFTypeRef,
+    _domain: u32,
+    out: *mut CFTypeRef,
+) -> OSStatus {
+    /// `errSecItemNotFound`.
+    const NOT_FOUND: OSStatus = -25300;
+    if !out.is_null() {
+        // SAFETY: writable, per the caller.
+        unsafe { out.write(std::ptr::null()) };
+    }
+    NOT_FOUND
+}
+
+/// `OSStatus SecCertificateGetCLHandle(SecCertificateRef, CSSM_CL_HANDLE *)`:
+/// there is no CSSM here.
+pub unsafe extern "C" fn SecCertificateGetCLHandle(_certificate: CFTypeRef, out: *mut usize) -> OSStatus {
+    /// `errSecUnimplemented`.
+    const UNIMPLEMENTED: OSStatus = -4;
+    if !out.is_null() {
+        // SAFETY: writable, per the caller.
+        unsafe { out.write(0) };
+    }
+    UNIMPLEMENTED
+}
+
+/// `CFDataRef SecCertificateCopyNormalizedIssuerSequence(SecCertificateRef)`.
+/// FIXME (ACCURACY): always null, as for a certificate it cannot parse; a
+/// caller matching client certificates by issuer finds none.
+pub extern "C" fn SecCertificateCopyNormalizedIssuerSequence(_certificate: CFTypeRef) -> CFTypeRef {
+    std::ptr::null()
+}
+
 /// `int SecRandomCopyBytes(SecRandomRef, size_t, void *)`. The generator
 /// argument is `kSecRandomDefault` - null - in every caller.
 ///
@@ -577,6 +802,23 @@ exports::exports! {
         "SecCertificateGetData" => SecCertificateGetData,
         "SecTrustCopyCertificateChain" => SecTrustCopyCertificateChain,
         "SecTrustSetSignedCertificateTimestamps" => SecTrustSetSignedCertificateTimestamps,
+        "SecPolicyCreateRevocation" => SecPolicyCreateRevocation,
+        "SecPolicyCopyProperties" => SecPolicyCopyProperties,
+        "SecPolicyGetTypeID" => SecPolicyGetTypeID,
+        "SecCertificateGetTypeID" => SecCertificateGetTypeID,
+        "SecTrustGetCertificateCount" => SecTrustGetCertificateCount,
+        "SecTrustGetCertificateAtIndex" => SecTrustGetCertificateAtIndex,
+        "SecTrustGetResult" => SecTrustGetResult,
+        "SecTrustGetCssmResultCode" => SecTrustGetCssmResultCode,
+        "SecTrustSetAnchorCertificates" => trust_setting_accepted,
+        "SecTrustSetAnchorCertificatesOnly" => trust_setting_accepted,
+        "SecTrustSetKeychains" => trust_setting_accepted,
+        "SecTrustSetOCSPResponse" => trust_setting_accepted,
+        "SecTrustSetParameters" => trust_setting_accepted,
+        "SecTrustSettingsCopyCertificates" => SecTrustSettingsCopyCertificates,
+        "SecTrustSettingsCopyTrustSettings" => SecTrustSettingsCopyTrustSettings,
+        "SecCertificateGetCLHandle" => SecCertificateGetCLHandle,
+        "SecCertificateCopyNormalizedIssuerSequence" => SecCertificateCopyNormalizedIssuerSequence,
     }
 }
 

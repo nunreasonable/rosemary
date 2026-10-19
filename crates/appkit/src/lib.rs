@@ -213,6 +213,8 @@ exports::exports! {
         "CGDisplayModeCopyPixelEncoding" => screen::CGDisplayModeCopyPixelEncoding,
         "CGColorSpaceCreateWithName" => graphics::CGColorSpaceCreateWithName,
         "CGColorSpaceCreateDeviceRGB" => graphics::CGColorSpaceCreateDeviceRGB,
+        "CGDisplayCopyColorSpace" => graphics::CGDisplayCopyColorSpace,
+        "CGColorSpaceCopyICCData" => graphics::CGColorSpaceCopyICCData,
         "CGColorSpaceRelease" => graphics::CGColorSpaceRelease,
         "CGColorSpaceGetName" => graphics::CGColorSpaceGetName,
         "CGColorSpaceCopyName" => graphics::CGColorSpaceCopyName,

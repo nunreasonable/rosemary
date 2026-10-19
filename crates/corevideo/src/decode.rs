@@ -41,6 +41,37 @@ pub unsafe extern "C" fn VTDecompressionSessionCreate(
     NO_DECODER
 }
 
+/// `OSStatus VTCompressionSessionCreate(CFAllocatorRef, int32_t width, int32_t
+/// height, CMVideoCodecType, CFDictionaryRef encoderSpecification,
+/// CFDictionaryRef sourceImageBufferAttributes, CFAllocatorRef,
+/// VTCompressionOutputCallback, void *, VTCompressionSessionRef *)`: no
+/// encoder either, which sends a program to its software encoder.
+///
+/// # Safety
+///
+/// `out` is null or writable.
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn VTCompressionSessionCreate(
+    _allocator: *const c_void,
+    _width: i32,
+    _height: i32,
+    _codec: u32,
+    _specification: *const c_void,
+    _attributes: *const c_void,
+    _compressed_allocator: *const c_void,
+    _callback: *const c_void,
+    _refcon: *const c_void,
+    out: *mut *const c_void,
+) -> i32 {
+    /// `kVTCouldNotFindVideoEncoderErr`.
+    const NO_ENCODER: i32 = -12908;
+    if !out.is_null() {
+        // SAFETY: writable, per the caller.
+        unsafe { out.write(std::ptr::null()) };
+    }
+    NO_ENCODER
+}
+
 /// `OSStatus CMVideoFormatDescriptionCreateFromH264ParameterSets(...)` and
 /// the HEVC one: refused, which keeps a program off the decoder path above.
 ///
