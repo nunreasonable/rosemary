@@ -461,6 +461,19 @@ unsafe extern "C" fn other_event(
     event
 }
 
+/// `-CGEvent`: a Quartz event for this one, autoreleased.
+/// FIXME (ACCURACY): it carries the pointer's place now, not this event's
+/// type, flags or fields.
+unsafe extern "C" fn cg_event(_receiver: Id, _sel: Sel) -> *const std::ffi::c_void {
+    // SAFETY: a plain constructor, with no source.
+    let event = unsafe { crate::cgevent::CGEventCreate(std::ptr::null()) };
+    if event.is_null() {
+        return event;
+    }
+    // SAFETY: a fresh object this call owns.
+    unsafe { corefoundation::api::CFAutorelease(event) }
+}
+
 pub(crate) fn install() {
     let class = objc::class::lookup(c"NSEvent").expect("declared before its methods");
     crate::define::class_methods!(class, {
@@ -477,6 +490,7 @@ pub(crate) fn install() {
         "type" => kind, c"Q16@0:8";
         "modifierFlags" => modifier_flags, c"Q16@0:8";
         "locationInWindow" => location_in_window, c"{CGPoint=dd}16@0:8";
+        "CGEvent" => cg_event, c"^{__CGEvent=}16@0:8";
         "keyCode" => key_code, c"S16@0:8";
         "buttonNumber" => button_number, c"q16@0:8";
         "clickCount" => click_count, c"q16@0:8";

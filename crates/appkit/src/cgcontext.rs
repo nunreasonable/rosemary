@@ -960,6 +960,18 @@ pub unsafe extern "C" fn CGPathGetBoundingBox(path: CFTypeRef) -> NSRect {
     unsafe { (*(*(path as *const Path)).bounds).unwrap_or_default() }
 }
 
+/// `bool CGPathIsEmpty(CGPathRef)`: whether nothing was ever added, which a
+/// path here knows from having no bounds yet.
+pub unsafe extern "C" fn CGPathIsEmpty(path: CFTypeRef) -> u8 {
+    let class = objc::class::lookup(c"__CGPath").expect("installed during bootstrap");
+    // SAFETY: null or an object a guest received from this runtime.
+    if path.is_null() || !unsafe { corefoundation::base::is_kind_of(path, class) } {
+        return 1;
+    }
+    // SAFETY: a `__CGPath`, created with bounds.
+    u8::from(unsafe { (*(*(path as *const Path)).bounds).is_none() })
+}
+
 /// `CGPathApply` visits every element; a path here records only its bounds,
 /// so there are none to visit.
 pub unsafe extern "C" fn CGPathApply(
@@ -1031,7 +1043,7 @@ exports::exports! {
         "CGContextFillRect" => CGContextFillRect,
         "CGContextClearRect" => CGContextClearRect,
         "CGContextDrawImage" => CGContextDrawImage,
-        "CGContextSetShouldSmoothFonts" | "CGContextSetInterpolationQuality" | "CGContextSetLineCap" | "CGContextSetLineJoin" | "CGContextSetTextDrawingMode" | "CGContextSetBlendMode" => ignored_context_int,
+        "CGContextSetShouldSmoothFonts" | "CGContextSetAllowsFontSubpixelPositioning" | "CGContextSetAllowsFontSubpixelQuantization" | "CGContextSetShouldSubpixelPositionFonts" | "CGContextSetShouldSubpixelQuantizeFonts" | "CGContextSetInterpolationQuality" | "CGContextSetLineCap" | "CGContextSetLineJoin" | "CGContextSetTextDrawingMode" | "CGContextSetBlendMode" => ignored_context_int,
         "CGContextSetLineWidth" => ignored_context_f64,
         "CGContextSetLineDash" => ignored_line_dash,
         "CGContextSetStrokeColorWithColor" | "CGContextSetFillColorSpace" | "CGContextAddPath" | "CGContextDrawShading" => ignored_context_pointer,
@@ -1071,6 +1083,7 @@ exports::exports! {
         "CGPathAddArc" => CGPathAddArc,
         "CGPathCloseSubpath" => CGPathCloseSubpath,
         "CGPathGetBoundingBox" => CGPathGetBoundingBox,
+        "CGPathIsEmpty" => CGPathIsEmpty,
         "CGPathApply" => CGPathApply,
     }
 }

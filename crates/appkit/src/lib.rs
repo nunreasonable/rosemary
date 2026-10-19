@@ -222,6 +222,7 @@ exports::exports! {
         "CGDataProviderCreateWithData" => graphics::CGDataProviderCreateWithData,
         "CGDataProviderCreateWithCFData" => graphics::CGDataProviderCreateWithCFData,
         "AXIsProcessTrusted" => accessibility::AXIsProcessTrusted,
+        "UAZoomEnabled" => accessibility::UAZoomEnabled,
         "AXIsProcessTrustedWithOptions" => accessibility::AXIsProcessTrustedWithOptions,
         "CGEventTapCreate" => accessibility::CGEventTapCreate,
         "CGEventTapEnable" => accessibility::CGEventTapEnable,

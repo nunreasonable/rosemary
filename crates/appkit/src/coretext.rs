@@ -439,6 +439,46 @@ pub unsafe extern "C" fn CTFontCopyName(font: CFTypeRef, name_key: CFTypeRef) ->
     std::ptr::null()
 }
 
+/// `CFStringRef CTFontCopyLocalizedName(CTFontRef, CFStringRef nameKey,
+/// CFStringRef *actualLanguage)`: the one name each font has here, with no
+/// language to report.
+///
+/// # Safety
+///
+/// `language` is null or writable.
+pub unsafe extern "C" fn CTFontCopyLocalizedName(
+    font: CFTypeRef,
+    name_key: CFTypeRef,
+    language: *mut CFTypeRef,
+) -> CFTypeRef {
+    if !language.is_null() {
+        // SAFETY: writable, per the caller.
+        unsafe { language.write(std::ptr::null()) };
+    }
+    // SAFETY: the caller's font and key.
+    unsafe { CTFontCopyName(font, name_key) }
+}
+
+/// `CFArrayRef CTFontCopyVariationAxes(CTFontRef)`: null, a font with no
+/// variation axes.
+/// FIXME (ACCURACY): a variable font's `fvar` axes are not reported.
+pub extern "C" fn CTFontCopyVariationAxes(_font: CFTypeRef) -> CFTypeRef {
+    std::ptr::null()
+}
+
+/// `CFDataRef CGFontCopyTableForTag(CGFontRef, uint32_t)`: a `CGFont` is the
+/// Core Text font here, so its table is the same.
+pub unsafe extern "C" fn CGFontCopyTableForTag(font: CFTypeRef, tag: u32) -> CFTypeRef {
+    // SAFETY: the caller's font.
+    unsafe { CTFontCopyTable(font, tag, 0) }
+}
+
+/// `CFStringRef CGFontCopyPostScriptName(CGFontRef)`.
+pub unsafe extern "C" fn CGFontCopyPostScriptName(font: CFTypeRef) -> CFTypeRef {
+    // SAFETY: the caller's font.
+    unsafe { CTFontCopyPostScriptName(font) }
+}
+
 pub unsafe extern "C" fn CTFontCopyFamilyName(font: CFTypeRef) -> CFTypeRef {
     copy_string_attribute(font, "CTFontFamilyNameAttribute")
 }
@@ -454,6 +494,50 @@ pub unsafe extern "C" fn CTFontGetSymbolicTraits(font: CFTypeRef) -> u32 {
 
 pub unsafe extern "C" fn CTFontGetUnitsPerEm(font: CFTypeRef) -> u32 {
     loaded(font).map_or(1000, |face| u32::from(face.face().units_per_em()))
+}
+
+/// `int CGFontGetUnitsPerEm(CGFontRef)`: a `CGFont` is the Core Text font.
+pub unsafe extern "C" fn CGFontGetUnitsPerEm(font: CFTypeRef) -> i32 {
+    // SAFETY: the caller's font.
+    unsafe { CTFontGetUnitsPerEm(font) as i32 }
+}
+
+/// `CFIndex CTFontGetGlyphCount(CTFontRef)`.
+pub unsafe extern "C" fn CTFontGetGlyphCount(font: CFTypeRef) -> isize {
+    loaded(font).map_or(0, |face| face.face().number_of_glyphs() as isize)
+}
+
+/// `CFArrayRef CTFontCopyAvailableTables(CTFontRef, CTFontTableOptions)`: the
+/// face's table tags as numbers, owned by the caller.
+pub unsafe extern "C" fn CTFontCopyAvailableTables(font: CFTypeRef, _options: u32) -> CFTypeRef {
+    let Some(face) = loaded(font) else {
+        return std::ptr::null();
+    };
+    let tags: Vec<u32> = face
+        .face()
+        .raw_face()
+        .table_records
+        .into_iter()
+        .map(|record| u32::from_be_bytes(record.tag.to_bytes()))
+        .collect();
+    let numbers: Vec<CFTypeRef> = tags
+        .iter()
+        .map(|tag| {
+            let value = i64::from(*tag);
+            // SAFETY: `kCFNumberSInt64Type` over a local.
+            unsafe { corefoundation::api::CFNumberCreate(std::ptr::null(), 4, (&raw const value).cast()) }
+        })
+        .collect();
+    let array = collections::new_array(
+        &numbers,
+        corefoundation::callbacks::Policy::from_type_callbacks(),
+        false,
+    );
+    for number in numbers {
+        // SAFETY: the array holds its own reference.
+        unsafe { corefoundation::api::CFRelease(number) };
+    }
+    array
 }
 
 pub unsafe extern "C" fn CTFontGetSize(font: CFTypeRef) -> f64 {
@@ -1141,6 +1225,13 @@ exports::exports! {
         "CTFontCopyFontDescriptor" => CTFontCopyFontDescriptor,
         "CTFontCopyGraphicsFont" => CTFontCopyGraphicsFont,
         "CTFontCopyName" => CTFontCopyName,
+        "CGFontGetUnitsPerEm" => CGFontGetUnitsPerEm,
+        "CTFontGetGlyphCount" => CTFontGetGlyphCount,
+        "CTFontCopyAvailableTables" => CTFontCopyAvailableTables,
+        "CTFontCopyLocalizedName" => CTFontCopyLocalizedName,
+        "CTFontCopyVariationAxes" => CTFontCopyVariationAxes,
+        "CGFontCopyTableForTag" => CGFontCopyTableForTag,
+        "CGFontCopyPostScriptName" => CGFontCopyPostScriptName,
         "CTFontCopyFamilyName" => CTFontCopyFamilyName,
         "CTFontCopyPostScriptName" => CTFontCopyPostScriptName,
         "CTFontGetSymbolicTraits" => CTFontGetSymbolicTraits,

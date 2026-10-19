@@ -422,8 +422,23 @@ pub unsafe extern "C" fn FSCreateFileUnicode(
     NO_ERR
 }
 
+/// `Boolean CSBackupIsItemExcluded(CFURLRef, Boolean *excludeByPath)`: no
+/// item is excluded, as nothing here backs anything up.
+///
+/// # Safety
+///
+/// `by_path` is null or writable.
+pub unsafe extern "C" fn CSBackupIsItemExcluded(_item: *const std::ffi::c_void, by_path: *mut u8) -> u8 {
+    if !by_path.is_null() {
+        // SAFETY: writable, per the caller.
+        unsafe { by_path.write(0) };
+    }
+    0
+}
+
 exports::exports! {
     functions {
+        "CSBackupIsItemExcluded" => CSBackupIsItemExcluded,
         "FSCreateFileUnicode" => FSCreateFileUnicode,
         "FSFindFolder" => FSFindFolder,
         "FSPathMakeRef" => FSPathMakeRef,

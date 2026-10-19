@@ -2695,6 +2695,17 @@ pub unsafe extern "C" fn CFRunLoopRunInMode(
     loop_.run_in_mode(&name, seconds, return_after_source_handled != 0)
 }
 
+/// `CFStringRef CFRunLoopCopyCurrentMode(CFRunLoopRef)`, owned by the caller.
+///
+/// FIXME (ACCURACY): the default mode whenever the loop is turning at all; a
+/// loop run in another named mode is not told apart, and one not running at
+/// all answers the default rather than null, since AppKit's event loop here
+/// is not a Core Foundation run.
+pub unsafe extern "C" fn CFRunLoopCopyCurrentMode(_run_loop: CFTypeRef) -> CFTypeRef {
+    // SAFETY: a fresh string this call hands over.
+    unsafe { CFRetain(crate::base::interned_name(runloop::DEFAULT_MODE) as usize as CFTypeRef) }
+}
+
 pub unsafe extern "C" fn CFRunLoopRun() {
     // `CFRunLoopRun` is the default mode with no timeout, until stopped.
     runloop::current().run_in_mode(runloop::DEFAULT_MODE, f64::INFINITY, false);
@@ -3234,6 +3245,20 @@ pub unsafe extern "C" fn CFArrayCreateCopy(
         return std::ptr::null();
     };
     collections::new_array(&a.values.clone(), a.policy, false)
+}
+
+/// `CFMutableArrayRef CFArrayCreateMutableCopy(CFAllocatorRef, CFIndex
+/// capacity, CFArrayRef)`: a mutable array holding the same values, with the
+/// same callbacks. The capacity is a hint here, as it is a limit nowhere else.
+pub unsafe extern "C" fn CFArrayCreateMutableCopy(
+    _allocator: CFAllocatorRef,
+    _capacity: CFIndex,
+    array: CFTypeRef,
+) -> CFTypeRef {
+    let Some(a) = (unsafe { collections::array(array) }) else {
+        return std::ptr::null();
+    };
+    collections::new_array(&a.values.clone(), a.policy, true)
 }
 
 pub unsafe extern "C" fn CFArrayInsertValueAtIndex(

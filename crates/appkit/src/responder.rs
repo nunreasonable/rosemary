@@ -418,9 +418,19 @@ unsafe extern "C" fn forward_event(receiver: Id, sel: Sel, event: Id) {
     unsafe { forward(receiver, sel, event) }
 }
 
+/// `-touchBar`: no Touch Bar is attached here.
+unsafe extern "C" fn touch_bar(_receiver: Id, _sel: Sel) -> Id {
+    std::ptr::null_mut()
+}
+
+/// `-setTouchBar:`: accepted; there is no Touch Bar to show it on.
+unsafe extern "C" fn set_touch_bar(_receiver: Id, _sel: Sel, _bar: Id) {}
+
 pub(crate) fn install() {
     let class = objc::class::lookup(c"NSResponder").expect("declared before its methods");
     methods!(class, {
+        "touchBar" => touch_bar, c"@16@0:8";
+        "setTouchBar:" => set_touch_bar, c"v24@0:8@16";
         "menu" => menu, c"@16@0:8";
         "setMenu:" => set_menu, c"v24@0:8@16";
         "nextResponder" => next_responder, c"@16@0:8";

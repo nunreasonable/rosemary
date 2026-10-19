@@ -14,6 +14,11 @@ pub fn bootstrap() {
             c"@24@0:8@16",
         );
         metaclass.replace_method(
+            objc::sel::get("devices"),
+            devices as *const std::ffi::c_void,
+            c"@16@0:8",
+        );
+        metaclass.replace_method(
             objc::sel::get("defaultDeviceWithMediaType:"),
             default_device_with_media_type as *const std::ffi::c_void,
             c"@24@0:8@16",
@@ -29,6 +34,12 @@ pub fn bootstrap() {
             c"v32@0:8@16@?24",
         );
     });
+}
+
+/// `+[AVCaptureDevice devices]`: every device of every type, which is none.
+unsafe extern "C" fn devices(class: Id, sel: Sel) -> Id {
+    // SAFETY: the same answer for no particular type.
+    unsafe { devices_with_media_type(class, sel, std::ptr::null_mut()) }
 }
 
 /// `+[AVCaptureDevice devicesWithMediaType:]`.

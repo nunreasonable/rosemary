@@ -15,6 +15,11 @@ pub unsafe extern "C" fn AXIsProcessTrusted() -> u8 {
     0
 }
 
+/// `Boolean UAZoomEnabled(void)`: no screen zoom runs here.
+pub extern "C" fn UAZoomEnabled() -> u8 {
+    0
+}
+
 /// `Boolean AXIsProcessTrustedWithOptions(CFDictionaryRef)`. Asking for the
 /// prompt shows none: there is no System Settings to send the user to.
 pub unsafe extern "C" fn AXIsProcessTrustedWithOptions(_options: *const c_void) -> u8 {

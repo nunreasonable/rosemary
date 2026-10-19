@@ -425,6 +425,49 @@ pub unsafe extern "C" fn SecItemUpdate(query: CFTypeRef, changes: CFTypeRef) -> 
     SUCCESS
 }
 
+/// A `SecKeychainRef`: a handle with nothing behind it, since this runtime
+/// has one store and no keychain files to tell apart.
+#[repr(C)]
+struct KeychainBody {
+    isa: *const objc::class::Class,
+}
+
+fn keychain_class() -> &'static objc::class::Class {
+    static CLASS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let pointer = *CLASS.get_or_init(|| {
+        let class = corefoundation::base::register(
+            c"__R3SecKeychainObject",
+            None,
+            size_of::<KeychainBody>(),
+            true,
+        );
+        objc::class::ptr(class) as usize
+    });
+    // SAFETY: a class registered above and kept for the process.
+    unsafe { objc::class::from_ptr(pointer as *const objc::class::Class).expect("a keychain class") }
+}
+
+/// `OSStatus SecKeychainOpen(const char *path, SecKeychainRef *)`: a handle
+/// owned by the caller, whether or not a file is there, as Apple's - opening
+/// only names the keychain.
+///
+/// # Safety
+///
+/// `out` is null or writable.
+pub unsafe extern "C" fn SecKeychainOpen(_path: *const std::ffi::c_char, out: *mut CFTypeRef) -> i32 {
+    if out.is_null() {
+        return -50;
+    }
+    // SAFETY: `KeychainBody` is the registered layout.
+    let body = unsafe { corefoundation::base::allocate::<KeychainBody>(keychain_class()) };
+    // SAFETY: writable, checked above.
+    unsafe { out.write(body as CFTypeRef) };
+    match body.is_null() {
+        true => -108,
+        false => 0,
+    }
+}
+
 /// `OSStatus SecKeychainCopySearchList(CFArrayRef *)`: an empty list, owned by
 /// the caller - there are no keychain files here to search.
 ///
@@ -474,6 +517,7 @@ exports::exports! {
         "SecItemAdd" => SecItemAdd,
         "SecKeychainAddCallback" => SecKeychainAddCallback,
         "SecKeychainCopySearchList" => SecKeychainCopySearchList,
+        "SecKeychainOpen" => SecKeychainOpen,
         "SecKeychainRemoveCallback" => SecKeychainRemoveCallback,
         "SecTaskCreateFromSelf" => SecTaskCreateFromSelf,
         "SecItemCopyMatching" => SecItemCopyMatching,

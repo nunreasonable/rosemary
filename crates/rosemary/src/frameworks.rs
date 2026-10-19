@@ -435,12 +435,32 @@ const VIDEO_CONSTANTS: &[(&str, &str)] = &[
     ),
 ];
 
+/// MediaPlayer's now-playing keys, which Chromium fills in for the system's
+/// media controls. Its classes stay unbound, so the messages go to nil.
+const NOW_PLAYING_CONSTANTS: &[(&str, &str)] = &[
+    ("_MPMediaItemPropertyTitle", "title"),
+    ("_MPMediaItemPropertyAlbumTitle", "albumTitle"),
+    ("_MPMediaItemPropertyArtist", "artist"),
+    ("_MPMediaItemPropertyArtwork", "artwork"),
+    ("_MPMediaItemPropertyPlaybackDuration", "playbackDuration"),
+    (
+        "_MPNowPlayingInfoPropertyElapsedPlaybackTime",
+        "MPNowPlayingInfoPropertyElapsedPlaybackTime",
+    ),
+    ("_MPNowPlayingInfoPropertyPlaybackRate", "MPNowPlayingInfoPropertyPlaybackRate"),
+    (
+        "_MPNowPlayingInfoPropertyCurrentPlaybackDate",
+        "MPNowPlayingInfoPropertyCurrentPlaybackDate",
+    ),
+];
+
 /// `kCMTimeInvalid`: a `CMTime` with no flags set, all zero.
 static CM_TIME_INVALID: [u64; 3] = [0; 3];
 
 fn media_constants() -> Vec<(String, u64)> {
     let mut out = corefoundation::base::string_globals(MEDIA_CONSTANTS);
     out.extend(corefoundation::base::string_globals(VIDEO_CONSTANTS));
+    out.extend(corefoundation::base::string_globals(NOW_PLAYING_CONSTANTS));
     out.push((
         "_kCMTimeInvalid".to_string(),
         &CM_TIME_INVALID as *const [u64; 3] as usize as u64,
