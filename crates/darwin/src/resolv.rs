@@ -150,12 +150,64 @@ unsafe extern "C" fn ns_parserr(
     }
 }
 
+/// The name servers `/etc/resolv.conf` lists, in order.
+fn name_servers() -> Vec<std::net::IpAddr> {
+    std::fs::read_to_string("/etc/resolv.conf")
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("nameserver"))
+        .filter_map(|rest| rest.trim().split('%').next()?.parse().ok())
+        .collect()
+}
+
+/// `int res_9_getservers(res_state, union res_sockaddr_union *, int count)`:
+/// the host's name servers as Darwin `sockaddr`s on port 53, each in a
+/// 128-byte slot; how many were written.
+///
+/// # Safety
+///
+/// `out` has room for `count` 128-byte slots.
+unsafe extern "C" fn res_getservers(_state: *mut u8, out: *mut u8, count: c_int) -> c_int {
+    const SLOT: usize = 128;
+    if out.is_null() || count <= 0 {
+        return 0;
+    }
+    let mut written = 0;
+    for server in name_servers().into_iter().take(count as usize) {
+        let mut slot = [0u8; SLOT];
+        match server {
+            std::net::IpAddr::V4(v4) => {
+                slot[0] = 16;
+                slot[1] = 2;
+                slot[2..4].copy_from_slice(&53u16.to_be_bytes());
+                slot[4..8].copy_from_slice(&v4.octets());
+            }
+            std::net::IpAddr::V6(v6) => {
+                slot[0] = 28;
+                slot[1] = 30;
+                slot[2..4].copy_from_slice(&53u16.to_be_bytes());
+                slot[8..24].copy_from_slice(&v6.octets());
+            }
+        }
+        // SAFETY: slot `written` of the caller's array.
+        unsafe { std::ptr::copy_nonoverlapping(slot.as_ptr(), out.add(written * SLOT), SLOT) };
+        written += 1;
+    }
+    written as c_int
+}
+
+/// `void res_9_ndestroy(res_state)`: as `res_9_nclose`; the state holds
+/// nothing of this runtime's to free.
+unsafe extern "C" fn res_ndestroy(_state: *mut u8) {}
+
 exports::exports! {
     functions {
         "res_9_init" => res_9_init,
         "res_9_close" => res_9_close,
         "res_9_ninit" => res_ninit,
         "res_9_nclose" => res_nclose,
+        "res_9_ndestroy" => res_ndestroy,
+        "res_9_getservers" => res_getservers,
         "res_9_nquery" => res_nquery,
         "res_9_ns_initparse" => ns_initparse,
         "res_9_ns_parserr" => ns_parserr,

@@ -2625,6 +2625,16 @@ pub unsafe extern "C" fn _CFCopyServerVersionDictionary() -> CFTypeRef {
     std::ptr::null()
 }
 
+/// `void CFRunLoopTimerSetTolerance(CFRunLoopTimerRef, CFTimeInterval)`: a
+/// hint for coalescing wake-ups, which a timer here - fired when due - has no
+/// use for.
+pub unsafe extern "C" fn CFRunLoopTimerSetTolerance(_timer: CFTypeRef, _tolerance: f64) {}
+
+/// `CFTimeInterval CFRunLoopTimerGetTolerance(CFRunLoopTimerRef)`.
+pub unsafe extern "C" fn CFRunLoopTimerGetTolerance(_timer: CFTypeRef) -> f64 {
+    0.0
+}
+
 pub unsafe extern "C" fn CFRunLoopGetCurrent() -> CFTypeRef {
     Arc::as_ptr(&runloop::current()) as CFTypeRef
 }

@@ -133,10 +133,8 @@ pub unsafe extern "C" fn guarded_close_np(fd: c_int, _guard: *const u64) -> c_in
 }
 
 /// `int fileport_makeport(int fd, fileport_t *port)`: a send right standing
-/// for the open file, which `fileport_makefd` turns back into a descriptor.
-///
-/// FIXME (ACCURACY): the right is this process's only - one sent in a
-/// message does not take the file with it.
+/// for the open file, which `fileport_makefd` turns back into a descriptor -
+/// in this process or, sent in a message, in another.
 pub unsafe extern "C" fn fileport_makeport(fd: c_int, port: *mut Name) -> c_int {
     if port.is_null() {
         crate::errno::set(libc::EFAULT);
@@ -420,9 +418,26 @@ pub unsafe extern "C" fn voucher_mach_msg_set(_message: *mut c_void) -> u32 {
     0
 }
 
+/// `audit_token_t`: eight words, of which the sixth is the process id.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct AuditToken([u32; 8]);
+
+/// `pid_t audit_token_to_pid(audit_token_t)`.
+pub extern "C" fn audit_token_to_pid(token: AuditToken) -> i32 {
+    token.0[5] as i32
+}
+
+/// `uid_t audit_token_to_euid(audit_token_t)`.
+pub extern "C" fn audit_token_to_euid(token: AuditToken) -> u32 {
+    token.0[1]
+}
+
 exports::exports! {
     functions {
         "sandbox_check" => sandbox_check,
+        "audit_token_to_pid" => audit_token_to_pid,
+        "audit_token_to_euid" => audit_token_to_euid,
         "posix_spawnattr_set_csm_np" => posix_spawnattr_set_csm_np,
         "pthread_stack_frame_decode_np" => pthread_stack_frame_decode_np,
         "voucher_mach_msg_set" => voucher_mach_msg_set,

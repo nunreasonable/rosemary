@@ -386,10 +386,24 @@ unsafe extern "C" fn is_file_package(_receiver: Id, _sel: Sel, path: Id) -> u8 {
     u8::from(package && host.is_dir())
 }
 
+/// The display accommodations of the Accessibility pane, all off, as they
+/// are on a Mac nobody has changed them on.
+unsafe extern "C" fn accessibility_off(_receiver: Id, _sel: Sel) -> u8 {
+    0
+}
+
 pub(crate) fn install() {
     let class = objc::class::lookup(c"NSWorkspace").expect("declared before its methods");
     class_methods!(class, {
         "sharedWorkspace" => shared_workspace, c"@16@0:8";
+    });
+    methods!(class, {
+        "accessibilityDisplayShouldReduceMotion" => accessibility_off, c"c16@0:8";
+        "accessibilityDisplayShouldIncreaseContrast" => accessibility_off, c"c16@0:8";
+        "accessibilityDisplayShouldReduceTransparency" => accessibility_off, c"c16@0:8";
+        "accessibilityDisplayShouldDifferentiateWithoutColor" => accessibility_off, c"c16@0:8";
+        "accessibilityDisplayShouldInvertColors" => accessibility_off, c"c16@0:8";
+        "isVoiceOverEnabled" => accessibility_off, c"c16@0:8";
     });
     methods!(class, {
         "URLForApplicationToOpenURL:" => application_url_for_url, c"@24@0:8@16";

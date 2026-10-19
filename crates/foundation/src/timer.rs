@@ -505,6 +505,69 @@ unsafe extern "C" fn get_cf_run_loop(receiver: Id, _sel: Sel) -> *const c_void {
     Arc::as_ptr(&loop_of(receiver)) as *const c_void
 }
 
+/// The `-performSelector:target:argument:order:modes:` requests not yet run,
+/// for `-cancelPerformSelector:target:argument:` to find.
+static PENDING: std::sync::Mutex<Vec<(usize, usize, usize, usize)>> = std::sync::Mutex::new(Vec::new());
+
+/// `-performSelector:target:argument:order:modes:`: `[target selector:argument]`
+/// on this run loop's next turn. The order among several such requests and
+/// the modes are not kept; every request runs in the default mode, in the
+/// order it was made.
+unsafe extern "C" fn perform_selector_on_loop(
+    receiver: Id,
+    _sel: Sel,
+    selector: Sel,
+    target: Id,
+    argument: Id,
+    _order: u64,
+    _modes: Id,
+) {
+    let timer = make(0.0, target, selector, argument, false, false, false);
+    let mut pending = PENDING.lock().unwrap_or_else(|e| e.into_inner());
+    // The ones that have run since are let go of here.
+    pending.retain(|(t, ..)| {
+        // SAFETY: a timer this module made and still holds.
+        let live = unsafe { is_valid(*t as Id, objc::sel::get("isValid")) } != 0;
+        if !live {
+            objc::arc::release(*t as Id);
+        }
+        live
+    });
+    pending.push((timer as usize, target as usize, selector as usize, argument as usize));
+    drop(pending);
+    objc::arc::retain(timer);
+    add_to_loop(timer, loop_of(receiver));
+}
+
+/// `-cancelPerformSelector:target:argument:`: every request for exactly this
+/// selector, target and argument that has not run yet.
+unsafe extern "C" fn cancel_perform_selector(
+    _receiver: Id,
+    _sel: Sel,
+    selector: Sel,
+    target: Id,
+    argument: Id,
+) {
+    let cancelled: Vec<usize> = {
+        let mut pending = PENDING.lock().unwrap_or_else(|e| e.into_inner());
+        let mut out = Vec::new();
+        pending.retain(|(timer, t, s, a)| {
+            let matches = *t == target as usize && *s == selector as usize && *a == argument as usize;
+            if matches {
+                out.push(*timer);
+            }
+            !matches
+        });
+        // Fired requests are dropped as they are found.
+        out
+    };
+    for timer in cancelled {
+        // SAFETY: a timer this module made and retained above.
+        unsafe { invalidate(timer as Id, objc::sel::get("invalidate")) };
+        objc::arc::release(timer as Id);
+    }
+}
+
 unsafe extern "C" fn add_timer_for_mode(receiver: Id, _sel: Sel, timer: Id, _mode: Id) {
     if !timer.is_null() {
         add_to_loop(timer, loop_of(receiver));
@@ -600,6 +663,8 @@ pub(crate) fn install() {
         "getCFRunLoop" => get_cf_run_loop, c"^{__CFRunLoop=}16@0:8";
         "addTimer:forMode:" => add_timer_for_mode, c"v32@0:8@16@24";
         "runMode:beforeDate:" => run_mode_before_date, c"B32@0:8@16@24";
+        "performSelector:target:argument:order:modes:" => perform_selector_on_loop, c"v56@0:8:16@24@32Q40@48";
+        "cancelPerformSelector:target:argument:" => cancel_perform_selector, c"v40@0:8:16@24@32";
         "runUntilDate:" => run_until_date, c"v24@0:8@16";
     });
 }

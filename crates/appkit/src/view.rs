@@ -1871,9 +1871,27 @@ unsafe extern "C" fn effective_appearance(receiver: Id, sel: Sel) -> Id {
     crate::appearance::effective_of(source)
 }
 
+/// `-viewDidMoveToWindow` and its neighbours: `NSView`'s own do nothing, and
+/// are there for a subclass's `super` call to land on.
+unsafe extern "C" fn view_hook(_receiver: Id, _sel: Sel) {}
+
+unsafe extern "C" fn view_hook_object(_receiver: Id, _sel: Sel, _object: Id) {}
+
+/// `-sortSubviewsUsingFunction:context:`.
+///
+/// FIXME (ACCURACY): the order is left as it is. Sibling order is drawing
+/// order, and a caller sorting to raise one view above another sees it drawn
+/// where it was.
+unsafe extern "C" fn sort_subviews(_receiver: Id, _sel: Sel, _compare: usize, _context: usize) {}
+
 pub(crate) fn install() {
     let class = objc::class::lookup(c"NSView").expect("declared before its methods");
     methods!(class, {
+        "viewDidMoveToWindow" => view_hook, c"v16@0:8";
+        "viewDidMoveToSuperview" => view_hook, c"v16@0:8";
+        "viewWillMoveToWindow:" => view_hook_object, c"v24@0:8@16";
+        "viewWillMoveToSuperview:" => view_hook_object, c"v24@0:8@16";
+        "sortSubviewsUsingFunction:context:" => sort_subviews, c"v32@0:8^?16^v24";
         "appearance" => appearance, c"@16@0:8";
         "setAppearance:" => set_appearance, c"v24@0:8@16";
         "effectiveAppearance" => effective_appearance, c"@16@0:8";

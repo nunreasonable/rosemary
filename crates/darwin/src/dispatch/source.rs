@@ -144,6 +144,9 @@ pub unsafe extern "C" fn source_create(kind: u64, handle: u64, mask: u64, queue:
     let Some(kind) = type_of(kind) else {
         return 0;
     };
+    if trace() {
+        eprintln!("rosemary: dispatch source: {kind:?} on {handle:#x} mask {mask:#x}");
+    }
     let queue = match queue {
         0 => unsafe { super::queue::get_global_queue(0, 0) },
         q => q,
@@ -405,9 +408,21 @@ unsafe fn call(handle: u64, handler: Handler) {
     }
 }
 
+/// `ROSEMARY_TRACE_DISPATCH_SOURCE=1`: say when a source is made and fires.
+fn trace() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("ROSEMARY_TRACE_DISPATCH_SOURCE").is_some())
+}
+
 /// Run the event handler on the source's queue, with the data accumulated.
 unsafe extern "C" fn fire(context: *mut c_void) {
     let handle = context as u64;
+    if trace() {
+        // SAFETY: the watcher's reference keeps it alive.
+        if let Some(source) = unsafe { source(handle) } {
+            eprintln!("rosemary: dispatch source: {:?} on {:#x} fires", source.kind, source.handle);
+        }
+    }
     // SAFETY: the reference the watcher took keeps it alive.
     let Some(source) = (unsafe { source(handle) }) else {
         return;

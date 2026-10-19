@@ -1431,6 +1431,27 @@ pub mod bitmap {
         };
     }
 
+    /// `-getPixel:atX:y:`: each sample of the pixel, eight-bit as every rep
+    /// here stores them, widened into the caller's `NSUInteger` array.
+    unsafe extern "C" fn get_pixel(receiver: Id, _sel: Sel, out: *mut usize, x: isize, y: isize) {
+        let rep = rep_of(receiver);
+        if out.is_null() || x < 0 || y < 0 || x as usize >= rep.width || y as usize >= rep.height {
+            return;
+        }
+        // SAFETY: `-bitmapData` is `void * (id, SEL)` and this module's own.
+        let data = unsafe { bitmap_data(receiver, objc::sel::get("bitmapData")) };
+        if data.is_null() {
+            return;
+        }
+        let bytes_per_pixel = (rep.bits_per_pixel / 8).max(1);
+        let at = y as usize * rep.bytes_per_row + x as usize * bytes_per_pixel;
+        for sample in 0..rep.samples {
+            // SAFETY: inside the buffer, by the bounds checked above; `out`
+            // has room for a pixel's samples, per the caller.
+            unsafe { out.add(sample).write(usize::from(*data.add(at + sample))) };
+        }
+    }
+
     /// `-copyWithZone:`: another rep owning a copy of the pixels, so that
     /// drawing into either leaves the other as it was - a copy of a rep over a
     /// buffer the guest supplied included.
@@ -1511,6 +1532,7 @@ pub mod bitmap {
             "setSize:" => set_rep_size, c"v32@0:8{CGSize=dd}16";
             "TIFFRepresentation" => tiff_representation, c"@16@0:8";
             "copyWithZone:" => copy_rep, c"@24@0:8^v16";
+            "getPixel:atX:y:" => get_pixel, c"v40@0:8^Q16q24q32";
         });
     }
 

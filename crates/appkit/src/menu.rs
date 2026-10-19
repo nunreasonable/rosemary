@@ -596,6 +596,10 @@ unsafe extern "C" fn zero_width(_receiver: Id, _sel: Sel) -> f64 {
 
 /// `-_setHasPadding:onEdge:`, private API Chromium calls to trim the space
 /// above and below a menu's items. Menus here have no padding to trim.
+/// `-setAllowsKeyEquivalentWhenHidden:`: key equivalents are matched by the
+/// menu here whether or not the item shows, so there is nothing to change.
+unsafe extern "C" fn ignored_flag(_receiver: Id, _sel: Sel, _flag: u8) {}
+
 unsafe extern "C" fn ignored_padding(_receiver: Id, _sel: Sel, _padding: u8, _edge: u64) {}
 
 pub(crate) fn install() {
@@ -670,6 +674,7 @@ pub(crate) fn install() {
         "isHidden" => is_hidden, c"c16@0:8";
         "setHidden:" => set_hidden, c"v20@0:8c16";
         "setKeyEquivalentModifierMask:" => set_key_equivalent_modifier_mask, c"v24@0:8Q16";
+        "setAllowsKeyEquivalentWhenHidden:" => ignored_flag, c"v20@0:8c16";
         "keyEquivalentModifierMask" => key_equivalent_modifier_mask, c"Q16@0:8";
         "isSeparatorItem" => is_separator_item, c"c16@0:8";
         "hasSubmenu" => has_submenu, c"c16@0:8";

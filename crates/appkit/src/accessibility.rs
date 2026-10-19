@@ -55,3 +55,9 @@ pub unsafe extern "C" fn CGPreflightScreenCaptureAccess() -> u8 {
 pub unsafe extern "C" fn CGFontRenderingGetFontSmoothingDisabled() -> u8 {
     0
 }
+
+/// `bool CGDisplayUsesForceToGray(void)`: no - the "use grayscale" filter of
+/// the Accessibility pane is off.
+pub unsafe extern "C" fn CGDisplayUsesForceToGray() -> u8 {
+    0
+}

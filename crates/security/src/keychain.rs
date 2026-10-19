@@ -425,9 +425,36 @@ pub unsafe extern "C" fn SecItemUpdate(query: CFTypeRef, changes: CFTypeRef) -> 
     SUCCESS
 }
 
+/// `OSStatus SecKeychainAddCallback(SecKeychainCallback, SecKeychainEventMask,
+/// void *)`: registered, and never called - nothing outside the program
+/// changes this keychain while it runs.
+pub unsafe extern "C" fn SecKeychainAddCallback(
+    _callback: *const std::ffi::c_void,
+    _events: u32,
+    _context: *mut std::ffi::c_void,
+) -> OSStatus {
+    SUCCESS
+}
+
+/// `OSStatus SecKeychainRemoveCallback(SecKeychainCallback)`.
+pub unsafe extern "C" fn SecKeychainRemoveCallback(_callback: *const std::ffi::c_void) -> OSStatus {
+    SUCCESS
+}
+
+/// `SecTaskRef SecTaskCreateFromSelf(CFAllocatorRef)`: null, which is the
+/// documented answer when the task's code signature cannot be read - there
+/// is none to read here, and a caller asking for an entitlement next must
+/// already handle that.
+pub unsafe extern "C" fn SecTaskCreateFromSelf(_allocator: CFTypeRef) -> CFTypeRef {
+    std::ptr::null()
+}
+
 exports::exports! {
     functions {
         "SecItemAdd" => SecItemAdd,
+        "SecKeychainAddCallback" => SecKeychainAddCallback,
+        "SecKeychainRemoveCallback" => SecKeychainRemoveCallback,
+        "SecTaskCreateFromSelf" => SecTaskCreateFromSelf,
         "SecItemCopyMatching" => SecItemCopyMatching,
         "SecItemDelete" => SecItemDelete,
         "SecItemUpdate" => SecItemUpdate,

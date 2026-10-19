@@ -233,6 +233,8 @@ exports::exports! {
         "CFRunLoopIsWaiting" => api::CFRunLoopIsWaiting,
         "CFRunLoopTimerGetInterval" => api::CFRunLoopTimerGetInterval,
         "CFRunLoopTimerSetNextFireDate" => api::CFRunLoopTimerSetNextFireDate,
+        "CFRunLoopTimerSetTolerance" => api::CFRunLoopTimerSetTolerance,
+        "CFRunLoopTimerGetTolerance" => api::CFRunLoopTimerGetTolerance,
         "CFDataCreateMutable" => api::CFDataCreateMutable,
         "CFDataGetBytes" => api::CFDataGetBytes,
         "CFStringGetSystemEncoding" => api::CFStringGetSystemEncoding,

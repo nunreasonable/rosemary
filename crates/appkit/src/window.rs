@@ -2428,6 +2428,12 @@ unsafe extern "C" fn effective_appearance(receiver: Id, sel: Sel) -> Id {
     crate::appearance::effective_of(crate::application::shared())
 }
 
+/// `-keyViewSelectionDirection`: `NSDirectSelection` - focus here moves by
+/// clicking, never by a Tab traversal in progress.
+unsafe extern "C" fn key_view_selection_direction(_receiver: Id, _sel: Sel) -> u64 {
+    0
+}
+
 pub(crate) fn install() {
     let responder = objc::class::lookup(c"NSResponder").expect("declared before its methods");
     methods!(responder, {
@@ -2592,6 +2598,7 @@ pub(crate) fn install() {
         "setCollectionBehavior:" => set_collection_behavior, c"v24@0:8Q16";
         "firstResponder" => first_responder, c"@16@0:8";
         "makeFirstResponder:" => make_first_responder, c"c24@0:8@16";
+        "keyViewSelectionDirection" => key_view_selection_direction, c"Q16@0:8";
         "initialFirstResponder" => initial_first_responder, c"@16@0:8";
         "nextResponder" => next_responder, c"@16@0:8";
         "setNextResponder:" => set_next_responder, c"v24@0:8@16";

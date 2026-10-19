@@ -8,6 +8,7 @@ pub mod collator;
 pub mod events;
 pub mod files;
 pub mod icons;
+mod lockdown;
 pub mod process;
 pub mod resources;
 pub mod uti;
@@ -18,6 +19,7 @@ exports::group! {
     events,
     files,
     icons,
+    lockdown,
     process,
     resources,
     uti,

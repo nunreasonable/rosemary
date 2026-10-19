@@ -848,6 +848,18 @@ pub unsafe extern "C" fn CTFontCollectionCreateWithFontDescriptors(
     collections::new_array(&items, type_policy(), false)
 }
 
+/// `CTFontCollectionRef CTFontCollectionCreateFromAvailableFonts(CFDictionaryRef)`:
+/// every installed face, as a collection of their descriptors.
+pub unsafe extern "C" fn CTFontCollectionCreateFromAvailableFonts(_options: CFTypeRef) -> CFTypeRef {
+    let faces: Vec<CFTypeRef> = fonts::all_faces()
+        .iter()
+        .map(|face| face_attributes(face, 0.0))
+        .collect();
+    let array = collections::new_array(&faces, type_policy(), false);
+    faces.into_iter().for_each(release);
+    array
+}
+
 /// `CFArrayRef CTFontCollectionCreateMatchingFontDescriptors(CTFontCollectionRef)`:
 /// every installed face matching any of the collection's descriptors, or null
 /// when none does.
@@ -1163,6 +1175,7 @@ exports::exports! {
         "CTFontDescriptorCreateWithNameAndSize" => CTFontDescriptorCreateWithNameAndSize,
         "CTFontDescriptorCreateMatchingFontDescriptors" => CTFontDescriptorCreateMatchingFontDescriptors,
         "CTFontCollectionCreateWithFontDescriptors" => CTFontCollectionCreateWithFontDescriptors,
+        "CTFontCollectionCreateFromAvailableFonts" => CTFontCollectionCreateFromAvailableFonts,
         "CTFontCollectionCreateMatchingFontDescriptors" => CTFontCollectionCreateMatchingFontDescriptors,
         "CTFontCreateCopyWithAttributes" => CTFontCreateCopyWithAttributes,
         "CTFontCreateWithGraphicsFont" => CTFontCreateWithGraphicsFont,

@@ -63,6 +63,8 @@ struct Link {
     /// integrates to get elapsed time.
     frame: i64,
     started: std::time::Instant,
+    /// The display it was made for or last pointed at.
+    display: u32,
 }
 
 // SAFETY: the context is the guest's own pointer and is only ever handed back to
@@ -118,6 +120,12 @@ pub unsafe extern "C" fn CVDisplayLinkCreateWithCGDisplay(
         period: display_period(display),
         frame: 0,
         started: std::time::Instant::now(),
+        // "Active displays" is the main one, which is what a link made that
+        // way reports as its current display.
+        display: match display {
+            0 => sdl3::video::primary_display(),
+            d => d,
+        },
     }));
     // The handle is the `Mutex`'s address, which the `Arc` in the table keeps
     // alive for as long as the link exists.
@@ -167,8 +175,15 @@ pub unsafe extern "C" fn CVDisplayLinkSetCurrentCGDisplay(
     let Some(link) = link_for(handle) else {
         return INVALID_ARGUMENT;
     };
-    link.lock().unwrap_or_else(|e| e.into_inner()).period = display_period(display);
+    let mut link = link.lock().unwrap_or_else(|e| e.into_inner());
+    link.period = display_period(display);
+    link.display = display;
     SUCCESS
+}
+
+/// `CGDirectDisplayID CVDisplayLinkGetCurrentCGDisplay(CVDisplayLinkRef)`.
+pub unsafe extern "C" fn CVDisplayLinkGetCurrentCGDisplay(handle: *mut c_void) -> u32 {
+    link_for(handle).map_or(0, |link| link.lock().unwrap_or_else(|e| e.into_inner()).display)
 }
 
 pub unsafe extern "C" fn CVDisplayLinkSetCurrentCGDisplayFromOpenGLContext(
@@ -347,12 +362,20 @@ unsafe extern "C" fn fire(_timer: *const c_void, info: *mut c_void) {
     unsafe { callback(info, &now, &output, 0, &mut flags_out, context) };
 }
 
+pub mod decode;
+
 exports::exports! {
     functions {
+        "VTRegisterSupplementalVideoDecoderIfAvailable" => decode::VTRegisterSupplementalVideoDecoderIfAvailable,
+        "VTIsHardwareDecodeSupported" => decode::VTIsHardwareDecodeSupported,
+        "CMVideoFormatDescriptionGetCleanAperture" => decode::CMVideoFormatDescriptionGetCleanAperture,
+        "VTDecompressionSessionCreate" => decode::VTDecompressionSessionCreate,
+        "CMVideoFormatDescriptionCreateFromH264ParameterSets" => decode::CMVideoFormatDescriptionCreateFromH264ParameterSets,
         "CVDisplayLinkCreateWithCGDisplay" => CVDisplayLinkCreateWithCGDisplay,
         "CVDisplayLinkCreateWithActiveCGDisplays" => CVDisplayLinkCreateWithActiveCGDisplays,
         "CVDisplayLinkSetOutputCallback" => CVDisplayLinkSetOutputCallback,
         "CVDisplayLinkSetCurrentCGDisplay" => CVDisplayLinkSetCurrentCGDisplay,
+        "CVDisplayLinkGetCurrentCGDisplay" => CVDisplayLinkGetCurrentCGDisplay,
         "CVDisplayLinkSetCurrentCGDisplayFromOpenGLContext" => CVDisplayLinkSetCurrentCGDisplayFromOpenGLContext,
         "CVDisplayLinkGetActualOutputVideoRefreshPeriod" => CVDisplayLinkGetActualOutputVideoRefreshPeriod,
         "CVDisplayLinkGetNominalOutputVideoRefreshPeriod" => CVDisplayLinkGetNominalOutputVideoRefreshPeriod,

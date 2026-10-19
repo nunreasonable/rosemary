@@ -93,6 +93,7 @@ pub unsafe extern "C" fn IOPMAssertionRelease(_assertion: u32) -> i32 {
 exports::exports! {
     functions {
         "IOPMAssertionCreateWithDescription" => IOPMAssertionCreateWithDescription,
+        "IOPMCopyCPUPowerStatus" => IOPMCopyCPUPowerStatus,
         "IOPMAssertionRelease" => IOPMAssertionRelease,
         "IOPSCopyPowerSourcesInfo" => IOPSCopyPowerSourcesInfo,
         "IOPSCopyPowerSourcesList" => IOPSCopyPowerSourcesList,
@@ -100,4 +101,19 @@ exports::exports! {
         "IOPSCopyExternalPowerAdapterDetails" => IOPSCopyExternalPowerAdapterDetails,
         "IOPSNotificationCreateRunLoopSource" => IOPSNotificationCreateRunLoopSource,
     }
+}
+
+/// `IOReturn IOPMCopyCPUPowerStatus(CFDictionaryRef *)`: `kIOReturnNotFound`,
+/// what a Mac answers when no thermal or power limit is in force - the CPU is
+/// not being throttled, so there is no status to report.
+///
+/// # Safety
+///
+/// `out` is null or writable.
+pub unsafe extern "C" fn IOPMCopyCPUPowerStatus(out: *mut CFTypeRef) -> i32 {
+    if !out.is_null() {
+        // SAFETY: writable, per the caller.
+        unsafe { out.write(std::ptr::null()) };
+    }
+    0xe000_02f0_u32 as i32
 }

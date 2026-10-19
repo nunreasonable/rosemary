@@ -1558,6 +1558,24 @@ pub(crate) fn has_tree(layer: Id) -> bool {
     })
 }
 
+/// `-setGeometryFlipped:`.
+///
+/// FIXME (ACCURACY): not kept - this runtime composes layers in one
+/// orientation, and a flipped sublayer draws as an unflipped one would.
+unsafe extern "C" fn ignored_layer_flag(_receiver: Id, _sel: Sel, _flag: u8) {}
+
+unsafe extern "C" fn layer_no(_receiver: Id, _sel: Sel) -> u8 {
+    0
+}
+
+/// `-setAutoresizingMask:`, a macOS-only layer property for layers that
+/// follow their superlayer's size; not kept, as above.
+unsafe extern "C" fn ignored_layer_mask(_receiver: Id, _sel: Sel, _mask: u32) {}
+
+unsafe extern "C" fn layer_zero_mask(_receiver: Id, _sel: Sel) -> u32 {
+    0
+}
+
 pub(crate) fn install() {
     let layer = objc::class::lookup(c"CALayer").expect("declared before its methods");
     methods!(layer, {
@@ -1576,6 +1594,11 @@ pub(crate) fn install() {
         "removeFromSuperlayer" => remove_from_superlayer, c"v16@0:8";
         "masksToBounds" => masks_to_bounds, c"c16@0:8";
         "setMasksToBounds:" => set_masks_to_bounds, c"v20@0:8c16";
+        "setGeometryFlipped:" => ignored_layer_flag, c"v20@0:8c16";
+        "isGeometryFlipped" => layer_no, c"c16@0:8";
+        "geometryFlipped" => layer_no, c"c16@0:8";
+        "setAutoresizingMask:" => ignored_layer_mask, c"v20@0:8I16";
+        "autoresizingMask" => layer_zero_mask, c"I16@0:8";
         "isHidden" => is_hidden, c"c16@0:8";
         "setHidden:" => set_hidden, c"v20@0:8c16";
         "opacity" => opacity, c"f16@0:8";

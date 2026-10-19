@@ -109,6 +109,7 @@ static NAMED: &[(&str, f64, f64, f64, f64)] = &[
     ("headerTextColor", 0.0, 0.0, 0.0, 1.0),
     ("headerColor", 0.93, 0.93, 0.93, 1.0),
     ("selectedControlColor", 0.70, 0.84, 1.0, 1.0),
+    ("secondarySelectedControlColor", 0.86, 0.86, 0.86, 1.0),
     ("selectedControlTextColor", 0.0, 0.0, 0.0, 1.0),
     ("selectedTextBackgroundColor", 0.70, 0.84, 1.0, 1.0),
     ("alternateSelectedControlColor", 0.0, 0.39, 0.88, 1.0),
@@ -509,6 +510,20 @@ pub extern "C" fn NSRectFill(rect: NSRect) {
     );
 }
 
+/// `+currentControlTint`: `NSBlueControlTint`, macOS's default accent.
+unsafe extern "C" fn current_control_tint(_class: Id, _sel: Sel) -> u64 {
+    1
+}
+
+/// `+colorWithCatalogName:colorName:`: the `System` catalog's colours are the
+/// named ones this runtime defines; any other is nil, as AppKit answers for a
+/// colour no catalog holds.
+unsafe extern "C" fn color_with_catalog_name(_class: Id, _sel: Sel, _catalog: Id, name: Id) -> Id {
+    // SAFETY: an `NSString` or nil.
+    let name = String::from_utf8(unsafe { foundation::string::bytes(name) }).unwrap_or_default();
+    named_color(&name).unwrap_or(std::ptr::null_mut())
+}
+
 pub(crate) fn install() {
     let class = objc::class::lookup(c"NSColor").expect("declared before its methods");
     let meta = class.metaclass();
@@ -516,6 +531,8 @@ pub(crate) fn install() {
         meta.replace_method(objc::sel::get(name), named as *const c_void, c"@16@0:8");
     }
     class_methods!(class, {
+        "currentControlTint" => current_control_tint, c"Q16@0:8";
+        "colorWithCatalogName:colorName:" => color_with_catalog_name, c"@32@0:8@16@24";
         "controlAlternatingRowBackgroundColors" => alternating_row_colors, c"@16@0:8";
         "alternatingContentBackgroundColors" => alternating_row_colors, c"@16@0:8";
         "colorWithCalibratedRed:green:blue:alpha:" => color_with_rgba, c"@48@0:8d16d24d32d40";

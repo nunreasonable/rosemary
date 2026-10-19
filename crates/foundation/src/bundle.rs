@@ -1557,6 +1557,43 @@ pub(crate) mod class {
         path(unsafe { layout_of(receiver) }.and_then(|b| b.resource_in(name, kind, directory)))
     }
 
+    /// `-pathForResource:ofType:inDirectory:forLocalization:`: the resource in
+    /// that localization's `.lproj`, under `directory`, and only there - a
+    /// caller asking for a localization's copy is asking whether it has one.
+    unsafe extern "C" fn path_for_resource_for_localization(
+        receiver: Id,
+        _sel: Sel,
+        name: Id,
+        kind: Id,
+        directory: Id,
+        localization: Id,
+    ) -> Id {
+        // SAFETY: each argument is an `NSString` or nil.
+        let (name, kind, directory, localization) = unsafe {
+            (
+                crate::string::bytes(name),
+                crate::string::bytes(kind),
+                crate::string::bytes(directory),
+                crate::string::bytes(localization),
+            )
+        };
+        let (Ok(name), Ok(kind), Ok(directory), Ok(localization)) = (
+            std::str::from_utf8(&name),
+            std::str::from_utf8(&kind),
+            std::str::from_utf8(&directory),
+            std::str::from_utf8(&localization),
+        ) else {
+            return std::ptr::null_mut();
+        };
+        let lproj = match (directory.is_empty(), localization.is_empty()) {
+            (_, true) => directory.to_string(),
+            (true, false) => format!("{localization}.lproj"),
+            (false, false) => format!("{directory}/{localization}.lproj"),
+        };
+        // SAFETY: the receiver is an `NSBundle`.
+        path(unsafe { layout_of(receiver) }.and_then(|b| b.resource_in(name, kind, &lproj)))
+    }
+
     /// `-infoDictionary`: the whole `Info.plist` as objects.
     ///
     /// This was refused until `crate::objectify` existed, and the reason is
@@ -1593,6 +1630,7 @@ pub(crate) mod class {
             "pathForResource:ofType:" => path_for_resource, c"@32@0:8@16@24";
             "URLForResource:withExtension:" => url_for_resource, c"@32@0:8@16@24";
             "pathForResource:ofType:inDirectory:" => path_for_resource_in_directory, c"@40@0:8@16@24@32";
+            "pathForResource:ofType:inDirectory:forLocalization:" => path_for_resource_for_localization, c"@48@0:8@16@24@32@40";
             "infoDictionary" => info_dictionary, c"@16@0:8";
             "executableName" => executable_name, c"*16@0:8";
             "localizedStringForKey:value:table:" => localized_string_for_key, c"@40@0:8@16@24@32";

@@ -224,6 +224,7 @@ exports::exports! {
         "CGEventTapEnable" => accessibility::CGEventTapEnable,
         "CGEventGetIntegerValueField" => accessibility::CGEventGetIntegerValueField,
         "CGPreflightScreenCaptureAccess" => accessibility::CGPreflightScreenCaptureAccess,
+        "CGDisplayUsesForceToGray" => accessibility::CGDisplayUsesForceToGray,
         "CGFontRenderingGetFontSmoothingDisabled" => accessibility::CGFontRenderingGetFontSmoothingDisabled,
         "CGDataProviderRelease" => graphics::CGDataProviderRelease,
         "CGImageCreate" => graphics::CGImageCreate,

@@ -156,6 +156,46 @@ unsafe extern "C" fn index_of_object_with_options_passing_test(
     NOT_FOUND
 }
 
+/// `-enumerateObjectsWithOptions:usingBlock:`, forwards or under
+/// `NSEnumerationReverse` backwards, until the block sets `*stop`.
+unsafe extern "C" fn enumerate_objects_with_options(
+    receiver: Id,
+    _sel: Sel,
+    options: usize,
+    block: Id,
+) {
+    // SAFETY: an array.
+    let Some(array) = (unsafe { collections::array(receiver as CFTypeRef) }) else {
+        return;
+    };
+    // SAFETY: null or a block.
+    let Some(invoke) = (unsafe { block_invoke(block) }) else {
+        return;
+    };
+    // SAFETY: the block is `void (^)(id, NSUInteger, BOOL *)`.
+    let call: unsafe extern "C" fn(Id, Id, usize, *mut bool) = unsafe { std::mem::transmute(invoke) };
+    // A copy, because the block may mutate the array it is enumerating.
+    let values = array.values.clone();
+    let order: Box<dyn Iterator<Item = usize>> = match options & ENUMERATION_REVERSE {
+        0 => Box::new(0..values.len()),
+        _ => Box::new((0..values.len()).rev()),
+    };
+    let mut stop = false;
+    for at in order {
+        // SAFETY: as above; `stop` outlives the call.
+        unsafe { call(block, values[at] as Id, at, &mut stop) };
+        if stop {
+            break;
+        }
+    }
+}
+
+/// `-enumerateObjectsUsingBlock:`.
+unsafe extern "C" fn enumerate_objects(receiver: Id, sel: Sel, block: Id) {
+    // SAFETY: forwarded with no options.
+    unsafe { enumerate_objects_with_options(receiver, sel, 0, block) }
+}
+
 unsafe extern "C" fn filtered_array_using_predicate(receiver: Id, _sel: Sel, predicate: Id) -> Id {
     let Some(array) = (unsafe { collections::array(receiver as CFTypeRef) }) else {
         return std::ptr::null_mut();
@@ -2559,6 +2599,8 @@ pub(crate) fn install() {
         "writeToURL:atomically:" => plist_write_to_url, c"B28@0:8@16c24";
         "count" => count, c"Q16@0:8";
         "objectAtIndex:" => object_at_index, c"@24@0:8Q16";
+        "enumerateObjectsUsingBlock:" => enumerate_objects, c"v24@0:8@?16";
+        "enumerateObjectsWithOptions:usingBlock:" => enumerate_objects_with_options, c"v32@0:8Q16@?24";
         "subarrayWithRange:" => subarray_with_range, c"@32@0:8{_NSRange=QQ}16";
         "objectAtIndexedSubscript:" => object_at_index, c"@24@0:8Q16";
         "containsObject:" => contains_object, c"B24@0:8@16";
