@@ -626,7 +626,19 @@ pub fn send_within(
 
 /// Take one datagram from `fd`, with any descriptors that came with it.
 fn receive_from(fd: c_int) -> std::io::Result<Option<Datagram>> {
-    let mut bytes = vec![0u8; MAX_MESSAGE];
+    thread_local! {
+        /// Room for the largest datagram, kept per thread: zeroing a fresh
+        /// one for every message cost more than the message itself.
+        static SCRATCH: std::cell::RefCell<Vec<u8>> = std::cell::RefCell::new(vec![0u8; MAX_MESSAGE]);
+    }
+    SCRATCH.with(|scratch| match scratch.try_borrow_mut() {
+        Ok(mut buffer) => receive_into(fd, &mut buffer),
+        // A receive inside a receive on this thread, which nothing does today.
+        Err(_) => receive_into(fd, &mut vec![0u8; MAX_MESSAGE]),
+    })
+}
+
+fn receive_into(fd: c_int, bytes: &mut [u8]) -> std::io::Result<Option<Datagram>> {
     let mut control = vec![0u8; control_len()];
     let mut iov = libc::iovec {
         iov_base: bytes.as_mut_ptr().cast(),
@@ -686,8 +698,10 @@ fn receive_from(fd: c_int) -> std::io::Result<Option<Datagram>> {
             return Err(error);
         }
     }
-    bytes.truncate(received);
-    Ok(Some(Datagram { bytes, fds }))
+    Ok(Some(Datagram {
+        bytes: bytes[..received].to_vec(),
+        fds,
+    }))
 }
 
 #[cfg(test)]

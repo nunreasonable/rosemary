@@ -246,6 +246,11 @@ trait ReadinessBackend: Sized {
         capacity: usize,
         timeout: c_int,
     ) -> Result<Vec<Ready>, c_int>;
+    /// Whether `wait` reads the registrations at all. Copying them for every
+    /// wait is the dearest part of a busy queue's `kevent`.
+    fn needs_registrations(&self) -> bool {
+        true
+    }
 }
 
 /// The portable reconstruction of a readiness set. It remains the complete
@@ -390,6 +395,11 @@ impl EpollBackend {
 
 #[cfg(target_os = "linux")]
 impl ReadinessBackend for EpollBackend {
+    fn needs_registrations(&self) -> bool {
+        // Only for the descriptors epoll refused, which `wait` polls itself.
+        !self.poll_only.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
+    }
+
     fn new() -> Result<(Self, c_int), c_int> {
         let epoll = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
         if epoll < 0 {
@@ -504,28 +514,26 @@ impl ReadinessBackend for EpollBackend {
         timeout: c_int,
     ) -> Result<Vec<Ready>, c_int> {
         let mut result = Vec::new();
-        let poll_only = self
-            .poll_only
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
-        if poll_only.is_empty() && ports.is_empty() {
-            return self.wait_epoll(queue, capacity, timeout);
-        }
-        let mut watched = Vec::with_capacity(poll_only.len() + ports.len() + 1);
-        watched.push(libc::pollfd {
+        let mut watched = vec![libc::pollfd {
             fd: queue,
             events: libc::POLLIN,
             revents: 0,
-        });
-        for fd in &poll_only {
-            let interest = interest_for(registrations, *fd).level;
-            if interest != 0 {
-                watched.push(libc::pollfd {
-                    fd: *fd,
-                    events: interest,
-                    revents: 0,
-                });
+        }];
+        {
+            let poll_only = self.poll_only.lock().unwrap_or_else(|e| e.into_inner());
+            if poll_only.is_empty() && ports.is_empty() {
+                drop(poll_only);
+                return self.wait_epoll(queue, capacity, timeout);
+            }
+            for fd in poll_only.iter() {
+                let interest = interest_for(registrations, *fd).level;
+                if interest != 0 {
+                    watched.push(libc::pollfd {
+                        fd: *fd,
+                        events: interest,
+                        revents: 0,
+                    });
+                }
             }
         }
         let registered = watched.len();
@@ -1578,7 +1586,10 @@ pub unsafe extern "C" fn kevent(
     let ready = {
         let state = state.lock().unwrap_or_else(|e| e.into_inner());
         let backend = Arc::clone(&state.backend);
-        let registrations = state.registrations.clone();
+        let registrations = match backend.needs_registrations() {
+            true => state.registrations.clone(),
+            false => HashMap::new(),
+        };
         drop(state);
         let port_fds: Vec<c_int> = ports.iter().map(|port| port.fd()).collect();
         match backend.wait(queue, &registrations, &port_fds, capacity, wait) {
@@ -2118,9 +2129,16 @@ mod tests {
     #[test]
     fn a_closed_descriptor_stops_being_watched_though_a_copy_lives_on() {
         let queue = kqueue();
-        let (read_end, write_end) = pipe();
-        // SAFETY: a descriptor of this test's.
-        let copy = unsafe { libc::dup(read_end) };
+        let (first_read, write_end) = pipe();
+        // A number far above what the other tests open, so it is this test's
+        // to reuse whatever runs beside it.
+        let read_end: c_int = 4000;
+        // SAFETY: descriptors of this test's.
+        let copy = unsafe {
+            assert_eq!(libc::dup2(first_read, read_end), read_end);
+            libc::close(first_read);
+            libc::dup(read_end)
+        };
         let add = |fd: c_int| Kevent {
             ident: fd as usize,
             filter: EVFILT_READ,
@@ -2139,8 +2157,10 @@ mod tests {
                 0,
                 "the old file is not reported once its descriptor closed"
             );
-            let (again, other_write) = pipe();
-            assert_eq!(again, read_end, "the number is reused");
+            let (fresh, other_write) = pipe();
+            assert_eq!(libc::dup2(fresh, read_end), read_end, "the number is reused");
+            libc::close(fresh);
+            let again = read_end;
             let second = add(again);
             assert_eq!(
                 kevent(queue, &raw const second, 1, got.as_mut_ptr(), 4, &raw const NO_WAIT),

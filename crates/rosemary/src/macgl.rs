@@ -302,12 +302,54 @@ unsafe extern "C" fn delete_textures(count: i32, textures: *const u32) {
     }
 }
 
+/// Pass-through replacements that first tell the IOSurface layer a draw
+/// happened, or which texture it wrote; see `appkit::opengl::surface`.
+macro_rules! noted {
+    ($($fn:ident = $name:literal ($($arg:ident: $ty:ty),*) => $note:expr;)*) => {
+        $(
+            unsafe extern "C" fn $fn($($arg: $ty),*) {
+                static SLOT: OnceLock<usize> = OnceLock::new();
+                $note;
+                if let Some(real) = driver($name, &SLOT) {
+                    // SAFETY: the driver's own entry point of this prototype,
+                    // called with the guest's arguments.
+                    let real: unsafe extern "C" fn($($ty),*) = unsafe { std::mem::transmute(real) };
+                    unsafe { real($($arg),*) };
+                }
+            }
+        )*
+    };
+}
+
+noted! {
+    draw_arrays = c"glDrawArrays" (mode: u32, first: i32, count: i32) => appkit::opengl::surface::drew();
+    draw_elements = c"glDrawElements" (mode: u32, count: i32, kind: u32, indices: *const std::ffi::c_void) => appkit::opengl::surface::drew();
+    draw_arrays_instanced = c"glDrawArraysInstanced" (mode: u32, first: i32, count: i32, instances: i32) => appkit::opengl::surface::drew();
+    draw_elements_instanced = c"glDrawElementsInstanced" (mode: u32, count: i32, kind: u32, indices: *const std::ffi::c_void, instances: i32) => appkit::opengl::surface::drew();
+    draw_range_elements = c"glDrawRangeElements" (mode: u32, start: u32, end: u32, count: i32, kind: u32, indices: *const std::ffi::c_void) => appkit::opengl::surface::drew();
+    clear = c"glClear" (mask: u32) => appkit::opengl::surface::drew();
+    blit_framebuffer = c"glBlitFramebuffer" (x0: i32, y0: i32, x1: i32, y1: i32, a0: i32, b0: i32, a1: i32, b1: i32, mask: u32, filter: u32) => appkit::opengl::surface::drew();
+    framebuffer_texture_2d = c"glFramebufferTexture2D" (target: u32, attachment: u32, textarget: u32, texture: u32, level: i32) => appkit::opengl::surface::written(texture);
+    tex_sub_image_2d = c"glTexSubImage2D" (target: u32, level: i32, x: i32, y: i32, w: i32, h: i32, format: u32, kind: u32, pixels: *const std::ffi::c_void) => appkit::opengl::surface::uploaded(target);
+    copy_tex_sub_image_2d = c"glCopyTexSubImage2D" (target: u32, level: i32, x: i32, y: i32, sx: i32, sy: i32, w: i32, h: i32) => appkit::opengl::surface::uploaded(target);
+}
+
 /// This module's replacement for `name`, if it has one.
 pub fn address(name: &str) -> Option<u64> {
     let f = match name {
         "glFlush" if crate::frameworks::using_builtin() => flush as *const (),
         "glFinish" if crate::frameworks::using_builtin() => finish as *const (),
         "glDeleteTextures" if crate::frameworks::using_builtin() => delete_textures as *const (),
+        "glDrawArrays" if crate::frameworks::using_builtin() => draw_arrays as *const (),
+        "glDrawElements" if crate::frameworks::using_builtin() => draw_elements as *const (),
+        "glDrawArraysInstanced" if crate::frameworks::using_builtin() => draw_arrays_instanced as *const (),
+        "glDrawElementsInstanced" if crate::frameworks::using_builtin() => draw_elements_instanced as *const (),
+        "glDrawRangeElements" if crate::frameworks::using_builtin() => draw_range_elements as *const (),
+        "glClear" if crate::frameworks::using_builtin() => clear as *const (),
+        "glBlitFramebuffer" if crate::frameworks::using_builtin() => blit_framebuffer as *const (),
+        "glFramebufferTexture2D" if crate::frameworks::using_builtin() => framebuffer_texture_2d as *const (),
+        "glTexSubImage2D" if crate::frameworks::using_builtin() => tex_sub_image_2d as *const (),
+        "glCopyTexSubImage2D" if crate::frameworks::using_builtin() => copy_tex_sub_image_2d as *const (),
         "glGetString" => get_string as *const (),
         "glGetStringi" => get_stringi as *const (),
         "glGetIntegerv" => get_integerv as *const (),

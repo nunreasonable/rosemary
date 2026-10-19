@@ -86,6 +86,44 @@ struct State {
     generations: Vec<(u32, u64)>,
 }
 
+thread_local! {
+    /// Whether this thread's context drew since its last flush. A flush that
+    /// follows no drawing has nothing new to copy into any surface.
+    static DREW: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Textures the guest attached to a framebuffer or wrote with an upload, by
+/// context: the only ones a draw can have changed.
+static WRITTEN: Mutex<Vec<(usize, u32)>> = Mutex::new(Vec::new());
+
+/// The guest drew, cleared or blitted in this thread's context.
+pub fn drew() {
+    DREW.with(|d| d.set(true));
+}
+
+/// `texture` became something drawing writes to in the current context.
+pub fn written(texture: u32) {
+    let context = super::CURRENT.get() as usize;
+    let mut written = WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
+    if !written.contains(&(context, texture)) {
+        written.push((context, texture));
+    }
+    drop(written);
+    drew();
+}
+
+/// The texture bound to `target` in the current context, as an upload to it
+/// writes it.
+pub fn uploaded(target: u32) {
+    let (Some(gl), Some(query)) = (gl(), binding_query(target)) else {
+        return;
+    };
+    let mut texture = 0;
+    // SAFETY: a state query on the current context.
+    unsafe { (gl.GetIntegerv)(query, &mut texture) };
+    written(texture as u32);
+}
+
 static STATE: Mutex<State> = Mutex::new(State {
     bindings: Vec::new(),
     generations: Vec::new(),
@@ -292,9 +330,24 @@ pub fn write_back() {
         PIXEL_UNPACK_BUFFER_BINDING,
     );
     let mut scratch = Vec::new();
+    let drew = DREW.with(|d| d.replace(false));
+    let written: Vec<u32> = match drew {
+        true => WRITTEN
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter(|(c, _)| *c == context)
+            .map(|(_, t)| *t)
+            .collect(),
+        false => Vec::new(),
+    };
     // Textures drawn into since they last matched: their pixels become the
-    // surface's.
-    for binding in bindings.iter_mut().filter(|b| b.context == context) {
+    // surface's. Only one drawing can have reached is read back at all, which
+    // is what keeps an idle or unrelated flush from copying every surface.
+    for binding in bindings
+        .iter_mut()
+        .filter(|b| b.context == context && written.contains(&b.texture))
+    {
         let (Some(pixels), Some(query)) = (
             iosurface::pixels(binding.surface as CFTypeRef),
             binding_query(binding.target),
@@ -398,6 +451,10 @@ pub unsafe fn forget(count: i32, textures: *const u32) {
     // SAFETY: `count` names, per the caller.
     let names = unsafe { std::slice::from_raw_parts(textures, count as usize) };
     let context = super::CURRENT.get() as usize;
+    WRITTEN
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .retain(|(c, t)| !(*c == context && names.contains(t)));
     state().bindings.retain(|b| {
         let gone = b.context == context && names.contains(&b.texture);
         if gone {
