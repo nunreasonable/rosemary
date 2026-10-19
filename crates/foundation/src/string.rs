@@ -268,6 +268,18 @@ unsafe extern "C" fn string_with_characters(
     unsafe { api::CFAutorelease(string) as Id }
 }
 
+/// `-initWithCharacters:length:`: the new string, owned by the caller as an
+/// initializer's result is - not autoreleased like `+stringWithCharacters:`'s,
+/// which a caller balancing its `+alloc` would release twice.
+unsafe extern "C" fn init_with_characters(receiver: Id, _sel: Sel, chars: *const u16, count: usize) -> Id {
+    // SAFETY: `count` UTF-16 units, per the caller.
+    unsafe {
+        objc::arc::release(receiver);
+        api::CFStringCreateWithCharacters(std::ptr::null(), chars, count as corefoundation::base::CFIndex)
+            as Id
+    }
+}
+
 unsafe extern "C" fn string_with_cstring_encoding(
     _class: Id,
     _sel: Sel,
@@ -1665,6 +1677,15 @@ unsafe extern "C" fn string_with_string(_class: Id, _sel: Sel, other: Id) -> Id 
     unsafe { api::CFAutorelease(s) as Id }
 }
 
+/// `-initWithString:`, owned by the caller; see [`init_with_characters`].
+unsafe extern "C" fn init_with_string(receiver: Id, _sel: Sel, other: Id) -> Id {
+    // SAFETY: an `NSString`, or nil.
+    let text = unsafe { bytes(other) };
+    // The placeholder `+alloc` made, which the new string replaces.
+    objc::arc::release(receiver);
+    corefoundation::string::from_bytes(&text, false) as Id
+}
+
 unsafe extern "C" fn mutable_string_with_string(_class: Id, _sel: Sel, other: Id) -> Id {
     let bytes = unsafe { bytes(other) };
     let s = corefoundation::string::new_mutable();
@@ -1798,12 +1819,12 @@ pub(crate) fn install() {
         "pathWithComponents:" => path_with_components, c"@24@0:8@16";
     });
     methods!(class, {
-        "initWithString:" => string_with_string, c"@24@0:8@16";
+        "initWithString:" => init_with_string, c"@24@0:8@16";
         // `-initWithCharacters:length:` on a freshly allocated `NSString` answers
         // a new object rather than filling the receiver in. That is what every
         // other initializer here does, and what the immutable storage allows:
         // `corefoundation::string` lays a string out at creation.
-        "initWithCharacters:length:" => string_with_characters, c"@32@0:8^S16Q24";
+        "initWithCharacters:length:" => init_with_characters, c"@32@0:8^S16Q24";
     });
 }
 
@@ -1828,6 +1849,39 @@ mod tests {
                 .map(|p| p.as_bytes().to_vec())
                 .collect();
             assert_eq!(join_path_components(&parts), path.as_bytes());
+        }
+    }
+
+    /// An initializer's result belongs to the caller: draining a pool must
+    /// not take it away from under the `+alloc` that is still to be balanced.
+    #[test]
+    fn initializers_return_strings_the_caller_owns() {
+        crate::bootstrap();
+        let class = objc::class::lookup(c"NSString").expect("NSString");
+        let units = [0x68u16, 0x69];
+        for name in ["initWithCharacters:length:", "initWithString:"] {
+            let pool = objc::arc::pool_push();
+            // SAFETY: NSString's registered allocator and initializers.
+            let string = unsafe {
+                let alloc: unsafe extern "C" fn(Id, Sel) -> Id = std::mem::transmute(objc::msg::entry());
+                let placeholder = alloc(objc::class::ptr(class) as Id, objc::sel::get("alloc"));
+                match name {
+                    "initWithString:" => {
+                        let init: unsafe extern "C" fn(Id, Sel, Id) -> Id =
+                            std::mem::transmute(objc::msg::entry());
+                        init(placeholder, objc::sel::get(name), from_str("hi"))
+                    }
+                    _ => {
+                        let init: unsafe extern "C" fn(Id, Sel, *const u16, usize) -> Id =
+                            std::mem::transmute(objc::msg::entry());
+                        init(placeholder, objc::sel::get(name), units.as_ptr(), 2)
+                    }
+                }
+            };
+            objc::arc::pool_pop(pool);
+            // SAFETY: a live string, if the pool did not take it.
+            assert_eq!(unsafe { bytes(string) }, b"hi", "{name}");
+            objc::arc::release(string);
         }
     }
 

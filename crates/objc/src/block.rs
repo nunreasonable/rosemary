@@ -336,7 +336,8 @@ pub unsafe fn object_dispose(object: *const c_void, flags: i32) {
 ///
 /// `source` must be a `Block_byref`.
 unsafe fn byref_copy(source: *mut Byref) -> *mut Byref {
-    crate::debug::validate(source as Id, "_Block_object_assign byref");
+    // Not `debug::validate`: a `__block` variable is no object, and one still
+    // on the stack has a null isa.
     let forwarding = unsafe { (*source).forwarding };
     if forwarding.is_null() {
         return source;
@@ -421,17 +422,18 @@ unsafe fn byref_copy(source: *mut Byref) -> *mut Byref {
 ///
 /// As [`byref_copy`].
 unsafe fn byref_release(byref: *mut Byref) {
-    crate::debug::validate(byref as Id, "_Block_object_dispose byref");
+    // The original may still be on the stack, with a null isa; only the heap
+    // copy is an allocation the debug checks know.
     let byref = unsafe { (*byref).forwarding };
     if byref.is_null() {
         return;
     }
-    crate::debug::validate(byref as Id, "_Block_object_dispose byref");
     // SAFETY: a byref.
     let flags = unsafe { (*byref).flags.load(Ordering::Relaxed) };
     if flags & byref_flag::NEEDS_FREE == 0 {
         return;
     }
+    crate::debug::validate(byref as Id, "_Block_object_dispose byref");
     if !latching_decr_should_deallocate(unsafe { &(*byref).flags }) {
         return;
     }

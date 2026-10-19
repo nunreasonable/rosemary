@@ -256,6 +256,7 @@ pub fn autorelease(object: Id) -> Id {
         return object;
     }
     crate::debug::validate(object, "autorelease");
+    crate::debug::note_autorelease(object);
     let pushed = POOLS.try_with(|pools| match pools.borrow_mut().last_mut() {
         Some(pool) => pool.objects.push(object),
         None => no_pool(),

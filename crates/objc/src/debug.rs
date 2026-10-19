@@ -25,6 +25,10 @@ struct Allocation {
     size: usize,
     state: State,
     origin: &'static std::panic::Location<'static>,
+    /// Return addresses of the call that finalized it, innermost first.
+    finalized_by: Vec<usize>,
+    /// The same, for the last few calls that autoreleased it.
+    autoreleased_by: Vec<Vec<usize>>,
 }
 
 static OBJECTS: LazyLock<Mutex<HashMap<usize, Allocation>>> =
@@ -74,8 +78,12 @@ pub fn enabled() -> bool {
     if ENABLED.load(Ordering::Acquire) {
         return true;
     }
-    static REQUESTED_AT_LAUNCH: LazyLock<bool> =
-        LazyLock::new(|| requested_at_launch(std::env::args_os().skip(1)));
+    // `ROSEMARY_OBJC_DEBUG=1` reaches the children a guest spawns, which the
+    // command-line flag does not.
+    static REQUESTED_AT_LAUNCH: LazyLock<bool> = LazyLock::new(|| {
+        std::env::var_os("ROSEMARY_OBJC_DEBUG").is_some()
+            || requested_at_launch(std::env::args_os().skip(1))
+    });
     if *REQUESTED_AT_LAUNCH {
         ENABLED.store(true, Ordering::Release);
         return true;
@@ -127,6 +135,8 @@ pub(crate) unsafe fn allocated(object: Id, class: &'static Class, size: usize) {
             size,
             state: State::Live,
             origin: std::panic::Location::caller(),
+            finalized_by: Vec::new(),
+            autoreleased_by: Vec::new(),
         },
     );
     if previous.is_some() {
@@ -159,6 +169,8 @@ pub(crate) unsafe fn allocated_raw(pointer: *mut c_void, size: usize, kind: &'st
             size,
             state: State::Live,
             origin: std::panic::Location::caller(),
+            finalized_by: Vec::new(),
+            autoreleased_by: Vec::new(),
         },
     );
     if previous.is_some() {
@@ -184,6 +196,61 @@ fn allocation_name(allocation: &Allocation) -> &'static str {
     }
     // SAFETY: allocation records only store leaked classes.
     unsafe { &*(allocation.class as *const Class) }.name_str()
+}
+
+/// Remember who autoreleased `object`, for a later over-release to name.
+pub(crate) fn note_autorelease(object: Id) {
+    if !enabled() {
+        return;
+    }
+    let stack = return_addresses();
+    let mut objects = OBJECTS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(allocation) = objects.get_mut(&(object as usize)) {
+        if allocation.autoreleased_by.len() == 4 {
+            allocation.autoreleased_by.remove(0);
+        }
+        allocation.autoreleased_by.push(stack);
+    }
+}
+
+/// The return addresses of the current call stack, innermost first, as the
+/// host unwinder finds them: through this runtime by its unwind tables, and
+/// into the first guest frame that called it.
+fn return_addresses() -> Vec<usize> {
+    let mut frames = [std::ptr::null_mut::<std::ffi::c_void>(); 24];
+    // SAFETY: room for the count passed.
+    let count = unsafe { libc::backtrace(frames.as_mut_ptr(), frames.len() as i32) };
+    frames[..count.max(0) as usize]
+        .iter()
+        .skip(1)
+        .map(|frame| *frame as usize)
+        .collect()
+}
+
+/// Each address as the mapped file it falls in and its offset there.
+fn describe(addresses: &[usize]) -> Vec<String> {
+    let maps = std::fs::read_to_string("/proc/self/maps").unwrap_or_default();
+    addresses
+        .iter()
+        .map(|&address| {
+            let place = maps.lines().find_map(|line| {
+                let mut fields = line.split_whitespace();
+                let (start, end) = fields.next()?.split_once('-')?;
+                let (start, end) = (
+                    usize::from_str_radix(start, 16).ok()?,
+                    usize::from_str_radix(end, 16).ok()?,
+                );
+                let offset = usize::from_str_radix(fields.nth(1)?, 16).ok()?;
+                // The path may hold spaces; it is everything from its slash.
+                let path = line.find('/').map_or("", |at| &line[at..]);
+                (start..end).contains(&address).then(|| {
+                    let name = path.rsplit('/').next().unwrap_or(path);
+                    format!("{name} file offset {:#x}", address - start + offset)
+                })
+            });
+            format!("{address:#x} {}", place.unwrap_or_default())
+        })
+        .collect()
 }
 
 fn violation(operation: &str, object: Id, reason: &str) -> ! {
@@ -221,6 +288,32 @@ pub(crate) fn validate(object: Id, operation: &str) {
         return;
     };
     match allocation.state {
+        State::Dead if !allocation.finalized_by.is_empty() => {
+            eprintln!("rosemary: objc debug: {object:p} was finalized from:");
+            for line in describe(&allocation.finalized_by) {
+                eprintln!("rosemary: objc debug:   {line}");
+            }
+            for (i, stack) in allocation.autoreleased_by.iter().enumerate() {
+                eprintln!("rosemary: objc debug: autorelease {i} from:");
+                for line in describe(stack) {
+                    eprintln!("rosemary: objc debug:   {line}");
+                }
+            }
+            eprintln!("rosemary: objc debug: and is used again from:");
+            for line in describe(&return_addresses()) {
+                eprintln!("rosemary: objc debug:   {line}");
+            }
+            violation(
+                operation,
+                object,
+                &format!(
+                    "use of finalized {} allocated at {}:{}",
+                    allocation_name(allocation),
+                    allocation.origin.file(),
+                    allocation.origin.line()
+                ),
+            )
+        }
         State::Dead => violation(
             operation,
             object,
@@ -366,6 +459,7 @@ pub(crate) fn finalized(object: Id) -> bool {
         );
     }
     allocation.state = State::Dead;
+    allocation.finalized_by = return_addresses();
     // SAFETY: the allocation is deliberately retained in quarantine.
     unsafe { std::ptr::write_bytes(object as *mut u8, DEAD, allocation.size) };
     true
