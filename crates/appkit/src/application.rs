@@ -93,7 +93,23 @@ unsafe extern "C" fn shared_application(class: Id, _sel: Sel) -> Id {
     let Some(class) = (unsafe { objc::class::from_ptr(class as *const Class) }) else {
         return std::ptr::null_mut();
     };
-    let app = objc::object::create_instance(class, 0);
+    // `[[self alloc] init]`, as AppKit's is, rather than an instance made
+    // here: `+alloc` is where a subclass's C++ ivars are constructed, and an
+    // application class with an observer list among them - Chromium's - would
+    // otherwise run with it unbuilt.
+    let receiver = objc::class::ptr(class) as Id;
+    // SAFETY: `+alloc` and `-init` are `id (id, SEL)`.
+    let app = unsafe {
+        let send: unsafe extern "C" fn(Id, Sel) -> Id = std::mem::transmute(objc::msg::entry());
+        let allocated = send(receiver, objc::sel::get("alloc"));
+        match allocated.is_null() {
+            true => objc::object::create_instance(class, 0),
+            false => match send(allocated, objc::sel::get("init")) {
+                app if app.is_null() => allocated,
+                app => app,
+            },
+        }
+    };
     // Retained forever: `NSApp` is a process-lifetime global, and an application
     // a guest can release is one it can make dangle.
     objc::arc::make_immortal(app);

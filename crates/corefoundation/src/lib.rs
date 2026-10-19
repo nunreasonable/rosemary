@@ -194,6 +194,8 @@ exports::exports! {
         "CFURLCopyFileSystemPath" => api::CFURLCopyFileSystemPath,
         "CFURLGetFileSystemRepresentation" => api::CFURLGetFileSystemRepresentation,
         "CFRunLoopGetCurrent" => api::CFRunLoopGetCurrent,
+        "_CFCopySystemVersionDictionary" => api::_CFCopySystemVersionDictionary,
+        "_CFCopyServerVersionDictionary" => api::_CFCopyServerVersionDictionary,
         "CFRunLoopGetMain" => api::CFRunLoopGetMain,
         "CFRunLoopRunInMode" => api::CFRunLoopRunInMode,
         "CFRunLoopRun" => api::CFRunLoopRun,
@@ -409,6 +411,10 @@ pub fn data_symbols() -> Vec<(String, u64)> {
 }
 
 static KEY_STRINGS: &[(&str, &str)] = &[
+    ("__kCFSystemVersionProductNameKey", "ProductName"),
+    ("__kCFSystemVersionProductVersionKey", "ProductVersion"),
+    ("__kCFSystemVersionBuildVersionKey", "ProductBuildVersion"),
+    ("__kCFSystemVersionProductVersionExtraKey", "ProductVersionExtra"),
     ("_kCFBundleIdentifierKey", "CFBundleIdentifier"),
     ("_kCFBundleNameKey", "CFBundleName"),
     ("_kCFBundleVersionKey", "CFBundleVersion"),

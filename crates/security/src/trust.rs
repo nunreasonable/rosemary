@@ -504,6 +504,42 @@ pub(crate) fn certificate(der: &[u8]) -> CFTypeRef {
     new(Payload::Certificate(der.to_vec()))
 }
 
+/// `CFArrayRef SecTrustCopyCertificateChain(SecTrustRef)`: the certificates
+/// the trust was made with, leaf first, owned by the caller.
+///
+/// FIXME (ACCURACY): the chain as given, not the one evaluation built - the
+/// anchor it found is not appended.
+///
+/// # Safety
+///
+/// `trust` is null or a live object.
+pub unsafe extern "C" fn SecTrustCopyCertificateChain(trust: CFTypeRef) -> CFTypeRef {
+    // SAFETY: the caller's guarantee.
+    let Some(Payload::Trust { chain, .. }) = (unsafe { payload(trust) }) else {
+        return std::ptr::null();
+    };
+    let certificates: Vec<CFTypeRef> = chain.iter().map(|der| certificate(der)).collect();
+    let array = corefoundation::collections::new_array(
+        &certificates,
+        corefoundation::callbacks::Policy::from_type_callbacks(),
+        false,
+    );
+    for c in certificates {
+        // SAFETY: the array took its own reference.
+        unsafe { corefoundation::api::CFRelease(c) };
+    }
+    array
+}
+
+/// `OSStatus SecTrustSetSignedCertificateTimestamps(SecTrustRef, CFArrayRef)`:
+/// accepted; nothing here checks certificate transparency.
+pub unsafe extern "C" fn SecTrustSetSignedCertificateTimestamps(
+    _trust: CFTypeRef,
+    _timestamps: CFTypeRef,
+) -> OSStatus {
+    SUCCESS
+}
+
 /// `int SecRandomCopyBytes(SecRandomRef, size_t, void *)`. The generator
 /// argument is `kSecRandomDefault` - null - in every caller.
 ///
@@ -539,6 +575,8 @@ exports::exports! {
         "SecTrustCopyAnchorCertificates" => SecTrustCopyAnchorCertificates,
         "SecCertificateCopyData" => SecCertificateCopyData,
         "SecCertificateGetData" => SecCertificateGetData,
+        "SecTrustCopyCertificateChain" => SecTrustCopyCertificateChain,
+        "SecTrustSetSignedCertificateTimestamps" => SecTrustSetSignedCertificateTimestamps,
     }
 }
 

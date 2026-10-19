@@ -15,10 +15,51 @@ use std::sync::atomic::{AtomicI32, Ordering};
 use crate::mach::kern::*;
 use crate::mach::space::{self, Name, Right, TASK_SELF};
 
-/// `int sandbox_check(pid_t, const char *operation, enum sandbox_filter_type, ...)`:
-/// zero, allowed - no process here runs in a sandbox.
-pub unsafe extern "C" fn sandbox_check(_pid: i32, _operation: *const c_char, _kind: i32) -> c_int {
+/// Whether this process has asked to be put in a sandbox.
+static SANDBOXED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// `int sandbox_init_with_parameters(const char *profile, uint64_t flags,
+/// const char *const parameters[], char **errorbuf)`.
+///
+/// FIXME (ACCURACY): the profile is accepted and **not enforced** - there is
+/// no Seatbelt on this host. The process is what it was, with the access it
+/// had; what changes is that it is told it is sandboxed, which is the state
+/// a program that just sandboxed itself goes on to check for.
+pub unsafe extern "C" fn sandbox_init_with_parameters(
+    _profile: *const c_char,
+    _flags: u64,
+    _parameters: *const *const c_char,
+    errorbuf: *mut *mut c_char,
+) -> c_int {
+    if !errorbuf.is_null() {
+        // SAFETY: writable, per the caller.
+        unsafe { errorbuf.write(std::ptr::null_mut()) };
+    }
+    if !SANDBOXED.swap(true, Ordering::Relaxed) {
+        eprintln!(
+            "rosemary: sandbox_init_with_parameters: accepted, not enforced - this host has no \
+             Seatbelt"
+        );
+    }
     0
+}
+
+/// `void sandbox_free_error(char *)`.
+pub unsafe extern "C" fn sandbox_free_error(error: *mut c_char) {
+    if !error.is_null() {
+        // SAFETY: nothing here allocates an error, so this is the caller's own.
+        unsafe { libc::free(error.cast()) };
+    }
+}
+
+/// `int sandbox_check(pid_t, const char *operation, enum sandbox_filter_type, ...)`.
+///
+/// With no operation it asks whether the process is sandboxed at all: yes
+/// for this process once it has called `sandbox_init_with_parameters`, and no
+/// otherwise. Any operation is allowed, which is the truth here.
+pub unsafe extern "C" fn sandbox_check(pid: i32, operation: *const c_char, _kind: i32) -> c_int {
+    let me = pid == 0 || pid == std::process::id() as i32;
+    c_int::from(operation.is_null() && me && SANDBOXED.load(Ordering::Relaxed))
 }
 
 /// `char *sandbox_extension_issue_file(const char *class, const char *path,
@@ -349,9 +390,44 @@ pub extern "C" fn pthread_from_mach_thread_np(_port: Name) -> *mut c_void {
     std::ptr::null_mut()
 }
 
+/// `int posix_spawnattr_set_csm_np(posix_spawnattr_t *, uint32_t flags)`:
+/// the CPU security mitigations a child should run with. The host applies
+/// its own, so the request is accepted.
+pub unsafe extern "C" fn posix_spawnattr_set_csm_np(_attr: *mut c_void, _flags: u32) -> c_int {
+    0
+}
+
+/// `uintptr_t pthread_stack_frame_decode_np(uintptr_t frame, uintptr_t
+/// *return_address)`: the frame-pointer record at `frame`, unsigned - there
+/// are no signed return addresses on x86-64.
+///
+/// # Safety
+///
+/// `frame` addresses a frame record; `return_address` is null or writable.
+pub unsafe extern "C" fn pthread_stack_frame_decode_np(frame: usize, return_address: *mut usize) -> usize {
+    // SAFETY: a frame record is the saved frame pointer and the return address.
+    unsafe {
+        if !return_address.is_null() {
+            return_address.write(*((frame + 8) as *const usize));
+        }
+        *(frame as *const usize)
+    }
+}
+
+/// `boolean_t voucher_mach_msg_set(mach_msg_header_t *)`: no voucher is
+/// attached, as for a thread that has adopted none.
+pub unsafe extern "C" fn voucher_mach_msg_set(_message: *mut c_void) -> u32 {
+    0
+}
+
 exports::exports! {
     functions {
         "sandbox_check" => sandbox_check,
+        "posix_spawnattr_set_csm_np" => posix_spawnattr_set_csm_np,
+        "pthread_stack_frame_decode_np" => pthread_stack_frame_decode_np,
+        "voucher_mach_msg_set" => voucher_mach_msg_set,
+        "sandbox_init_with_parameters" => sandbox_init_with_parameters,
+        "sandbox_free_error" => sandbox_free_error,
         "sandbox_extension_issue_file" => sandbox_extension_issue_file,
         "sandbox_extension_consume" => sandbox_extension_consume,
         "sandbox_extension_release" => sandbox_extension_release,

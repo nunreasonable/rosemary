@@ -572,6 +572,13 @@ pub fn announce_unbound_imports<'r>(
     report: &'r LinkReport,
     what: &str,
 ) -> Vec<(&'r str, &'r machish::report::MissingSymbol)> {
+    if std::env::var_os("ROSEMARY_WEAK_DETAIL").is_some() {
+        for image in &report.images {
+            for m in image.missing.iter().filter(|m| m.weak_import) {
+                eprintln!("rosemary: weak import absent: {} in {}", m.symbol, image.name);
+            }
+        }
+    }
     let unbound = unbound_imports(report);
     if unbound.is_empty() {
         return unbound;

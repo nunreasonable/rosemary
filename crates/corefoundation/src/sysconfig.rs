@@ -550,6 +550,53 @@ pub unsafe extern "C" fn SCDynamicStoreKeyCreateNetworkGlobalEntity(
     crate::string::from_bytes(&key, false)
 }
 
+/// `CFRunLoopSourceRef SCDynamicStoreCreateRunLoopSource(CFAllocatorRef,
+/// SCDynamicStoreRef, CFIndex order)`: a source that is never signalled.
+/// Nothing here changes the dynamic store while a program runs, so the
+/// callout it would deliver - "these keys changed" - never comes.
+pub unsafe extern "C" fn SCDynamicStoreCreateRunLoopSource(
+    _allocator: CFTypeRef,
+    store: CFTypeRef,
+    _order: isize,
+) -> CFTypeRef {
+    if store.is_null() {
+        return std::ptr::null();
+    }
+    std::sync::Arc::into_raw(crate::runloop::new_source(None, 0)) as CFTypeRef
+}
+
+/// `Boolean SCDynamicStoreSetNotificationKeys(SCDynamicStoreRef, CFArrayRef
+/// keys, CFArrayRef patterns)`: accepted; see the run loop source above.
+pub unsafe extern "C" fn SCDynamicStoreSetNotificationKeys(
+    store: CFTypeRef,
+    _keys: CFTypeRef,
+    _patterns: CFTypeRef,
+) -> u8 {
+    u8::from(!store.is_null())
+}
+
+/// `CFStringRef SCDynamicStoreKeyCreateProxies(CFAllocatorRef)`: the global
+/// proxies key, `State:/Network/Global/Proxies`.
+pub unsafe extern "C" fn SCDynamicStoreKeyCreateProxies(_allocator: CFTypeRef) -> CFTypeRef {
+    crate::string::from_bytes(b"State:/Network/Global/Proxies", false)
+}
+
+/// `int SCError(void)`: `kSCStatusOK`, since no call here fails with a
+/// SystemConfiguration status of its own.
+pub unsafe extern "C" fn SCError() -> i32 {
+    0
+}
+
+/// `const char *SCErrorString(int status)`.
+pub unsafe extern "C" fn SCErrorString(status: i32) -> *const std::ffi::c_char {
+    match status {
+        0 => c"Success!".as_ptr(),
+        1001 => c"Permission denied".as_ptr(),
+        1002 => c"Configuration daemon not (no longer) available".as_ptr(),
+        _ => c"Failed!".as_ptr(),
+    }
+}
+
 /// `CFPropertyListRef SCDynamicStoreCopyValue(SCDynamicStoreRef, CFStringRef key)`
 ///
 /// One key is answered: the global IPv4 entity, whose `PrimaryInterface` is what
@@ -746,6 +793,11 @@ exports::exports! {
         "SCNetworkReachabilityUnscheduleFromRunLoop" => SCNetworkReachabilityUnscheduleFromRunLoop,
         "SCDynamicStoreCopyProxies" => SCDynamicStoreCopyProxies,
         "SCDynamicStoreCreate" => SCDynamicStoreCreate,
+        "SCDynamicStoreCreateRunLoopSource" => SCDynamicStoreCreateRunLoopSource,
+        "SCDynamicStoreSetNotificationKeys" => SCDynamicStoreSetNotificationKeys,
+        "SCDynamicStoreKeyCreateProxies" => SCDynamicStoreKeyCreateProxies,
+        "SCError" => SCError,
+        "SCErrorString" => SCErrorString,
         "SCDynamicStoreCopyComputerName" => SCDynamicStoreCopyComputerName,
         "SCDynamicStoreKeyCreateNetworkGlobalEntity" => SCDynamicStoreKeyCreateNetworkGlobalEntity,
         "SCDynamicStoreCopyValue" => SCDynamicStoreCopyValue,

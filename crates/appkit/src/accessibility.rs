@@ -43,3 +43,15 @@ pub unsafe extern "C" fn CGEventTapEnable(_tap: *const c_void, _enable: u8) {}
 pub unsafe extern "C" fn CGEventGetIntegerValueField(_event: *const c_void, _field: u32) -> i64 {
     0
 }
+
+/// `bool CGPreflightScreenCaptureAccess(void)`: no - nothing here records
+/// the screen, and this does not ask the user.
+pub unsafe extern "C" fn CGPreflightScreenCaptureAccess() -> u8 {
+    0
+}
+
+/// `bool CGFontRenderingGetFontSmoothingDisabled(void)`: smoothing is on,
+/// macOS's default.
+pub unsafe extern "C" fn CGFontRenderingGetFontSmoothingDisabled() -> u8 {
+    0
+}

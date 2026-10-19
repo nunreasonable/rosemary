@@ -2587,6 +2587,44 @@ unsafe fn borrow<T: 'static>(p: CFTypeRef) -> Option<std::mem::ManuallyDrop<Arc<
 /// frame, and handing out an owned reference each time would add one to the
 /// count forever. The thread-local holds the loop alive, so borrowing is both
 /// sound and stable.
+/// `CFDictionaryRef _CFCopySystemVersionDictionary(void)`: what
+/// `/System/Library/CoreServices/SystemVersion.plist` says on a Mac, from the
+/// same answers `sysctl kern.osproductversion` gives here.
+pub unsafe extern "C" fn _CFCopySystemVersionDictionary() -> CFTypeRef {
+    let pairs = [
+        ("ProductName", "macOS".to_string()),
+        ("ProductVersion", darwin::sysctl::product_version()),
+        ("ProductUserVisibleVersion", darwin::sysctl::product_version()),
+        ("ProductBuildVersion", darwin::sysctl::build()),
+    ];
+    let pairs: Vec<(CFTypeRef, CFTypeRef)> = pairs
+        .iter()
+        .map(|(k, v)| {
+            (
+                crate::base::interned_name(k) as usize as CFTypeRef,
+                string::from_bytes(v.as_bytes(), false),
+            )
+        })
+        .collect();
+    let dictionary = collections::new_dictionary(
+        &pairs,
+        crate::callbacks::Policy::from_key_callbacks(),
+        crate::callbacks::Policy::from_type_callbacks(),
+        false,
+    );
+    for (_, value) in pairs {
+        // SAFETY: the dictionary took its own reference.
+        unsafe { CFRelease(value) };
+    }
+    dictionary
+}
+
+/// `CFDictionaryRef _CFCopyServerVersionDictionary(void)`: null, as on any
+/// Mac that is not macOS Server.
+pub unsafe extern "C" fn _CFCopyServerVersionDictionary() -> CFTypeRef {
+    std::ptr::null()
+}
+
 pub unsafe extern "C" fn CFRunLoopGetCurrent() -> CFTypeRef {
     Arc::as_ptr(&runloop::current()) as CFTypeRef
 }

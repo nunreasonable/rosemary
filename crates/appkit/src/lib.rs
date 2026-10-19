@@ -223,6 +223,8 @@ exports::exports! {
         "CGEventTapCreate" => accessibility::CGEventTapCreate,
         "CGEventTapEnable" => accessibility::CGEventTapEnable,
         "CGEventGetIntegerValueField" => accessibility::CGEventGetIntegerValueField,
+        "CGPreflightScreenCaptureAccess" => accessibility::CGPreflightScreenCaptureAccess,
+        "CGFontRenderingGetFontSmoothingDisabled" => accessibility::CGFontRenderingGetFontSmoothingDisabled,
         "CGDataProviderRelease" => graphics::CGDataProviderRelease,
         "CGImageCreate" => graphics::CGImageCreate,
         "CGImageCreateCopyWithColorSpace" => graphics::CGImageCreateCopyWithColorSpace,

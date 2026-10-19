@@ -629,8 +629,11 @@ extern "C" fn report(signal: i32, info: *mut libc::siginfo_t, context: *mut libc
         });
         line.str(" on thread ");
         line.hex(me as u32 as u64);
+        line.str(" of process ");
+        line.hex(u64::from(std::process::id()));
         line.str(" at host pc ");
         line.hex(host_pc(context).unwrap_or(0));
+        say_region(&mut line, host_pc(context).unwrap_or(0));
         line.str(" - another thread is reporting its own fault first\n");
         line.flush();
         restore(signal);
