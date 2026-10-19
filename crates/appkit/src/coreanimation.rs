@@ -124,7 +124,33 @@ struct Node {
     /// `contents` as premultiplied BGRA, for the kinds that are not already:
     /// the object it was made from, its width and height, and its pixels.
     decoded: Option<(usize, usize, usize, Vec<u8>)>,
+    /// `-contentsRect`, the part of `contents` shown, in unit coordinates.
+    contents_rect: NSRect,
+    /// FIXME (ACCURACY): kept for the getters only; sublayers are drawn as if
+    /// it were the identity, and corners square.
+    sublayer_transform: Transform3D,
+    corner_radius: f64,
+    edge_antialiasing: u32,
 }
+
+/// `CATransform3D`: a 4x4 matrix of `CGFloat`, row by row.
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq)]
+pub(crate) struct Transform3D([f64; 16]);
+
+impl Transform3D {
+    const IDENTITY: Transform3D = Transform3D([
+        1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
+    ]);
+}
+
+const UNIT_RECT: NSRect = NSRect {
+    origin: NSPoint { x: 0.0, y: 0.0 },
+    size: NSSize {
+        width: 1.0,
+        height: 1.0,
+    },
+};
 
 impl Default for Node {
     fn default() -> Node {
@@ -142,6 +168,11 @@ impl Default for Node {
             contents: 0,
             gravity: Gravity::Resize,
             decoded: None,
+            contents_rect: UNIT_RECT,
+            sublayer_transform: Transform3D::IDENTITY,
+            corner_radius: 0.0,
+            // `kCALayerLeftEdge | ...TopEdge`: every edge, as a new layer has.
+            edge_antialiasing: 0xf,
         }
     }
 }
@@ -1244,6 +1275,36 @@ fn decode_contents(contents: usize) -> Option<(usize, usize, Vec<u8>)> {
 
 /// Run `f` over `layer`'s contents, if it has any this can draw.
 fn with_contents<T>(layer: Id, f: impl FnOnce(Source) -> T) -> Option<T> {
+    let shown = read_node(layer, |node| node.map_or(UNIT_RECT, |node| node.contents_rect));
+    with_whole_contents(layer, |source| f(crop(source, shown)))
+}
+
+/// The part of `source` a unit `rect` picks out, rows counted from the top of
+/// the buffer.
+fn crop(source: Source, rect: NSRect) -> Source {
+    if rect == UNIT_RECT {
+        return source;
+    }
+    let (w, h) = (source.width as f64, source.height as f64);
+    let x0 = (rect.origin.x * w).clamp(0.0, w) as usize;
+    let y0 = (rect.origin.y * h).clamp(0.0, h) as usize;
+    let x1 = ((rect.origin.x + rect.size.width) * w).clamp(0.0, w) as usize;
+    let y1 = ((rect.origin.y + rect.size.height) * h).clamp(0.0, h) as usize;
+    if x1 <= x0 || y1 <= y0 {
+        return source;
+    }
+    let start = y0 * source.stride + x0 * 4;
+    let end = (y1 - 1) * source.stride + x1 * 4;
+    Source {
+        width: x1 - x0,
+        height: y1 - y0,
+        stride: source.stride,
+        bytes: &source.bytes[start..end],
+        swap: source.swap,
+    }
+}
+
+fn with_whole_contents<T>(layer: Id, f: impl FnOnce(Source) -> T) -> Option<T> {
     let (contents, cached) = read_node(layer, |node| {
         node.map_or((0, false), |node| {
             let cached = node
@@ -1576,6 +1637,41 @@ unsafe extern "C" fn layer_zero_mask(_receiver: Id, _sel: Sel) -> u32 {
     0
 }
 
+unsafe extern "C" fn contents_rect(receiver: Id, _sel: Sel) -> NSRect {
+    read_node(receiver, |node| node.map_or(UNIT_RECT, |node| node.contents_rect))
+}
+
+unsafe extern "C" fn set_contents_rect(receiver: Id, _sel: Sel, rect: NSRect) {
+    with_node(receiver, |node| node.contents_rect = rect);
+    changed(receiver);
+}
+
+unsafe extern "C" fn sublayer_transform(receiver: Id, _sel: Sel) -> Transform3D {
+    read_node(receiver, |node| {
+        node.map_or(Transform3D::IDENTITY, |node| node.sublayer_transform)
+    })
+}
+
+unsafe extern "C" fn set_sublayer_transform(receiver: Id, _sel: Sel, transform: Transform3D) {
+    with_node(receiver, |node| node.sublayer_transform = transform);
+}
+
+unsafe extern "C" fn corner_radius(receiver: Id, _sel: Sel) -> f64 {
+    read_node(receiver, |node| node.map_or(0.0, |node| node.corner_radius))
+}
+
+unsafe extern "C" fn set_corner_radius(receiver: Id, _sel: Sel, radius: f64) {
+    with_node(receiver, |node| node.corner_radius = radius);
+}
+
+unsafe extern "C" fn edge_antialiasing_mask(receiver: Id, _sel: Sel) -> u32 {
+    read_node(receiver, |node| node.map_or(0xf, |node| node.edge_antialiasing))
+}
+
+unsafe extern "C" fn set_edge_antialiasing_mask(receiver: Id, _sel: Sel, mask: u32) {
+    with_node(receiver, |node| node.edge_antialiasing = mask);
+}
+
 pub(crate) fn install() {
     let layer = objc::class::lookup(c"CALayer").expect("declared before its methods");
     methods!(layer, {
@@ -1612,6 +1708,15 @@ pub(crate) fn install() {
         "removeAnimationForKey:" => remove_animation_for_key, c"v24@0:8@16";
         "removeAllAnimations" => remove_all_animations, c"v16@0:8";
         "animationKeys" => animation_keys, c"@16@0:8";
+        "contentsRect" => contents_rect, c"{CGRect={CGPoint=dd}{CGSize=dd}}16@0:8";
+        "setContentsRect:" => set_contents_rect, c"v48@0:8{CGRect={CGPoint=dd}{CGSize=dd}}16";
+        "sublayerTransform" => sublayer_transform, c"{CATransform3D=dddddddddddddddd}16@0:8";
+        "setSublayerTransform:" => set_sublayer_transform,
+            c"v144@0:8{CATransform3D=dddddddddddddddd}16";
+        "cornerRadius" => corner_radius, c"d16@0:8";
+        "setCornerRadius:" => set_corner_radius, c"v24@0:8d16";
+        "edgeAntialiasingMask" => edge_antialiasing_mask, c"I16@0:8";
+        "setEdgeAntialiasingMask:" => set_edge_antialiasing_mask, c"v20@0:8I16";
     });
 
     let base = objc::class::lookup(c"CAAnimation").expect("declared before its methods");

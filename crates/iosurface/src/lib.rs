@@ -425,12 +425,18 @@ pub unsafe extern "C" fn IOSurfaceCreateMachPort(surface: CFTypeRef) -> u32 {
         return 0;
     };
     if trace() {
+        // SAFETY: the surface's pixels, `bytes_per_row` bytes a row.
+        let pixels = unsafe {
+            std::slice::from_raw_parts(state.memory.add(state.offset), state.bytes_per_row * state.height)
+        };
+        let painted = pixels.iter().any(|&b| b != 0);
         eprintln!(
-            "rosemary: iosurface: {} sends {:#x} ({}x{})",
+            "rosemary: iosurface: {} sends {:#x} ({}x{}, {})",
             std::process::id(),
             state.id,
             state.width,
-            state.height
+            state.height,
+            if painted { "painted" } else { "blank" }
         );
     }
     darwin::mach::space::insert(darwin::mach::space::Right::Memory {
