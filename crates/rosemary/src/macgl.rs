@@ -332,6 +332,26 @@ noted! {
     framebuffer_texture_2d = c"glFramebufferTexture2D" (target: u32, attachment: u32, textarget: u32, texture: u32, level: i32) => appkit::opengl::surface::written(texture);
     tex_sub_image_2d = c"glTexSubImage2D" (target: u32, level: i32, x: i32, y: i32, w: i32, h: i32, format: u32, kind: u32, pixels: *const std::ffi::c_void) => appkit::opengl::surface::uploaded(target);
     copy_tex_sub_image_2d = c"glCopyTexSubImage2D" (target: u32, level: i32, x: i32, y: i32, sx: i32, sy: i32, w: i32, h: i32) => appkit::opengl::surface::uploaded(target);
+    bind_framebuffer = c"glBindFramebuffer" (target: u32, framebuffer: u32) => ();
+    copy_image_sub_data = c"glCopyImageSubData" (src: u32, src_target: u32, src_level: i32, sx: i32, sy: i32, sz: i32, dst: u32, dst_target: u32, dst_level: i32, dx: i32, dy: i32, dz: i32, w: i32, h: i32, d: i32) => appkit::opengl::surface::written(dst);
+    draw_elements_base_vertex = c"glDrawElementsBaseVertex" (mode: u32, count: i32, kind: u32, indices: *const std::ffi::c_void, base: i32) => appkit::opengl::surface::drew();
+    draw_range_elements_base_vertex = c"glDrawRangeElementsBaseVertex" (mode: u32, start: u32, end: u32, count: i32, kind: u32, indices: *const std::ffi::c_void, base: i32) => appkit::opengl::surface::drew();
+    draw_elements_instanced_base_vertex = c"glDrawElementsInstancedBaseVertex" (mode: u32, count: i32, kind: u32, indices: *const std::ffi::c_void, instances: i32, base: i32) => appkit::opengl::surface::drew();
+    draw_arrays_instanced_base_instance = c"glDrawArraysInstancedBaseInstance" (mode: u32, first: i32, count: i32, instances: i32, base: u32) => appkit::opengl::surface::drew();
+    draw_elements_instanced_base_instance = c"glDrawElementsInstancedBaseInstance" (mode: u32, count: i32, kind: u32, indices: *const std::ffi::c_void, instances: i32, base: u32) => appkit::opengl::surface::drew();
+    draw_elements_instanced_base_vertex_base_instance = c"glDrawElementsInstancedBaseVertexBaseInstance" (mode: u32, count: i32, kind: u32, indices: *const std::ffi::c_void, instances: i32, base: i32, base_instance: u32) => appkit::opengl::surface::drew();
+    multi_draw_arrays = c"glMultiDrawArrays" (mode: u32, first: *const i32, count: *const i32, draws: i32) => appkit::opengl::surface::drew();
+    multi_draw_elements = c"glMultiDrawElements" (mode: u32, count: *const i32, kind: u32, indices: *const *const std::ffi::c_void, draws: i32) => appkit::opengl::surface::drew();
+    clear_buffer_fv = c"glClearBufferfv" (buffer: u32, drawbuffer: i32, value: *const f32) => appkit::opengl::surface::drew();
+    clear_buffer_iv = c"glClearBufferiv" (buffer: u32, drawbuffer: i32, value: *const i32) => appkit::opengl::surface::drew();
+    clear_buffer_uiv = c"glClearBufferuiv" (buffer: u32, drawbuffer: i32, value: *const u32) => appkit::opengl::surface::drew();
+}
+
+/// `glBindFramebuffer`, after which the texture now drawn into is known.
+unsafe extern "C" fn bind_framebuffer_noted(target: u32, framebuffer: u32) {
+    // SAFETY: the guest's call, passed on.
+    unsafe { bind_framebuffer(target, framebuffer) };
+    appkit::opengl::surface::framebuffer_bound(target);
 }
 
 /// This module's replacement for `name`, if it has one.
@@ -350,6 +370,19 @@ pub fn address(name: &str) -> Option<u64> {
         "glFramebufferTexture2D" if crate::frameworks::using_builtin() => framebuffer_texture_2d as *const (),
         "glTexSubImage2D" if crate::frameworks::using_builtin() => tex_sub_image_2d as *const (),
         "glCopyTexSubImage2D" if crate::frameworks::using_builtin() => copy_tex_sub_image_2d as *const (),
+        "glCopyImageSubData" if crate::frameworks::using_builtin() => copy_image_sub_data as *const (),
+        "glDrawElementsBaseVertex" if crate::frameworks::using_builtin() => draw_elements_base_vertex as *const (),
+        "glDrawRangeElementsBaseVertex" if crate::frameworks::using_builtin() => draw_range_elements_base_vertex as *const (),
+        "glDrawElementsInstancedBaseVertex" if crate::frameworks::using_builtin() => draw_elements_instanced_base_vertex as *const (),
+        "glDrawArraysInstancedBaseInstance" if crate::frameworks::using_builtin() => draw_arrays_instanced_base_instance as *const (),
+        "glDrawElementsInstancedBaseInstance" if crate::frameworks::using_builtin() => draw_elements_instanced_base_instance as *const (),
+        "glDrawElementsInstancedBaseVertexBaseInstance" if crate::frameworks::using_builtin() => draw_elements_instanced_base_vertex_base_instance as *const (),
+        "glMultiDrawArrays" if crate::frameworks::using_builtin() => multi_draw_arrays as *const (),
+        "glMultiDrawElements" if crate::frameworks::using_builtin() => multi_draw_elements as *const (),
+        "glClearBufferfv" if crate::frameworks::using_builtin() => clear_buffer_fv as *const (),
+        "glClearBufferiv" if crate::frameworks::using_builtin() => clear_buffer_iv as *const (),
+        "glClearBufferuiv" if crate::frameworks::using_builtin() => clear_buffer_uiv as *const (),
+        "glBindFramebuffer" if crate::frameworks::using_builtin() => bind_framebuffer_noted as *const (),
         "glGetString" => get_string as *const (),
         "glGetStringi" => get_stringi as *const (),
         "glGetIntegerv" => get_integerv as *const (),

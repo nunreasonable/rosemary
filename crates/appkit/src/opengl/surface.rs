@@ -39,6 +39,7 @@ struct Gl {
     PixelStorei: unsafe extern "C" fn(u32, i32),
     TexImage2D: unsafe extern "C" fn(u32, i32, i32, i32, i32, i32, u32, u32, *const c_void),
     GetTexImage: unsafe extern "C" fn(u32, i32, u32, u32, *mut c_void),
+    GetFramebufferAttachmentParameteriv: unsafe extern "C" fn(u32, u32, u32, *mut i32),
 }
 
 fn gl() -> Option<&'static Gl> {
@@ -57,6 +58,7 @@ fn gl() -> Option<&'static Gl> {
             PixelStorei: get(c"glPixelStorei")?,
             TexImage2D: get(c"glTexImage2D")?,
             GetTexImage: get(c"glGetTexImage")?,
+            GetFramebufferAttachmentParameteriv: get(c"glGetFramebufferAttachmentParameteriv")?,
         })
     })
     .as_ref()
@@ -110,6 +112,38 @@ pub fn written(texture: u32) {
     }
     drop(written);
     drew();
+}
+
+/// A framebuffer was bound for drawing: the texture it draws into is
+/// written, whichever call attached it.
+pub fn framebuffer_bound(target: u32) {
+    const FRAMEBUFFER: u32 = 0x8D40;
+    const DRAW_FRAMEBUFFER: u32 = 0x8CA9;
+    const DRAW_FRAMEBUFFER_BINDING: u32 = 0x8CA6;
+    const COLOR_ATTACHMENT0: u32 = 0x8CE0;
+    const OBJECT_TYPE: u32 = 0x8CD0;
+    const OBJECT_NAME: u32 = 0x8CD1;
+    const TEXTURE: i32 = 0x1702;
+    if !matches!(target, FRAMEBUFFER | DRAW_FRAMEBUFFER) {
+        return;
+    }
+    let Some(gl) = gl() else {
+        return;
+    };
+    let (mut bound, mut kind, mut name) = (0, 0, 0);
+    // SAFETY: state queries on the current context.
+    unsafe {
+        (gl.GetIntegerv)(DRAW_FRAMEBUFFER_BINDING, &mut bound);
+        if bound == 0 {
+            return;
+        }
+        (gl.GetFramebufferAttachmentParameteriv)(DRAW_FRAMEBUFFER, COLOR_ATTACHMENT0, OBJECT_TYPE, &mut kind);
+        if kind != TEXTURE {
+            return;
+        }
+        (gl.GetFramebufferAttachmentParameteriv)(DRAW_FRAMEBUFFER, COLOR_ATTACHMENT0, OBJECT_NAME, &mut name);
+    }
+    written(name as u32);
 }
 
 /// The texture bound to `target` in the current context, as an upload to it
