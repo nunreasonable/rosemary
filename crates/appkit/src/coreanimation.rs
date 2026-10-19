@@ -1263,16 +1263,25 @@ fn fill(store: &mut Store, rect: Rect, color: [f64; 4], opacity: f64) {
     if rect.is_empty() || alpha <= 0.0 {
         return;
     }
-    let source = [color[2], color[1], color[0]].map(|c| c.clamp(0.0, 1.0) * alpha * 255.0);
-    let keep = 1.0 - alpha;
+    // Integer blending: this runs over whole windows every frame, and a
+    // floating-point round per channel cost more than the rest of composing.
+    let a = (alpha * 255.0).round() as u32;
+    let source = [color[2], color[1], color[0]].map(|c| (c.clamp(0.0, 1.0) * alpha * 255.0).round() as u32);
+    let opaque = [source[0] as u8, source[1] as u8, source[2] as u8, 255];
+    let keep = 255 - a;
     for row in rect.y..rect.y + rect.height {
         let start = (row as usize * store.width as usize + rect.x as usize) * 4;
         let end = start + rect.width as usize * 4;
-        for pixel in store.pixels[start..end].as_chunks_mut::<4>().0 {
+        let pixels = store.pixels[start..end].as_chunks_mut::<4>().0;
+        if a == 255 {
+            pixels.fill(opaque);
+            continue;
+        }
+        for pixel in pixels {
             for channel in 0..3 {
-                pixel[channel] = (source[channel] + f64::from(pixel[channel]) * keep).round() as u8;
+                pixel[channel] = (source[channel] + (u32::from(pixel[channel]) * keep + 127) / 255) as u8;
             }
-            pixel[3] = (alpha * 255.0 + f64::from(pixel[3]) * keep).round() as u8;
+            pixel[3] = (a + (u32::from(pixel[3]) * keep + 127) / 255) as u8;
         }
     }
 }
