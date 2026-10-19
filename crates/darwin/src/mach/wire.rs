@@ -496,22 +496,72 @@ fn control_len() -> usize {
     unsafe { libc::CMSG_SPACE((MAX_FDS * core::mem::size_of::<c_int>()) as u32) as usize }
 }
 
+/// The socket this process sends to `destination` from.
+///
+/// One per destination rather than one for the process: a datagram nobody has
+/// read yet is charged to the socket that sent it, so with a single socket one
+/// port nobody drains would stop every send this process makes, where Mach
+/// stops only the senders to that port. Unbound: a reply travels to a port
+/// named inside the message, never back to the datagram's source.
+fn sender_for(destination: Address) -> Option<std::sync::Arc<std::os::fd::OwnedFd>> {
+    use std::os::fd::FromRawFd;
+    /// Enough for every port a process talks to at once; past it the oldest
+    /// socket goes, and closes once no send is still using it.
+    const KEPT: usize = 256;
+    /// What a port may hold unread before its senders wait.
+    const BUFFER: c_int = 4 << 20;
+    type Senders = Vec<(Address, std::sync::Arc<std::os::fd::OwnedFd>)>;
+    static SENDERS: std::sync::Mutex<Senders> = std::sync::Mutex::new(Vec::new());
+    let mut senders = SENDERS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(at) = senders.iter().position(|(a, _)| *a == destination) {
+        let entry = senders.remove(at);
+        let socket = entry.1.clone();
+        senders.push(entry);
+        return Some(socket);
+    }
+    let fd = socket().ok()?;
+    // SAFETY: a socket just made and owned by nothing else.
+    let socket = std::sync::Arc::new(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) });
+    // SAFETY: an int option on a socket of this process. The kernel caps it
+    // at `wmem_max`, which is all this asks for.
+    let buffer = BUFFER;
+    unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_SNDBUF,
+            (&raw const buffer).cast(),
+            size_of::<c_int>() as libc::socklen_t,
+        )
+    };
+    if senders.len() >= KEPT {
+        senders.remove(0);
+    }
+    senders.push((destination, socket.clone()));
+    Some(socket)
+}
+
 /// Send `bytes` to `destination`, moving `fds` with it.
 ///
 /// The descriptors are *not* closed here: a caller that moved a right closes its
 /// own copy once the send has succeeded, and one that failed still holds the
 /// right it was asked to move.
 pub fn send(destination: Address, bytes: &[u8], fds: &[c_int]) -> std::io::Result<()> {
-    /// One sending socket for the whole process.
-    ///
-    /// Unbound: a reply travels to a port named inside the message, never back
-    /// to the source address of the datagram, so this end never needs a name.
-    /// `sendmsg` is atomic per datagram, so the descriptor is shared freely.
-    static SENDER: std::sync::OnceLock<Option<c_int>> = std::sync::OnceLock::new();
+    send_within(destination, bytes, fds, None)
+}
 
-    let Some(sender) = *SENDER.get_or_init(|| socket().ok()) else {
+/// [`send`], giving up with `EAGAIN` once `timeout` has passed with the
+/// destination's queue still full; `None` waits as long as it takes.
+pub fn send_within(
+    destination: Address,
+    bytes: &[u8],
+    fds: &[c_int],
+    timeout: Option<std::time::Duration>,
+) -> std::io::Result<()> {
+    let Some(sender) = sender_for(destination) else {
         return Err(std::io::Error::other("no Mach sending socket"));
     };
+    let sender = std::os::fd::AsRawFd::as_raw_fd(&*sender);
     if fds.len() > MAX_FDS {
         return Err(std::io::Error::from_raw_os_error(libc::EMSGSIZE));
     }
@@ -549,18 +599,28 @@ pub fn send(destination: Address, bytes: &[u8], fds: &[c_int]) -> std::io::Resul
         }
     }
 
+    let deadline = timeout.map(|t| std::time::Instant::now() + t);
+    let flags = match deadline {
+        Some(_) => libc::MSG_DONTWAIT,
+        None => 0,
+    };
     loop {
         // SAFETY: `msg` describes `bytes` and the control block above, both
         // still live.
-        let sent = unsafe { libc::sendmsg(sender, &msg, 0) };
+        let sent = unsafe { libc::sendmsg(sender, &msg, flags) };
         if sent >= 0 {
             return Ok(());
         }
         let error = std::io::Error::last_os_error();
-        if error.raw_os_error() == Some(libc::EINTR) {
-            continue;
+        match error.raw_os_error() {
+            Some(libc::EINTR) => continue,
+            Some(libc::EAGAIN) if deadline.is_some_and(|d| std::time::Instant::now() < d) => {
+                // A full queue has no readiness to wait on from the sending
+                // side, so look again shortly.
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            _ => return Err(error),
         }
-        return Err(error);
     }
 }
 

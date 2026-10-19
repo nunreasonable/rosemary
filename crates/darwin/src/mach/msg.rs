@@ -510,6 +510,24 @@ pub fn deliver_no_senders(destination: wire::Address, count: u32) {
     let _ = wire::send(destination, &bytes, &[]);
 }
 
+/// Queue a `MACH_NOTIFY_SEND_POSSIBLE` message about `name` on the port at
+/// `destination`: a `mach_send_possible_notification_t`, header, `NDR_record_t`
+/// and the name.
+pub fn deliver_send_possible(destination: wire::Address, name: Name) {
+    const NDR: [u8; 8] = [0, 0, 0, 0, 1, 0, 0, 0];
+    let mut payload = Vec::with_capacity(NDR.len() + 4);
+    payload.extend_from_slice(&NDR);
+    payload.extend_from_slice(&name.to_le_bytes());
+    let bytes = encode(
+        MOVE_SEND_ONCE,
+        space::NOTIFY_SEND_POSSIBLE,
+        &Reference::NONE,
+        &[],
+        &payload,
+    );
+    let _ = wire::send(destination, &bytes, &[]);
+}
+
 /// Put the descriptors a right travels with beside `fds`, and say where they are.
 ///
 /// A send right carries a fresh claim on its port rather than the sender's own,
@@ -585,7 +603,7 @@ fn word(bytes: &[u8], at: usize) -> u32 {
 /// # Safety
 ///
 /// `msg` addresses a `mach_msg_header_t` and `send_size` readable bytes.
-unsafe fn send(msg: *const u8, send_size: u32) -> i32 {
+unsafe fn send(msg: *const u8, send_size: u32, timeout: Option<std::time::Duration>) -> i32 {
     let size = send_size as usize;
     if !(HEADER..=wire::MAX_MESSAGE).contains(&size) {
         return MACH_SEND_TOO_LARGE;
@@ -694,7 +712,7 @@ unsafe fn send(msg: *const u8, send_size: u32) -> i32 {
 
     let wire_bytes = encode(bits, id, &reply, &descriptors, &bytes[payload_at..]);
 
-    match wire::send(destination, &wire_bytes, &fds) {
+    match wire::send_within(destination, &wire_bytes, &fds, timeout) {
         Ok(()) => {
             for held in pending {
                 held.commit();
@@ -1079,7 +1097,9 @@ pub unsafe extern "C" fn mach_msg(
     let msg = msg.cast::<u8>();
     if option & SEND_MSG != 0 {
         // SAFETY: the caller's message, of the size it passed.
-        let sent = unsafe { send(msg, send_size) };
+        let timeout = (option & SEND_TIMEOUT != 0)
+            .then(|| std::time::Duration::from_millis(u64::from(timeout)));
+        let sent = unsafe { send(msg, send_size, timeout) };
         // SAFETY: the header the send just read.
         unsafe { trace("send", msg, sent) };
         if sent != MACH_MSG_SUCCESS {
@@ -1181,9 +1201,14 @@ pub unsafe extern "C" fn mach_msg_overwrite(
     }
     if option & SEND_MSG != 0 {
         // SAFETY: the caller's message, of the size it passed.
-        let sent = unsafe { send(msg.cast(), send_size) };
+        let timeout = (option & SEND_TIMEOUT != 0)
+            .then(|| std::time::Duration::from_millis(u64::from(timeout)));
+        let sent = unsafe { send(msg.cast(), send_size, timeout) };
         if sent != MACH_MSG_SUCCESS {
-            return sent;
+            return match option & SEND_TIMEOUT != 0 && sent == MACH_SEND_NO_BUFFER {
+                true => MACH_SEND_TIMED_OUT,
+                false => sent,
+            };
         }
     }
     if option & RCV_MSG != 0 {

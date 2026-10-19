@@ -853,6 +853,8 @@ pub extern "C" fn mach_port_set_attributes(
 
 /// `MACH_NOTIFY_NO_SENDERS`, from `<mach/notify.h>`: `MACH_NOTIFY_FIRST + 6`.
 pub const NOTIFY_NO_SENDERS: i32 = 0o106;
+/// `MACH_NOTIFY_SEND_POSSIBLE`.
+pub const NOTIFY_SEND_POSSIBLE: i32 = 0o102;
 
 /// `kern_return_t mach_port_request_notification(ipc_space_t, mach_port_name_t,
 /// mach_msg_id_t, mach_port_mscount_t, mach_port_name_t notify,
@@ -912,6 +914,20 @@ pub unsafe extern "C" fn mach_port_request_notification(
         && let Some(port) = port
         && super::senders::request(port.address(), destination, sync)
     {
+        return KERN_SUCCESS;
+    }
+    // A sender told its destination's queue was full asks to hear when it
+    // has room. Nothing here sees a queue drain from the sending side, so the
+    // answer comes shortly after: the caller retries, and asks again if the
+    // queue is still full.
+    // FIXME (ACCURACY): sent whether or not room has been made.
+    if id == NOTIFY_SEND_POSSIBLE
+        && let Some(destination) = destination
+    {
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            super::msg::deliver_send_possible(destination, name);
+        });
         return KERN_SUCCESS;
     }
     announce_undelivered_notifications(id);
