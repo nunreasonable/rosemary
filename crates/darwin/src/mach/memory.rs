@@ -57,6 +57,15 @@ fn mapped_at(address: u64) -> Option<(Arc<OwnedFd>, u64, u64)> {
         })
 }
 
+/// The same memory file, open for reading only.
+fn reopen_read_only(file: &OwnedFd) -> Option<OwnedFd> {
+    let path = format!("/proc/self/fd/{}\0", file.as_raw_fd());
+    // SAFETY: a NUL-terminated path naming this process's own descriptor.
+    let fd = unsafe { libc::open(path.as_ptr().cast(), libc::O_RDONLY | libc::O_CLOEXEC) };
+    // SAFETY: just opened, and owned by nothing else.
+    (fd >= 0).then(|| unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
 fn round_page(size: u64) -> u64 {
     size.div_ceil(PAGE) * PAGE
 }
@@ -125,6 +134,16 @@ pub unsafe extern "C" fn mach_make_memory_entry_64(
         (file, base + offset, if wanted == 0 { rest } else { wanted.min(rest) })
     } else {
         return KERN_INVALID_ARGUMENT;
+    };
+    // An entry without write permission names the memory read-only, and a
+    // read-only descriptor is what makes that hold: a writable mapping of it
+    // fails here and, once the right is sent, in any other process too.
+    let file = match permission & VM_PROT_WRITE {
+        0 => match reopen_read_only(&file) {
+            Some(read_only) => Arc::new(read_only),
+            None => return KERN_FAILURE,
+        },
+        _ => file,
     };
     let name = space::insert(Right::Memory {
         file,
@@ -217,7 +236,7 @@ pub unsafe extern "C" fn mach_vm_map(
             )
         };
         if base == libc::MAP_FAILED {
-            return KERN_NO_SPACE;
+            return map_failure();
         }
         let base = base as u64;
         if alignment <= PAGE {
@@ -279,7 +298,7 @@ pub unsafe extern "C" fn mach_vm_map(
             )
         };
         if placed == libc::MAP_FAILED {
-            return KERN_NO_SPACE;
+            return map_failure();
         }
         requested
     };
@@ -293,6 +312,17 @@ pub unsafe extern "C" fn mach_vm_map(
     // SAFETY: writable, per the caller.
     unsafe { address.write(mapped) };
     KERN_SUCCESS
+}
+
+/// What a failed `mmap` means to a Mach caller. Asking for more access than
+/// an entry grants is `KERN_INVALID_RIGHT`, which is XNU's answer and the one
+/// a caller tests to learn whether a handle is read-only; anything else is a
+/// lack of room.
+fn map_failure() -> i32 {
+    match crate::errno::get() {
+        libc::EACCES | libc::EPERM => KERN_INVALID_RIGHT,
+        _ => KERN_NO_SPACE,
+    }
 }
 
 /// `kern_return_t mach_vm_protect(vm_map_t, mach_vm_address_t, mach_vm_size_t,

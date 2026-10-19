@@ -36,6 +36,15 @@ const DESCRIPTOR_TYPE_AT: usize = 11;
 /// The disposition byte, one before it.
 const DESCRIPTOR_DISPOSITION_AT: usize = 10;
 const DESCRIPTOR_PORT: u8 = 0;
+/// `MACH_MSG_OOL_DESCRIPTOR` and `MACH_MSG_OOL_VOLATILE_DESCRIPTOR`: memory
+/// that travels by copy.
+const DESCRIPTOR_OOL: u8 = 1;
+const DESCRIPTOR_OOL_VOLATILE: u8 = 3;
+/// `mach_msg_ool_descriptor_t` on a 64-bit task: the address, four bytes of
+/// flags and type, and the size.
+const OOL_DESCRIPTOR: usize = 16;
+/// `MACH_MSG_VIRTUAL_COPY`, which is how a received region is described.
+const VIRTUAL_COPY: u8 = 1;
 
 /// `mach_msg_header_t`, `mach_msg_body_t` and `mach_msg_port_descriptor_t`, in
 /// bytes. All three are the same size on x86-64 and arm64.
@@ -71,6 +80,15 @@ mod refkind {
     pub const RECEIVE: u8 = 2;
     /// A right whose port is gone.
     pub const DEAD: u8 = 3;
+    /// A send right to a memory entry: the memory file is the descriptor at
+    /// `fd_index`, `address` is the entry's size and `claims` its offset in
+    /// pages.
+    pub const MEMORY: u8 = 4;
+    /// A fileport: the open file is the descriptor at `fd_index`.
+    pub const FILE: u8 = 5;
+    /// Out-of-line memory: `address` bytes of the memory file at `fd_index`,
+    /// which the receiver maps as its own copy.
+    pub const OOL: u8 = 6;
 }
 
 #[derive(Clone, Copy)]
@@ -127,6 +145,36 @@ impl Reference {
         })
     }
 
+    /// Map the out-of-line memory this reference carries as a private copy in
+    /// the receiving task, which owns it from here and gives it back with
+    /// `vm_deallocate`.
+    fn adopt_out_of_line(&self, message: &mut Datagram) -> Adopted {
+        let size = self.address as usize;
+        let fd = usize::try_from(self.fd_index).ok().and_then(|i| message.take_fd(i));
+        // SAFETY: a descriptor that arrived over `SCM_RIGHTS`, now owned here.
+        let file = fd.map(|fd| unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) });
+        let (Some(file), true) = (file, size > 0) else {
+            return Adopted::OutOfLine { address: 0, size: 0 };
+        };
+        let page = super::info::page_size() as usize;
+        // SAFETY: a fresh private mapping of the sender's copy; writes stay in
+        // this task, as they do with a virtual copy.
+        let address = unsafe {
+            libc::mmap(
+                core::ptr::null_mut(),
+                size.next_multiple_of(page),
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE,
+                std::os::fd::AsRawFd::as_raw_fd(&file),
+                0,
+            )
+        };
+        match address == libc::MAP_FAILED {
+            true => Adopted::OutOfLine { address: 0, size: 0 },
+            false => Adopted::OutOfLine { address: address as u64, size: size as u32 },
+        }
+    }
+
     /// Put this reference into the receiving task's space and answer with the
     /// name it got.
     fn adopt(&self, message: &mut Datagram) -> Name {
@@ -167,6 +215,24 @@ impl Reference {
                 None => MACH_PORT_DEAD,
             },
             refkind::DEAD => MACH_PORT_DEAD,
+            refkind::MEMORY | refkind::FILE => {
+                let Some(fd) = usize::try_from(self.fd_index).ok().and_then(|i| message.take_fd(i))
+                else {
+                    return MACH_PORT_DEAD;
+                };
+                // SAFETY: a descriptor that arrived over `SCM_RIGHTS`, now
+                // owned by this process.
+                let file = std::sync::Arc::new(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) });
+                space::insert(match self.kind {
+                    refkind::MEMORY => space::Right::Memory {
+                        file,
+                        offset: u64::from(self.claims) * 4096,
+                        size: self.address,
+                        refs: 1,
+                    },
+                    _ => space::Right::File { file, refs: 1 },
+                })
+            }
             _ => MACH_PORT_NULL,
         }
     }
@@ -184,13 +250,28 @@ enum Pending {
     /// A receive right already out of the space, with the descriptors to send:
     /// the port, and its listener or `-1`.
     Receive { moved: wire::Moved, address: u64 },
+    /// A memory entry or a fileport: the file goes with the message, and the
+    /// name is released afterwards when the right was moved.
+    Backed {
+        file: std::sync::Arc<std::os::fd::OwnedFd>,
+        moved: Option<Name>,
+    },
+    /// Out-of-line memory: its copy, and the sender's region to unmap once
+    /// the message is away when the descriptor said `deallocate`.
+    OutOfLine {
+        copy: std::os::fd::OwnedFd,
+        release: Option<(u64, u64)>,
+    },
 }
 
 impl Pending {
     /// The send failed: put back whatever was taken.
     fn restore(self) {
         match self {
-            Pending::Copied | Pending::Moved(_) => {}
+            Pending::Copied
+            | Pending::Moved(_)
+            | Pending::Backed { .. }
+            | Pending::OutOfLine { .. } => {}
             Pending::Receive { moved, address } => {
                 // SAFETY: the descriptors taken out of the space above, never
                 // handed to anything else.
@@ -210,8 +291,18 @@ impl Pending {
     /// The send succeeded: consume what the disposition said it would.
     fn commit(self) {
         match self {
-            Pending::Copied => {}
-            Pending::Moved(name) => {
+            Pending::Copied | Pending::Backed { moved: None, .. } => {}
+            Pending::OutOfLine { release, .. } => {
+                if let Some((address, size)) = release {
+                    // Mach gives up every page the region touches.
+                    let page = super::info::page_size();
+                    let start = address & !(page - 1);
+                    let end = (address + size).next_multiple_of(page);
+                    // SAFETY: the sender's own region, which it asked to give up.
+                    unsafe { super::vm::vm_deallocate(space::TASK_SELF, start, end - start) };
+                }
+            }
+            Pending::Moved(name) | Pending::Backed { moved: Some(name), .. } => {
                 super::space::mach_port_deallocate(space::TASK_SELF, name);
             }
             Pending::Receive { moved, .. } => {
@@ -244,6 +335,31 @@ fn export(name: Name, disposition: u32) -> Result<(Reference, Option<Pending>), 
                 ..Reference::NONE
             },
             None,
+        ));
+    }
+    // A memory entry or a fileport has no port behind it to send to: what
+    // crosses is the file itself.
+    let backed = space::memory(name)
+        .map(|(file, offset, size)| (refkind::MEMORY, file, offset, size))
+        .or_else(|| space::file(name).map(|file| (refkind::FILE, file, 0, 0)));
+    if let Some((kind, file, offset, size)) = backed {
+        if !matches!(disposition, MAKE_SEND | COPY_SEND | MOVE_SEND) {
+            return Err(MACH_SEND_INVALID_RIGHT);
+        }
+        return Ok((
+            Reference {
+                kind,
+                disposition: MOVE_SEND as u8,
+                fd_index: -1,
+                listener: false,
+                claims: (offset / 4096) as u16,
+                complete: false,
+                address: size,
+            },
+            Some(Pending::Backed {
+                file,
+                moved: (disposition == MOVE_SEND).then_some(name),
+            }),
         ));
     }
     match disposition {
@@ -327,7 +443,27 @@ fn encode(
         reference.encode(&mut wire_bytes);
     }
     wire_bytes.extend_from_slice(payload);
+    // Who sent it, after everything else: what the kernel puts in the
+    // receiver's sender and audit trailers. A server that hands each child its
+    // own ports tells them apart by the pid in the audit token.
+    // SAFETY: plain identity queries.
+    let (euid, egid) = unsafe { (libc::geteuid(), libc::getegid()) };
+    wire_bytes.extend_from_slice(&(starnix::process::me() as u32).to_le_bytes());
+    wire_bytes.extend_from_slice(&euid.to_le_bytes());
+    wire_bytes.extend_from_slice(&egid.to_le_bytes());
     wire_bytes
+}
+
+/// `MACH_RCV_TRAILER_ELEMENTS(option)`: which trailer the receiver asked for.
+fn trailer_size(option: i32) -> usize {
+    match (option >> 24) & 0xf {
+        0 => TRAILER,
+        1 => 12,
+        2 => 20,
+        3 => 52,
+        4 => 60,
+        _ => 68,
+    }
 }
 
 /// Queue a `MACH_NOTIFY_NO_SENDERS` message on the port at `destination`.
@@ -380,6 +516,21 @@ fn attach(
                 fds.extend(&moved.claims[..carried]);
                 reference.claims = carried as u16;
                 reference.complete = moved.complete && carried == moved.claims.len();
+            }
+        }
+        refkind::OOL => {
+            if let Some(Pending::OutOfLine { copy, .. }) = held {
+                reference.fd_index = fds.len() as i16;
+                fds.push(copy.as_raw_fd());
+            }
+        }
+        refkind::MEMORY | refkind::FILE => {
+            if let Some(Pending::Backed { file, .. }) = held
+                && let Ok(copy) = file.try_clone()
+            {
+                reference.fd_index = fds.len() as i16;
+                fds.push(copy.as_raw_fd());
+                claims.push(copy);
             }
         }
         refkind::SEND if reference.disposition as u32 != MOVE_SEND_ONCE => {
@@ -464,13 +615,40 @@ unsafe fn send(msg: *const u8, send_size: u32) -> i32 {
         if count > MAX_RIGHTS {
             return failure(pending, MACH_SEND_TOO_LARGE);
         }
-        payload_at = HEADER + BODY + count * DESCRIPTOR;
-        if size < payload_at {
-            return failure(pending, MACH_SEND_INVALID_DATA);
-        }
-        for i in 0..count {
-            let at = HEADER + BODY + i * DESCRIPTOR;
-            if bytes[at + DESCRIPTOR_TYPE_AT] != DESCRIPTOR_PORT {
+        let mut at = HEADER + BODY;
+        for _ in 0..count {
+            if size < at + DESCRIPTOR {
+                return failure(pending, MACH_SEND_INVALID_DATA);
+            }
+            let kind = bytes[at + DESCRIPTOR_TYPE_AT];
+            if matches!(kind, DESCRIPTOR_OOL | DESCRIPTOR_OOL_VOLATILE) {
+                if size < at + OOL_DESCRIPTOR {
+                    return failure(pending, MACH_SEND_INVALID_DATA);
+                }
+                let address = u64::from(word(&bytes, at)) | u64::from(word(&bytes, at + 4)) << 32;
+                let deallocate = bytes[at + 8] != 0;
+                let length = word(&bytes, at + 12) as usize;
+                // SAFETY: the sender's region, `length` readable bytes by the
+                // descriptor's own statement.
+                let Some(copy) = (unsafe { out_of_line_copy(address, length) }) else {
+                    return failure(pending, MACH_SEND_NO_BUFFER);
+                };
+                let mut reference = Reference {
+                    kind: refkind::OOL,
+                    address: length as u64,
+                    ..Reference::NONE
+                };
+                let held = Pending::OutOfLine {
+                    copy,
+                    release: (deallocate && length > 0).then_some((address, length as u64)),
+                };
+                attach(&mut reference, Some(&held), &mut fds, &mut claims);
+                pending.push(held);
+                descriptors.push(reference);
+                at += OOL_DESCRIPTOR;
+                continue;
+            }
+            if kind != DESCRIPTOR_PORT {
                 announce_out_of_line();
                 return failure(pending, MACH_SEND_INVALID_TYPE);
             }
@@ -484,6 +662,11 @@ unsafe fn send(msg: *const u8, send_size: u32) -> i32 {
                 }
                 Err(code) => return failure(pending, code),
             }
+            at += DESCRIPTOR;
+        }
+        payload_at = at;
+        if size < payload_at {
+            return failure(pending, MACH_SEND_INVALID_DATA);
         }
     }
 
@@ -510,14 +693,58 @@ unsafe fn send(msg: *const u8, send_size: u32) -> i32 {
     }
 }
 
+/// What one reference became in the receiving task.
+enum Adopted {
+    Port(Name, u8),
+    OutOfLine { address: u64, size: u32 },
+}
+
+/// How many bytes of descriptors the `count` references of a datagram take
+/// once written out: a port is 12, out-of-line memory 16.
+fn descriptors_length(bytes: &[u8], count: usize) -> usize {
+    (0..count)
+        .map(|i| match bytes.get(envelope::FIXED + i * REFERENCE) {
+            Some(&refkind::OOL) => OOL_DESCRIPTOR,
+            _ => DESCRIPTOR,
+        })
+        .sum()
+}
+
+/// A memory file holding `length` bytes copied from `address`, which is what
+/// out-of-line memory crosses as: any size, unlike a datagram.
+///
+/// # Safety
+///
+/// `address` is readable for `length` bytes.
+unsafe fn out_of_line_copy(address: u64, length: usize) -> Option<std::os::fd::OwnedFd> {
+    use std::os::fd::FromRawFd;
+    // SAFETY: a fresh, unnamed memory file.
+    let fd = unsafe { libc::memfd_create(c"mach-ool".as_ptr(), libc::MFD_CLOEXEC) };
+    if fd < 0 {
+        return None;
+    }
+    // SAFETY: just made and owned by nothing else.
+    let file = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) };
+    let mut written = 0usize;
+    while written < length {
+        // SAFETY: the caller's readable region, from `written` on.
+        let n = unsafe {
+            libc::write(fd, (address as usize + written) as *const c_void, length - written)
+        };
+        if n <= 0 {
+            return None;
+        }
+        written += n as usize;
+    }
+    Some(file)
+}
+
 fn announce_out_of_line() {
     static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
         eprintln!(
-            "rosemary: mach_msg refused a message carrying out-of-line memory - a page mapped into \
-             the receiver is not something one unrelated process can do to another here, and \
-             copying the pointer across would hand the receiver an address that means something \
-             else in its own space"
+            "rosemary: mach_msg refused a message carrying out-of-line port arrays, which are not \
+             carried here"
         );
     }
 }
@@ -575,7 +802,7 @@ pub unsafe extern "C" fn mach_port_peek(
     let measured = (bytes.len() >= envelope::FIXED).then(|| {
         let count = word(bytes, 16) as usize;
         let complex = count > 0 || word(bytes, 8) & BITS_COMPLEX != 0;
-        let body = if complex { BODY + count * DESCRIPTOR } else { 0 };
+        let body = if complex { BODY + descriptors_length(bytes, count) } else { 0 };
         ((HEADER + body + word(bytes, 20) as usize) as u32, word(bytes, 12) as i32)
     });
     port.hold(message);
@@ -648,6 +875,7 @@ unsafe fn receive(
     rcv_name: Name,
     timeout_ms: i32,
     large: bool,
+    option: i32,
 ) -> i32 {
     let (mut message, arrived_on) = match next_message(rcv_name, timeout_ms) {
         Ok(taken) => taken,
@@ -671,11 +899,15 @@ unsafe fn receive(
 
     let complex = count > 0 || sender_bits & BITS_COMPLEX != 0;
     let body = match complex {
-        true => BODY + count * DESCRIPTOR,
+        true => BODY + descriptors_length(bytes, count),
         false => 0,
     };
     let size = HEADER + body + payload_len;
-    if size + TRAILER > rcv_size as usize {
+    let trailer = trailer_size(option);
+    let sender_at = envelope::FIXED + count * REFERENCE + payload_len;
+    let sender = (bytes.len() >= sender_at + 12)
+        .then(|| (word(bytes, sender_at), word(bytes, sender_at + 4), word(bytes, sender_at + 8)));
+    if size + trailer > rcv_size as usize {
         // Without `MACH_RCV_LARGE` the message is destroyed, which is what
         // dropping `message` does - including any rights it carried. With it,
         // the caller means to come back with a bigger buffer, so the message is
@@ -698,11 +930,14 @@ unsafe fn receive(
     // for rights it was never told about.
     let reply = Reference::decode(&bytes[24..]).unwrap_or(Reference::NONE);
     let reply_name = reply.adopt(&mut message);
-    let adopted: Vec<(Name, u8)> = (0..count)
+    let adopted: Vec<Adopted> = (0..count)
         .map(|i| {
             let at = envelope::FIXED + i * REFERENCE;
             let reference = Reference::decode(&message.bytes[at..]).unwrap_or(Reference::NONE);
-            (reference.adopt(&mut message), reference.disposition)
+            match reference.kind {
+                refkind::OOL => reference.adopt_out_of_line(&mut message),
+                _ => Adopted::Port(reference.adopt(&mut message), reference.disposition),
+            }
         })
         .collect();
 
@@ -712,19 +947,35 @@ unsafe fn receive(
         bits |= BITS_COMPLEX;
     }
 
-    // SAFETY: `size + TRAILER` bytes of the caller's buffer, checked above.
+    // SAFETY: `size + trailer` bytes of the caller's buffer, checked above.
     unsafe {
         write_header(msg, bits, size as u32, reply_name, arrived_on, id);
         if complex {
             write_word(msg, HEADER, count as u32);
-            for (i, (name, disposition)) in adopted.iter().enumerate() {
-                let at = HEADER + BODY + i * DESCRIPTOR;
-                write_word(msg, at, *name);
-                write_word(msg, at + 4, 0);
-                msg.add(at + 8).write(0);
-                msg.add(at + 9).write(0);
-                msg.add(at + DESCRIPTOR_DISPOSITION_AT).write(*disposition);
-                msg.add(at + DESCRIPTOR_TYPE_AT).write(DESCRIPTOR_PORT);
+            let mut at = HEADER + BODY;
+            for adopted in &adopted {
+                match *adopted {
+                    Adopted::Port(name, disposition) => {
+                        write_word(msg, at, name);
+                        write_word(msg, at + 4, 0);
+                        msg.add(at + 8).write(0);
+                        msg.add(at + 9).write(0);
+                        msg.add(at + DESCRIPTOR_DISPOSITION_AT).write(disposition);
+                        msg.add(at + DESCRIPTOR_TYPE_AT).write(DESCRIPTOR_PORT);
+                        at += DESCRIPTOR;
+                    }
+                    Adopted::OutOfLine { address, size } => {
+                        write_word(msg, at, address as u32);
+                        write_word(msg, at + 4, (address >> 32) as u32);
+                        // deallocate, then copy, then the padding byte.
+                        msg.add(at + 8).write(0);
+                        msg.add(at + 9).write(VIRTUAL_COPY);
+                        msg.add(at + 10).write(0);
+                        msg.add(at + DESCRIPTOR_TYPE_AT).write(DESCRIPTOR_OOL);
+                        write_word(msg, at + 12, size);
+                        at += OOL_DESCRIPTOR;
+                    }
+                }
             }
         }
         let payload_at = envelope::FIXED + count * REFERENCE;
@@ -733,9 +984,24 @@ unsafe fn receive(
             msg.add(HEADER + body),
             payload_len,
         );
-        // The trailer, which `msgh_size` does not count and `rcv_size` must.
+        // The trailer, which `msgh_size` does not count and `rcv_size` must:
+        // as much of it as the receiver asked for - the sequence number, the
+        // sender's ids, and its audit token, whose sixth word is its pid.
+        core::ptr::write_bytes(msg.add(size), 0, trailer);
         write_word(msg, size, TRAILER_FORMAT_0);
-        write_word(msg, size + 4, TRAILER as u32);
+        write_word(msg, size + 4, trailer as u32);
+        if let Some((pid, uid, gid)) = sender {
+            if trailer >= 20 {
+                write_word(msg, size + 12, uid);
+                write_word(msg, size + 16, gid);
+            }
+            if trailer >= 52 {
+                let audit = [uid, uid, gid, uid, gid, pid, 0, 0];
+                for (i, word) in audit.iter().enumerate() {
+                    write_word(msg, size + 20 + i * 4, *word);
+                }
+            }
+        }
     }
     MACH_MSG_SUCCESS
 }
@@ -792,6 +1058,8 @@ pub unsafe extern "C" fn mach_msg(
     if option & SEND_MSG != 0 {
         // SAFETY: the caller's message, of the size it passed.
         let sent = unsafe { send(msg, send_size) };
+        // SAFETY: the header the send just read.
+        unsafe { trace("send", msg, sent) };
         if sent != MACH_MSG_SUCCESS {
             return match option & SEND_TIMEOUT != 0 && sent == MACH_SEND_NO_BUFFER {
                 true => MACH_SEND_TIMED_OUT,
@@ -805,9 +1073,62 @@ pub unsafe extern "C" fn mach_msg(
             false => -1,
         };
         // SAFETY: the caller's buffer, of the size it passed.
-        return unsafe { receive(msg, rcv_size, rcv_name, timeout_ms, option & RCV_LARGE != 0) };
+        let received =
+            unsafe { receive(msg, rcv_size, rcv_name, timeout_ms, option & RCV_LARGE != 0, option) };
+        if received != MACH_RCV_TIMED_OUT {
+            // SAFETY: the header the receive wrote, or the caller's own.
+            unsafe { trace("recv", msg, received) };
+        }
+        return received;
     }
     MACH_MSG_SUCCESS
+}
+
+/// `ROSEMARY_TRACE_MACH_MSG`: one line per message sent or received, with the
+/// header and the type of each descriptor.
+///
+/// # Safety
+///
+/// `msg` addresses a whole header, and the descriptors its bits announce.
+unsafe fn trace(what: &str, msg: *const u8, rc: i32) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("ROSEMARY_TRACE_MACH_MSG").is_some()) {
+        return;
+    }
+    // SAFETY: the caller's header.
+    let header: [u32; 6] = unsafe { core::ptr::read_unaligned(msg.cast()) };
+    let mut kinds = String::new();
+    if rc == MACH_MSG_SUCCESS && header[0] & BITS_COMPLEX != 0 {
+        // SAFETY: a complex message's body follows its header.
+        let count = unsafe { msg.add(HEADER).cast::<u32>().read_unaligned() }.min(16);
+        let mut at = HEADER + BODY;
+        for _ in 0..count {
+            // SAFETY: inside the message, per the descriptor count.
+            let kind = unsafe { *msg.add(at + DESCRIPTOR_TYPE_AT) };
+            let value = unsafe { msg.add(at).cast::<u32>().read_unaligned() };
+            match kind {
+                DESCRIPTOR_OOL | DESCRIPTOR_OOL_VOLATILE => {
+                    let size = unsafe { msg.add(at + 12).cast::<u32>().read_unaligned() };
+                    kinds.push_str(&format!(" ool:{size}"));
+                    at += OOL_DESCRIPTOR;
+                }
+                _ => {
+                    let disposition = unsafe { *msg.add(at + DESCRIPTOR_DISPOSITION_AT) };
+                    kinds.push_str(&format!(" port:{value:#x}/{disposition}"));
+                    at += DESCRIPTOR;
+                }
+            }
+        }
+    }
+    eprintln!(
+        "rosemary: mach_msg[{}] {what} rc={rc:#x} bits={:#x} size={} remote={:#x} local={:#x} id={}{kinds}",
+        std::process::id(),
+        header[0],
+        header[1],
+        header[2],
+        header[3],
+        header[5] as i32,
+    );
 }
 
 /// `mach_msg_return_t mach_msg_overwrite(...)` - `mach_msg` with a separate
@@ -856,6 +1177,7 @@ pub unsafe extern "C" fn mach_msg_overwrite(
                 rcv_name,
                 timeout_ms,
                 option & RCV_LARGE != 0,
+                option,
             )
         };
     }
@@ -895,12 +1217,33 @@ pub unsafe extern "C" fn mach_msg_destroy(msg: *mut c_void) {
         return;
     }
     let count = word(&bytes, HEADER) as usize;
-    for i in 0..count {
-        let at = HEADER + BODY + i * DESCRIPTOR;
-        if at + DESCRIPTOR > bytes.len() || bytes[at + DESCRIPTOR_TYPE_AT] != DESCRIPTOR_PORT {
+    let mut at = HEADER + BODY;
+    for _ in 0..count {
+        if at + DESCRIPTOR > bytes.len() {
+            return;
+        }
+        let kind = bytes[at + DESCRIPTOR_TYPE_AT];
+        if matches!(kind, DESCRIPTOR_OOL | DESCRIPTOR_OOL_VOLATILE) {
+            if at + OOL_DESCRIPTOR > bytes.len() {
+                return;
+            }
+            let address = u64::from(word(&bytes, at)) | u64::from(word(&bytes, at + 4)) << 32;
+            let size = u64::from(word(&bytes, at + 12));
+            if address != 0 && size != 0 {
+                let page = super::info::page_size();
+                // SAFETY: memory the receive mapped for this message.
+                unsafe {
+                    super::vm::vm_deallocate(space::TASK_SELF, address, size.next_multiple_of(page))
+                };
+            }
+            at += OOL_DESCRIPTOR;
+            continue;
+        }
+        if kind != DESCRIPTOR_PORT {
             return;
         }
         let name = word(&bytes, at);
+        at += DESCRIPTOR;
         if name == MACH_PORT_NULL || name == MACH_PORT_DEAD {
             continue;
         }
@@ -1209,18 +1552,20 @@ mod tests {
         space::destroy(arrived);
     }
 
-    /// Out-of-line memory cannot cross, and is refused by name rather than sent
-    /// with the sender's pointer in it.
+    /// Out-of-line memory arrives as the receiver's own copy, whatever its
+    /// size - far past what one datagram holds - with the inline payload after
+    /// the 16-byte descriptor.
     #[test]
-    fn a_message_carrying_out_of_line_memory_is_refused() {
+    fn out_of_line_memory_arrives_as_a_copy() {
         let port = allocate_receive();
+        let data: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
         let mut descriptor = Vec::new();
         descriptor.extend_from_slice(&1u32.to_le_bytes());
-        descriptor.extend_from_slice(&[0u8; 8]); // address
-        // `deallocate`, `copy`, `pad1`, `type` - the type byte at offset 11, as
-        // in a port descriptor.
-        descriptor.extend_from_slice(&[0, 0, 0, 1]); // MACH_MSG_OOL_DESCRIPTOR
-        descriptor.extend_from_slice(&8u32.to_le_bytes()); // size
+        descriptor.extend_from_slice(&(data.as_ptr() as u64).to_le_bytes());
+        // `deallocate`, `copy`, `pad1`, `type`.
+        descriptor.extend_from_slice(&[0, 0, 0, DESCRIPTOR_OOL]);
+        descriptor.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        descriptor.extend_from_slice(&0xdead_beefu32.to_le_bytes());
         let mut sent = message(BITS_COMPLEX, port, MACH_PORT_NULL, 1, &descriptor);
         // SAFETY: a whole message of the size in its header.
         let rc = unsafe {
@@ -1234,7 +1579,34 @@ mod tests {
                 MACH_PORT_NULL,
             )
         };
-        assert_eq!(rc, MACH_SEND_INVALID_TYPE);
+        assert_eq!(rc, MACH_MSG_SUCCESS);
+
+        let mut buf = vec![0u8; 256];
+        // SAFETY: 256 writable bytes.
+        let rc = unsafe {
+            mach_msg(
+                buf.as_mut_ptr().cast(),
+                RCV_MSG | RCV_TIMEOUT,
+                0,
+                buf.len() as u32,
+                port,
+                1000,
+                MACH_PORT_NULL,
+            )
+        };
+        assert_eq!(rc, MACH_MSG_SUCCESS);
+        let at = HEADER + BODY;
+        assert_eq!(buf[at + DESCRIPTOR_TYPE_AT], DESCRIPTOR_OOL);
+        assert_eq!(word(&buf, at + 12) as usize, data.len());
+        assert_eq!(word(&buf, at + OOL_DESCRIPTOR), 0xdead_beef);
+        assert_eq!(word(&buf, 4) as usize, at + OOL_DESCRIPTOR + 4, "msgh_size");
+        let address = u64::from(word(&buf, at)) | u64::from(word(&buf, at + 4)) << 32;
+        assert_ne!(address, data.as_ptr() as u64, "a copy, not the sender's pointer");
+        // SAFETY: the region the receive mapped, of the size it stated.
+        let arrived = unsafe { std::slice::from_raw_parts(address as *const u8, data.len()) };
+        assert!(arrived == data.as_slice());
+        // SAFETY: the message just received into `buf`.
+        unsafe { mach_msg_destroy(buf.as_mut_ptr().cast()) };
         space::destroy(port);
     }
 

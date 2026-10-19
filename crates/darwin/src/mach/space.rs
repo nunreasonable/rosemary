@@ -121,6 +121,10 @@ impl Right {
 struct Space {
     names: HashMap<Name, Right>,
     next: Name,
+    /// User references on the send right a receive right's own name also
+    /// holds, which `MAKE_SEND` under that name adds and `mach_port_deallocate`
+    /// takes away again without touching the receive right.
+    sends: HashMap<Name, u32>,
 }
 
 fn space() -> &'static RwLock<Space> {
@@ -137,6 +141,7 @@ fn space() -> &'static RwLock<Space> {
         RwLock::new(Space {
             names,
             next: FIRST_DYNAMIC,
+            sends: HashMap::new(),
         })
     })
 }
@@ -225,7 +230,18 @@ pub fn move_receive(name: Name) -> Result<Receiver, i32> {
         return Err(MACH_SEND_INVALID_RIGHT);
     };
     match Arc::try_unwrap(port) {
-        Ok(port) => Ok(port),
+        Ok(port) => {
+            // The send rights the name also held stay behind as a plain send
+            // right to the port that has just left.
+            let address = port.address();
+            with(|space| {
+                if let Some(refs) = space.sends.remove(&name) {
+                    let claim = super::wire::claim(address);
+                    space.names.insert(name, Right::Send { address, refs, claim });
+                }
+            });
+            Ok(port)
+        }
         Err(shared) => {
             // Put it back: the caller still holds the right it asked to move.
             with(|space| space.names.insert(name, Right::Receive(shared)));
@@ -419,14 +435,24 @@ fn release(space: &mut Space, name: Name) -> i32 {
         // `mach_port_deallocate` on a receive right is an error on a real
         // system, and the mistake it catches - deallocating the port you are
         // about to listen on - is one worth still catching here.
-        Right::Receive(_) | Right::Set(_) => KERN_INVALID_RIGHT,
+        Right::Receive(_) => match space.sends.get_mut(&name) {
+            Some(refs) if *refs > 0 => {
+                *refs -= 1;
+                if *refs == 0 {
+                    space.sends.remove(&name);
+                }
+                KERN_SUCCESS
+            }
+            _ => KERN_INVALID_RIGHT,
+        },
+        Right::Set(_) => KERN_INVALID_RIGHT,
         Right::Semaphore(_) | Right::Special => KERN_SUCCESS,
     }
 }
 
 /// Remove `name` and everything behind it, whatever kind of right it is.
 pub fn destroy(name: Name) -> i32 {
-    with(|space| match space.names.remove(&name) {
+    with(|space| match (space.sends.remove(&name), space.names.remove(&name)).1 {
         Some(Right::Set(members)) => {
             let _ = members;
             KERN_SUCCESS
@@ -661,6 +687,7 @@ pub extern "C" fn mach_port_insert_right(
             && matches!(space.names.get(&name), Some(Right::Receive(_)))
             && disposition == super::msg::MAKE_SEND
         {
+            *space.sends.entry(name).or_default() += 1;
             return KERN_SUCCESS;
         }
         let inserted = match disposition {
