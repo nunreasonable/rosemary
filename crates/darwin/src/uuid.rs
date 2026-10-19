@@ -204,8 +204,33 @@ unsafe extern "C" fn parse(text: *const c_char, out: *mut u8) -> i32 {
     0
 }
 
+/// `int gethostuuid(uuid_t id, const struct timespec *wait)`
+///
+/// The host's machine id, which like Darwin's hardware UUID is the same for
+/// every process on the machine and across boots. `wait` bounds Darwin's wait
+/// for the kernel to learn the UUID; here it is known or it is not, and a
+/// host without one fails as a Darwin wait that ran out does.
+///
+/// # Safety
+///
+/// `out` is sixteen writable bytes.
+unsafe extern "C" fn gethostuuid(out: *mut u8, _wait: *const libc::timespec) -> i32 {
+    if out.is_null() {
+        crate::errno::set(libc::EFAULT);
+        return -1;
+    }
+    let Some(bytes) = starnix::system::host_uuid() else {
+        crate::errno::set(libc::EWOULDBLOCK);
+        return -1;
+    };
+    // SAFETY: the caller's sixteen writable bytes.
+    unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), out, LEN) };
+    0
+}
+
 exports::exports! {
     functions {
+        "gethostuuid" => gethostuuid,
         "uuid_clear" => clear,
         "uuid_compare" => compare,
         "uuid_copy" => copy,
@@ -315,5 +340,17 @@ mod tests {
         assert_eq!(unsafe { compare(a.as_ptr(), b.as_ptr()) }, 0);
         // SAFETY: sixteen readable bytes.
         assert_eq!(unsafe { is_null(a.as_ptr()) }, 1);
+    }
+
+    #[test]
+    fn the_host_uuid_is_the_same_each_time() {
+        let read = || {
+            let mut out = [0u8; LEN];
+            let rc = unsafe { gethostuuid(out.as_mut_ptr(), core::ptr::null()) };
+            (rc == 0).then_some(out)
+        };
+        let first = read();
+        assert_eq!(first, read());
+        assert_eq!(first.is_some(), starnix::system::host_uuid().is_some());
     }
 }

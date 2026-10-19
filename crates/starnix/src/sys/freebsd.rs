@@ -262,6 +262,10 @@ pub fn cpu_brand() -> Option<String> {
     sysctl::string_by_name(c"hw.model")
 }
 
+pub fn host_uuid() -> Option<[u8; 16]> {
+    crate::system::parse_uuid(&sysctl::string_by_name(c"kern.hostuuid")?)
+}
+
 pub fn peer(fd: RawFd) -> Option<Peer> {
     // SAFETY: `xucred` is plain data, valid when zeroed.
     let mut cred: libc::xucred = unsafe { std::mem::zeroed() };

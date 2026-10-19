@@ -602,6 +602,7 @@ dependencies = [
  "objc",
  "prefix",
  "sdl3",
+ "starnix",
  "static_init",
 ]
 
@@ -893,6 +894,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "cty"
+version = "0.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b365fabc795046672053e29c954733ec3b05e4be654ab130fe8f1f94d7051f35"
+
+[[package]]
 name = "cursor-icon"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -914,6 +921,7 @@ dependencies = [
  "getrandom 0.3.4",
  "libc",
  "libm",
+ "libmimalloc-sys",
  "machish",
  "md-5",
  "objc",
@@ -1559,10 +1567,9 @@ checksum = "b6d2cec3eae94f9f509c767b45932f1ada8350c4bdb85af2fcab4a3c14807981"
 [[package]]
 name = "libmimalloc-sys"
 version = "0.1.49"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6a45a52f43e1c16f667ccfe4dd8c85b7f7c204fd5e3bf46c5b0db9a5c3c0b8e9"
 dependencies = [
  "cc",
+ "cty",
 ]
 
 [[package]]
@@ -1753,6 +1760,17 @@ name = "multiversion_no_op"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "743fb55ba31b18fb1ecef6bdc9aa2743314978ac084044301a7eee33fb99a20d"
+
+[[package]]
+name = "network"
+version = "0.3.0"
+dependencies = [
+ "corefoundation",
+ "darwin",
+ "exports",
+ "objc",
+ "starnix",
+]
 
 [[package]]
 name = "num-conv"
@@ -2240,6 +2258,7 @@ dependencies = [
  "metal",
  "microlift",
  "mimalloc",
+ "network",
  "objc",
  "opencl",
  "prefix",

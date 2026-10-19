@@ -51,6 +51,24 @@ pub fn cpu_brand() -> Option<String> {
     sys::cpu_brand()
 }
 
+/// A UUID that names this machine and stays the same across boots.
+pub fn host_uuid() -> Option<[u8; 16]> {
+    sys::host_uuid()
+}
+
+/// Sixteen bytes from 32 hex digits, with or without a UUID's dashes.
+#[cfg_attr(not(any(target_os = "linux", target_os = "freebsd")), allow(dead_code))]
+pub(crate) fn parse_uuid(text: &str) -> Option<[u8; 16]> {
+    let mut digits = text.trim().bytes().filter(|&b| b != b'-');
+    let mut out = [0u8; 16];
+    for byte in &mut out {
+        let high = (digits.next()? as char).to_digit(16)?;
+        let low = (digits.next()? as char).to_digit(16)?;
+        *byte = (high << 4 | low) as u8;
+    }
+    digits.next().is_none().then_some(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -60,6 +78,17 @@ mod tests {
         assert!(memory().free > 0);
         let ticks = cpu_ticks();
         assert!(ticks.user + ticks.system + ticks.idle > 0);
+    }
+
+    #[test]
+    fn a_uuid_parses_with_or_without_dashes() {
+        let plain = parse_uuid("0123456789abcdef0123456789ABCDEF\n");
+        let dashed = parse_uuid("01234567-89ab-cdef-0123-456789abcdef");
+        assert_eq!(plain, dashed);
+        assert_eq!(plain.map(|bytes| bytes[1]), Some(0x23));
+        assert_eq!(parse_uuid("0123"), None);
+        assert_eq!(parse_uuid("0123456789abcdef0123456789abcdef00"), None);
+        assert_eq!(parse_uuid("g123456789abcdef0123456789abcdef"), None);
     }
 
     #[test]

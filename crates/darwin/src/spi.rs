@@ -295,27 +295,6 @@ pub extern "C" fn thread_switch(_thread: Name, option: c_int, time_ms: u32) -> i
     KERN_SUCCESS
 }
 
-/// `kern_return_t thread_policy_get(thread_act_t, thread_policy_flavor_t,
-/// thread_policy_t, mach_msg_type_number_t *, boolean_t *get_default)`: every
-/// policy at its default, which is what `thread_policy_set` leaves it at.
-pub unsafe extern "C" fn thread_policy_get(
-    _thread: Name,
-    _flavor: u32,
-    policy: *mut u32,
-    count: *mut u32,
-    get_default: *mut u32,
-) -> i32 {
-    if !policy.is_null() && !count.is_null() {
-        // SAFETY: `*count` words, per the caller.
-        unsafe { std::ptr::write_bytes(policy, 0, count.read() as usize) };
-    }
-    if !get_default.is_null() {
-        // SAFETY: writable, per the caller.
-        unsafe { get_default.write(1) };
-    }
-    KERN_SUCCESS
-}
-
 /// `kern_return_t task_policy_set(task_t, task_policy_flavor_t, task_policy_t,
 /// mach_msg_type_number_t)`: a scheduling hint, accepted and dropped as
 /// `thread_policy_set`'s are.
@@ -460,7 +439,6 @@ exports::exports! {
         "notify_cancel" => notify_cancel,
         "task_self_trap" => task_self_trap,
         "thread_switch" => thread_switch,
-        "thread_policy_get" => thread_policy_get,
         "task_policy_set" => task_policy_set,
         "host_processor_info" => host_processor_info,
         "pthread_from_mach_thread_np" => pthread_from_mach_thread_np,

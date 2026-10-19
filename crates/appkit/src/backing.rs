@@ -2140,7 +2140,7 @@ unsafe extern "C" fn cg_context(receiver: Id, _sel: Sel) -> *const c_void {
         .iter()
         .rev()
         .find(|(context, _)| *context == receiver as usize)
-        .map_or(std::ptr::null(), |(_, cg)| *cg as *const c_void)
+        .map_or_else(crate::cgcontext::focus_context, |(_, cg)| *cg as *const c_void)
 }
 
 unsafe extern "C" fn ignored_integer(_receiver: Id, _sel: Sel, _value: isize) {}

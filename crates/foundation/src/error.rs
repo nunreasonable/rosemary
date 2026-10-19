@@ -37,6 +37,51 @@ pub fn make(domain: &str, code: i64, description: &str) -> Id {
     unsafe { make_with_user_info(domain, code, description, std::ptr::null_mut()) }
 }
 
+/// A new error at +1, as `CFErrorCreate` makes one: `description` under
+/// `NSLocalizedDescription` in its user info, beside each of `entries` - an
+/// underlying error under `NSUnderlyingError`, say. `description` wins over
+/// an `entries` item under `NSLocalizedDescription`, and a null result (the
+/// allocation failed) leaves nothing owned.
+pub fn create(domain: &str, code: i64, description: &str, entries: &[(&str, Id)]) -> Id {
+    let text = crate::string::from_str(description);
+    let mut pairs = vec![(crate::string::from_str("NSLocalizedDescription"), text)];
+    pairs.extend(
+        entries
+            .iter()
+            .filter(|&&(key, _)| key != "NSLocalizedDescription")
+            .map(|&(key, value)| (crate::string::from_str(key), objc::arc::retain(value))),
+    );
+    let as_cf: Vec<_> = pairs
+        .iter()
+        .map(|&(key, value)| {
+            (
+                key as corefoundation::base::CFTypeRef,
+                value as corefoundation::base::CFTypeRef,
+            )
+        })
+        .collect();
+    let user_info = corefoundation::collections::new_dictionary(
+        &as_cf,
+        corefoundation::callbacks::Policy::from_type_callbacks(),
+        corefoundation::callbacks::Policy::from_type_callbacks(),
+        false,
+    ) as Id;
+    for (key, value) in pairs {
+        objc::arc::release(key);
+        objc::arc::release(value);
+    }
+    let error = made(Contents {
+        domain: domain.to_string(),
+        code,
+        description: description.to_string(),
+        user_info,
+    });
+    if error.is_null() {
+        objc::arc::release(user_info);
+    }
+    error
+}
+
 /// An autoreleased error retaining the supplied user-info dictionary.
 ///
 /// # Safety
@@ -248,6 +293,41 @@ fn autoreleased(text: &str) -> Id {
     unsafe { corefoundation::api::CFAutorelease(string as corefoundation::base::CFTypeRef) as Id }
 }
 
+/// The CoreFoundation spellings, for the `CFErrorRef` an `NSError` is.
+pub mod cf {
+    // The C spellings are the interface; renaming them would only hide it.
+    #![allow(non_snake_case)]
+
+    use objc::object::Id;
+    use objc::sel::Sel;
+
+    /// `CFStringRef CFErrorCopyDescription(CFErrorRef err)`.
+    ///
+    /// What Apple's `CFError.c` answers for a bridged error: its
+    /// `-localizedDescription`, sent so that a subclass's own is the one
+    /// read, and retained, as a `Copy` is.
+    unsafe extern "C" fn CFErrorCopyDescription(err: Id) -> Id {
+        if err.is_null() {
+            return std::ptr::null_mut();
+        }
+        // SAFETY: `objc_msgSend`, called as `-localizedDescription` is.
+        let description = unsafe {
+            let send: unsafe extern "C" fn(Id, Sel) -> Id = std::mem::transmute(objc::msg::entry());
+            send(err, objc::sel::get("localizedDescription"))
+        };
+        match description.is_null() {
+            true => description,
+            false => objc::arc::retain(description),
+        }
+    }
+
+    exports::exports! {
+        functions {
+            "CFErrorCopyDescription" => CFErrorCopyDescription,
+        }
+    }
+}
+
 pub(crate) fn install() {
     let class = class();
     methods!(class, {
@@ -265,27 +345,4 @@ pub(crate) fn install() {
     crate::define::class_methods!(class, {
         "errorWithDomain:code:userInfo:" => error_with_domain, c"@40@0:8@16q24@32";
     });
-}
-
-#[allow(non_snake_case)]
-pub mod cf {
-    use objc::object::Id;
-
-    /// `CFStringRef CFErrorCopyDescription(CFErrorRef)`: the error's description,
-    /// owned by the caller. Never null, as Apple's is not: an error this module
-    /// did not make gets the generic sentence.
-    unsafe extern "C" fn CFErrorCopyDescription(error: Id) -> Id {
-        // SAFETY: an error the caller holds, read only if this module made it.
-        let text = unsafe { super::contents(error) }
-            .map(|c| c.description.clone())
-            .filter(|d| !d.is_empty())
-            .unwrap_or_else(|| "The operation couldn\u{2019}t be completed.".to_string());
-        crate::string::from_str(&text)
-    }
-
-    exports::exports! {
-        functions {
-            "CFErrorCopyDescription" => CFErrorCopyDescription,
-        }
-    }
 }

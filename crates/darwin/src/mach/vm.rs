@@ -513,6 +513,33 @@ pub unsafe extern "C" fn vm_read_overwrite(
     KERN_SUCCESS
 }
 
+/// `kern_return_t vm_copy(vm_map_t target_task, vm_address_t source_address,
+/// vm_size_t size, vm_address_t dest_address)`
+///
+/// Darwin takes the source as it was before the call, so an overlapping copy
+/// is a `memmove`. jemalloc uses it to move page runs in `realloc`.
+///
+/// # Safety
+///
+/// `source` is readable and `dest` writable for `size` bytes.
+pub unsafe extern "C" fn vm_copy(task: Name, source: u64, size: u64, dest: u64) -> i32 {
+    if task != TASK_SELF {
+        return KERN_INVALID_ARGUMENT;
+    }
+    if size == 0 {
+        return KERN_SUCCESS;
+    }
+    if source == 0 || dest == 0 {
+        return KERN_INVALID_ADDRESS;
+    }
+    let Ok(len) = usize::try_from(size) else {
+        return KERN_INVALID_ADDRESS;
+    };
+    // SAFETY: the caller's obligation; `copy` permits the two to overlap.
+    unsafe { std::ptr::copy(source as *const u8, dest as *mut u8, len) };
+    KERN_SUCCESS
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -613,6 +640,17 @@ mod tests {
         assert_eq!(status, KERN_SUCCESS);
         assert_eq!(into, from);
         assert_eq!(wrote, 4);
+    }
+
+    /// An overlapping copy sees the source as it was before the call.
+    #[test]
+    fn copies_overlapping_memory_like_memmove() {
+        let mut buf = [1_u8, 2, 3, 4, 5, 6];
+        let base = buf.as_mut_ptr() as u64;
+        // SAFETY: both ranges lie inside `buf`.
+        let status = unsafe { vm_copy(TASK_SELF, base, 4, base + 2) };
+        assert_eq!(status, KERN_SUCCESS);
+        assert_eq!(buf, [1, 2, 1, 2, 3, 4]);
     }
 
     /// The buffer Crashpad's message server receives into.

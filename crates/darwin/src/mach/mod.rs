@@ -124,8 +124,11 @@ exports::exports! {
         "thread_set_state" => thread::thread_set_state,
         "thread_abort" | "thread_abort_safely" => thread::thread_abort,
         "thread_policy_set" => thread::thread_policy_set,
+        "thread_policy_get" => thread::thread_policy_get,
         "mach_port_space_basic_info" => tasks::mach_port_space_basic_info,
         "task_policy_get" => tasks::task_policy_get,
+        "task_suspend" => tasks::task_suspend,
+        "task_resume" => tasks::task_resume,
         "task_set_special_port" => task::task_set_special_port,
 
         // The exception-port family. `task`, `host` and `thread` are the same
@@ -169,6 +172,7 @@ exports::exports! {
         "vm_deallocate" | "mach_vm_deallocate" => vm::vm_deallocate,
         "mach_vm_region" => vm::vm_region_64,
         "vm_read_overwrite" => vm::vm_read_overwrite,
+        "vm_copy" | "mach_vm_copy" => vm::vm_copy,
 
         "mach_msg" => msg::mach_msg,
         "mach_msg_overwrite" => msg::mach_msg_overwrite,

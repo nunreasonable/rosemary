@@ -263,6 +263,7 @@ struct Api {
     SDL_GetModState: Option<unsafe extern "C" fn() -> u16>,
     SDL_GetKeyFromScancode: Option<unsafe extern "C" fn(u32, u16, bool) -> u32>,
     SDL_SetHint: Option<unsafe extern "C" fn(*const c_char, *const c_char) -> bool>,
+    SDL_ResetHint: Option<unsafe extern "C" fn(*const c_char) -> bool>,
     SDL_GetSystemTheme: Option<unsafe extern "C" fn() -> c_int>,
     SDL_GetCurrentVideoDriver: Option<unsafe extern "C" fn() -> *const c_char>,
     SDL_GetWindowProperties: Option<unsafe extern "C" fn(Window) -> PropertiesId>,
@@ -493,6 +494,7 @@ fn api() -> Option<&'static Api> {
             SDL_GetModState,
             SDL_GetKeyFromScancode,
             SDL_SetHint,
+            SDL_ResetHint,
             SDL_GetSystemTheme,
             SDL_GetCurrentVideoDriver,
             SDL_GetWindowProperties,
@@ -3531,6 +3533,36 @@ pub mod audio {
     ) -> Option<AudioStream> {
         // SAFETY: the caller's obligation.
         unsafe { open_device(DEFAULT_PLAYBACK, spec, callback, userdata) }
+    }
+
+    /// `SDL_HINT_AUDIO_DEVICE_SAMPLE_FRAMES`.
+    const HINT_SAMPLE_FRAMES: &std::ffi::CStr = c"SDL_AUDIO_DEVICE_SAMPLE_FRAMES";
+
+    /// As [`open_recording`], with the device running `frames` at a time. The
+    /// hint is global, so it is reset after the open; an environment variable
+    /// still overrides it.
+    ///
+    /// # Safety
+    ///
+    /// As [`open_playback`].
+    pub unsafe fn open_recording_sized(
+        spec: AudioSpec,
+        frames: u32,
+        callback: AudioStreamCallback,
+        userdata: *mut c_void,
+    ) -> Option<AudioStream> {
+        if !init_audio() {
+            return None;
+        }
+        let value = std::ffi::CString::new(frames.to_string()).ok()?;
+        super::video::set_hint(HINT_SAMPLE_FRAMES, &value);
+        // SAFETY: the caller's obligation.
+        let stream = unsafe { open_recording(spec, callback, userdata) };
+        if let Some(reset) = api().and_then(|a| a.SDL_ResetHint) {
+            // SAFETY: a NUL-terminated name.
+            unsafe { reset(HINT_SAMPLE_FRAMES.as_ptr()) };
+        }
+        stream
     }
 
     /// Open the default recording device, converting from whatever it runs at

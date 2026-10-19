@@ -412,6 +412,13 @@ pub fn cpu_brand() -> Option<String> {
     })
 }
 
+/// systemd's machine id, or D-Bus's where it is not installed.
+pub fn host_uuid() -> Option<[u8; 16]> {
+    ["/etc/machine-id", "/var/lib/dbus/machine-id"]
+        .into_iter()
+        .find_map(|path| crate::system::parse_uuid(&std::fs::read_to_string(path).ok()?))
+}
+
 pub fn peer(fd: RawFd) -> Option<Peer> {
     // SAFETY: `fd` is expected to be an open file descriptor
     let fd = unsafe { BorrowedFd::borrow_raw(fd) };
@@ -524,4 +531,21 @@ pub fn xattr_remove_path(
 
 pub fn xattr_is_missing(error: &io::Error) -> bool {
     error.raw_os_error() == Some(libc::ENODATA)
+}
+
+/// What `/sys/class/net/<name>` says carries the interface.
+pub fn link_medium(name: &std::ffi::CStr) -> Option<crate::net::Link> {
+    use crate::net::Link;
+    let dir = std::path::Path::new("/sys/class/net").join(name.to_str().ok()?);
+    if dir.join("wireless").exists() || dir.join("phy80211").exists() {
+        return Some(Link::Wifi);
+    }
+    let uevent = std::fs::read_to_string(dir.join("uevent")).unwrap_or_default();
+    if uevent.lines().any(|line| line == "DEVTYPE=wwan") {
+        return Some(Link::Cellular);
+    }
+    // Bridges, veths and the like frame as Ethernet too, but only hardware
+    // has a `device`; tunnels and PPP are other ARPHRD kinds.
+    let kind = std::fs::read_to_string(dir.join("type")).ok()?;
+    (kind.trim() == "1" && dir.join("device").exists()).then_some(Link::Wired)
 }

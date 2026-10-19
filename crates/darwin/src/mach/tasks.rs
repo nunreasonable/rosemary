@@ -6,7 +6,9 @@
 //! Only guests are tasks: a host process is not part of the system a guest
 //! can see, and `task_for_pid` on one fails as it would for a process the
 //! caller may not inspect.
+use std::collections::BTreeMap;
 use std::ffi::c_void;
+use std::sync::{Mutex, MutexGuard};
 
 use super::info::{TimeValue, publish};
 use super::kern::*;
@@ -436,6 +438,77 @@ pub extern "C" fn task_policy_get(
     KERN_INVALID_ARGUMENT
 }
 
+/// Suspend counts of the tasks this process has suspended, by host pid.
+///
+/// Darwin keeps the count in the kernel's task. A host stop signal does not
+/// count, so this process counts for it; a task suspended from two processes
+/// resumes when either one lets go.
+static SUSPENDED: Mutex<BTreeMap<i32, u32>> = Mutex::new(BTreeMap::new());
+
+fn suspended() -> MutexGuard<'static, BTreeMap<i32, u32>> {
+    SUSPENDED.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// `kern_return_t task_suspend(task_t)`
+///
+/// The first suspension stops the process and the rest only count. Suspending
+/// this task stops the caller too, as on Darwin, until another process
+/// resumes it.
+pub extern "C" fn task_suspend(task: Name) -> i32 {
+    let Some(pid) = space::task_pid(task) else {
+        return KERN_INVALID_ARGUMENT;
+    };
+    let pid = crate::process::host_pid(pid);
+    let first = {
+        let mut counts = suspended();
+        let count = counts.entry(pid).or_insert(0);
+        *count += 1;
+        *count == 1
+    };
+    // Signalled outside the lock: stopping this process while holding it
+    // would leave it held for whichever thread runs first after the resume.
+    // SAFETY: `kill` has no memory preconditions.
+    if first && unsafe { libc::kill(pid, libc::SIGSTOP) } != 0 {
+        let mut counts = suspended();
+        if let Some(count) = counts.get_mut(&pid) {
+            *count -= 1;
+            if *count == 0 {
+                counts.remove(&pid);
+            }
+        }
+        return KERN_FAILURE;
+    }
+    KERN_SUCCESS
+}
+
+/// `kern_return_t task_resume(task_t)`
+///
+/// A task with no suspension outstanding is refused, as Darwin refuses it.
+/// The process sees `SIGCONT` when the last one is lifted, which Darwin's
+/// does not.
+pub extern "C" fn task_resume(task: Name) -> i32 {
+    let Some(pid) = space::task_pid(task) else {
+        return KERN_INVALID_ARGUMENT;
+    };
+    let pid = crate::process::host_pid(pid);
+    {
+        let mut counts = suspended();
+        let Some(count) = counts.get_mut(&pid) else {
+            return KERN_FAILURE;
+        };
+        *count -= 1;
+        if *count > 0 {
+            return KERN_SUCCESS;
+        }
+        counts.remove(&pid);
+    }
+    // SAFETY: `kill` has no memory preconditions.
+    match unsafe { libc::kill(pid, libc::SIGCONT) } {
+        0 => KERN_SUCCESS,
+        _ => KERN_FAILURE,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -563,5 +636,40 @@ mod tests {
             unsafe { mach_port_space_basic_info(HOST_SELF, (&raw mut info).cast()) },
             KERN_INVALID_ARGUMENT
         );
+    }
+
+    /// A suspended child stops, a second suspension only counts, and it runs
+    /// again once both are lifted - and not before.
+    #[test]
+    fn a_suspended_task_stops_until_every_suspension_is_lifted() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let pid = child.id() as i32;
+        let task = space::insert_task(pid);
+        let waited = |flag| {
+            let mut status = 0;
+            // SAFETY: a child of this process and a writable status.
+            let rc = unsafe { libc::waitpid(pid, &mut status, flag) };
+            (rc == pid).then_some(status)
+        };
+
+        assert_eq!(task_suspend(task), KERN_SUCCESS);
+        let status = waited(libc::WUNTRACED).unwrap();
+        assert!(libc::WIFSTOPPED(status));
+        assert_eq!(task_suspend(task), KERN_SUCCESS);
+
+        assert_eq!(task_resume(task), KERN_SUCCESS);
+        assert_eq!(waited(libc::WCONTINUED | libc::WNOHANG), None);
+        assert_eq!(task_resume(task), KERN_SUCCESS);
+        let status = waited(libc::WCONTINUED).unwrap();
+        assert!(libc::WIFCONTINUED(status));
+
+        // Nothing is outstanding now.
+        assert_eq!(task_resume(task), KERN_FAILURE);
+        assert_eq!(task_suspend(0xdead_0003), KERN_INVALID_ARGUMENT);
+        child.kill().unwrap();
+        child.wait().unwrap();
     }
 }

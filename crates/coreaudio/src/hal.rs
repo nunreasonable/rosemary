@@ -196,10 +196,21 @@ fn input() -> Option<&'static Device> {
         .as_ref()
 }
 
-/// The recording device's rate, channel count and buffer size in frames, for
-/// an output unit that records through it; `None` without one.
-pub(crate) fn input_shape() -> Option<(f64, u32, u32)> {
-    input().map(|d| (d.sample_rate, d.channels, d.buffer_frames()))
+pub(crate) fn has_input() -> bool {
+    input().is_some()
+}
+
+/// The recording device's format, in the canonical layout.
+pub(crate) fn input_format() -> Option<crate::stream::Format> {
+    input().map(|device| crate::stream::Format {
+        sample_rate: device.sample_rate,
+        channels_per_frame: device.channels,
+        ..crate::stream::Format::default()
+    })
+}
+
+pub(crate) fn input_buffer_frames() -> u32 {
+    input().map_or(512, Device::buffer_frames)
 }
 
 fn device(object: ObjectId) -> Option<&'static Device> {

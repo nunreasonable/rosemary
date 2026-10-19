@@ -614,11 +614,46 @@ pub extern "C" fn proc_pidfdinfo(
     0
 }
 
+/// `WAKEMON_DISABLE`: no wakeups monitor is armed.
+const WAKEMON_DISABLE: i32 = 0x02;
+
+/// `int proc_get_wakemon_params(pid_t pid, int *rate_hz, int *flags)`
+///
+/// Nothing here counts a process's wakeups, so every process reads as one
+/// whose monitor is off - what xnu reports for a task with no limit. Like the
+/// rest of libproc's `rlimit_control` wrappers, it returns the error number
+/// rather than -1.
+///
+/// # Safety
+///
+/// `rate_hz` and `flags` are writable.
+pub unsafe extern "C" fn proc_get_wakemon_params(
+    pid: c_int,
+    rate_hz: *mut i32,
+    flags: *mut i32,
+) -> c_int {
+    let error = if rate_hz.is_null() || flags.is_null() {
+        libc::EFAULT
+    } else if !crate::process::visible(pid) {
+        libc::ESRCH
+    } else {
+        // SAFETY: the caller's out-parameters.
+        unsafe {
+            rate_hz.write(-1);
+            flags.write(WAKEMON_DISABLE);
+        }
+        return 0;
+    };
+    crate::errno::set(error);
+    crate::errno::from_host(error)
+}
+
 exports::exports! {
     functions {
         "proc_listpidspath" => proc_listpidspath,
         "proc_pidfdinfo" => proc_pidfdinfo,
         "kpersona_pidinfo" => kpersona_pidinfo,
+        "proc_get_wakemon_params" => proc_get_wakemon_params,
         "proc_pidinfo" => proc_pidinfo,
         "proc_name" => proc_name,
         "proc_pidpath" => proc_pidpath,
@@ -699,5 +734,15 @@ mod tests {
         };
         assert_eq!(ask(0, 999), 0);
         assert_eq!(ask(1, PROC_PIDTASKINFO), 0, "not this process");
+    }
+
+    #[test]
+    fn the_wakeups_monitor_reads_as_disabled() {
+        let (mut rate, mut flags) = (0, 0);
+        let me = crate::process::guest_pid(starnix::process::me());
+        let rc = unsafe { proc_get_wakemon_params(me, &mut rate, &mut flags) };
+        assert_eq!((rc, rate, flags), (0, -1, WAKEMON_DISABLE));
+        let rc = unsafe { proc_get_wakemon_params(me, std::ptr::null_mut(), &mut flags) };
+        assert_eq!(rc, crate::errno::from_host(libc::EFAULT));
     }
 }

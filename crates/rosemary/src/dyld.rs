@@ -1611,6 +1611,12 @@ static NATIVE_SYMBOL_COUNT: AtomicUsize = AtomicUsize::new(0);
 /// `RTLD_GLOBAL` and never closed, for the reason the native provider's own fallback
 /// is: closing it would dangle every pointer already written into a guest slot.
 fn open_native(path: &str) -> Option<u64> {
+    // Every symbol behind such a handle is the host's own, which is exactly what
+    // `darwin::strict` withdraws; a guest `dlopen("libstdc++.so.6")` must not
+    // undo it at run time.
+    if darwin::strict::enabled() {
+        return None;
+    }
     if crate::frameworks::no_host_frameworks() && crate::frameworks::is_host_framework_path(path) {
         return None;
     }
@@ -1742,6 +1748,62 @@ fn set_error(message: String) {
 
 fn clear_error() {
     *ERROR.lock().unwrap_or_else(|e| e.into_inner()) = None;
+}
+
+/// `NSLinkEditErrors` values the `NS*` image calls report.
+const NS_LINK_EDIT_FILE_ACCESS: i32 = 0;
+const NS_LINK_EDIT_FILE_FORMAT: i32 = 1;
+const NS_LINK_EDIT_UNDEFINED: i32 = 7;
+
+/// The failure `NSLinkEditError` reports, kept until the next one: the strings
+/// it hands out stay valid that long, as dyld's static buffers do.
+struct LinkEditError {
+    kind: i32,
+    errno: i32,
+    file: CString,
+    message: CString,
+}
+
+static LINK_EDIT_ERROR: Mutex<Option<LinkEditError>> = Mutex::new(None);
+
+fn set_link_edit_error(kind: i32, errno: i32, file: &str, message: String) {
+    *LINK_EDIT_ERROR.lock().unwrap_or_else(|e| e.into_inner()) = Some(LinkEditError {
+        kind,
+        errno,
+        file: CString::new(file).unwrap_or_default(),
+        message: CString::new(message).unwrap_or_default(),
+    });
+}
+
+/// The handle an already-loaded image at `path` has, without loading it.
+fn loaded_handle(path: &str) -> Option<u64> {
+    if let Some(library) = synthetic::find(path) {
+        return Some(library.handle);
+    }
+    let resolved = resolve_path(path)?;
+    let main = MAIN_HEADER.load(Ordering::Acquire);
+    if main != 0
+        && let Some((executable, _)) = EXECUTABLE.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        && std::fs::canonicalize(&executable).is_ok_and(|p| p.to_string_lossy() == resolved)
+    {
+        return Some(main);
+    }
+    find(|i| (i.path == resolved && !i.unloading.load(Ordering::Acquire)).then_some(i.handle))
+}
+
+/// The address the Mach-O symbol `mangled` has in the image at `header`.
+///
+/// The `NS*` calls take the linker's spelling, underscore included; a name
+/// without one names nothing, as under dyld.
+fn lookup_in_image(header: u64, mangled: &str) -> Option<u64> {
+    let name = mangled.strip_prefix('_')?;
+    // `lookup` treats an unknown handle as a global search, which would let the
+    // executable's header answer with any image's symbol.
+    if header != 0 && header == MAIN_HEADER.load(Ordering::Acquire) {
+        let main = main_exports()?;
+        return main.exports.get(mangled)?.address(main.slide);
+    }
+    lookup(header, name)
 }
 
 /// The `dyld_unwind_sections` this runtime fills in for one of its own images.
@@ -2340,7 +2402,11 @@ pub(crate) mod entry {
             }
             // No Mach-O for this backend on disk under that name.
             Err(reason) => super::open_native(&path).or_else(|| {
-                super::set_error(format!("dlopen({path}): {reason}"));
+                let strict = match darwin::strict::enabled() {
+                    true => format!(" (and {} refuses the host's loader)", darwin::strict::VAR),
+                    false => String::new(),
+                };
+                super::set_error(format!("dlopen({path}): {reason}{strict}"));
                 None
             }),
         };
@@ -2446,11 +2512,195 @@ pub(crate) mod entry {
         // Non-zero on success, unlike the rest of `<dlfcn.h>`.
         1
     }
+
+    /// What dyld does when an `NS*` call fails without its `RETURN_ON_ERROR`
+    /// option: the caller asked not to be told, so there is nobody to tell.
+    fn halt(message: &str) -> ! {
+        eprintln!("dyld: {message}");
+        std::process::abort();
+    }
+
+    /// `const struct mach_header *NSAddImage(const char *image_name, uint32_t options)`
+    ///
+    /// The old spelling of `dlopen`, which XPCOM's standalone glue still uses to
+    /// load `XUL`. An image added this way is never unloaded: there is no call
+    /// to remove one.
+    ///
+    /// # Safety
+    ///
+    /// `name` is null or NUL-terminated.
+    pub unsafe extern "C" fn ns_add_image(name: *const c_char, options: u32) -> u64 {
+        const RETURN_ON_ERROR: u32 = 0x1;
+        const RETURN_ONLY_IF_LOADED: u32 = 0x4;
+        if name.is_null() {
+            return 0;
+        }
+        // SAFETY: the caller states `name` is NUL-terminated.
+        let path = unsafe { CStr::from_ptr(name) }
+            .to_string_lossy()
+            .into_owned();
+        if crate::shims::vmmap::tracing() {
+            eprintln!("rosemary: NSAddImage({path:?}, options {options:#x})");
+        }
+        // Not loaded is an answer here, not a failure.
+        if options & RETURN_ONLY_IF_LOADED != 0 {
+            return super::loaded_handle(&path).unwrap_or(0);
+        }
+        match super::open(&path) {
+            Ok(handle) => {
+                super::pin(handle);
+                handle
+            }
+            Err(reason) => {
+                let (kind, errno) = match super::resolve_path(&path) {
+                    Some(_) => (super::NS_LINK_EDIT_FILE_FORMAT, 0),
+                    None => (super::NS_LINK_EDIT_FILE_ACCESS, libc::ENOENT),
+                };
+                let message = format!("NSAddImage({path}): {reason}");
+                if options & RETURN_ON_ERROR == 0 {
+                    halt(&message);
+                }
+                super::set_link_edit_error(kind, errno, &path, message);
+                0
+            }
+        }
+    }
+
+    /// `NSSymbol NSLookupSymbolInImage(const struct mach_header *image,
+    /// const char *symbolName, uint32_t options)`
+    ///
+    /// An `NSSymbol` is the symbol's address: nothing else is ever asked of one.
+    ///
+    /// # Safety
+    ///
+    /// `name` is null or NUL-terminated.
+    pub unsafe extern "C" fn ns_lookup_symbol_in_image(
+        image: u64,
+        name: *const c_char,
+        options: u32,
+    ) -> u64 {
+        const RETURN_ON_ERROR: u32 = 0x4;
+        if name.is_null() {
+            return 0;
+        }
+        // SAFETY: the caller states `name` is NUL-terminated.
+        let name = unsafe { CStr::from_ptr(name) }
+            .to_string_lossy()
+            .into_owned();
+        if let Some(addr) = super::lookup_in_image(image, &name) {
+            return addr;
+        }
+        let message = format!("NSLookupSymbolInImage({image:#x}, {name}): symbol not found");
+        if options & RETURN_ON_ERROR == 0 {
+            halt(&message);
+        }
+        if crate::shims::vmmap::tracing() {
+            eprintln!("rosemary: {message}");
+        }
+        super::set_link_edit_error(super::NS_LINK_EDIT_UNDEFINED, 0, "", message);
+        0
+    }
+
+    /// `bool NSIsSymbolNameDefined(const char *symbolName)`
+    ///
+    /// # Safety
+    ///
+    /// `name` is null or NUL-terminated.
+    pub unsafe extern "C" fn ns_is_symbol_name_defined(name: *const c_char) -> bool {
+        if name.is_null() {
+            return false;
+        }
+        // SAFETY: the caller states `name` is NUL-terminated.
+        let name = unsafe { CStr::from_ptr(name) }.to_string_lossy();
+        super::lookup_in_image(super::global_handle(), &name).is_some()
+    }
+
+    /// `NSSymbol NSLookupAndBindSymbol(const char *symbolName)`, which dyld
+    /// treats an undefined name as fatal for: the caller was meant to ask
+    /// `NSIsSymbolNameDefined` first.
+    ///
+    /// # Safety
+    ///
+    /// `name` is null or NUL-terminated.
+    pub unsafe extern "C" fn ns_lookup_and_bind_symbol(name: *const c_char) -> u64 {
+        if name.is_null() {
+            halt("NSLookupAndBindSymbol(NULL)");
+        }
+        // SAFETY: the caller states `name` is NUL-terminated.
+        let name = unsafe { CStr::from_ptr(name) }.to_string_lossy();
+        super::lookup_in_image(super::global_handle(), &name).unwrap_or_else(|| {
+            halt(&format!(
+                "NSLookupAndBindSymbol({name}): symbol not defined"
+            ))
+        })
+    }
+
+    /// `void *NSAddressOfSymbol(NSSymbol symbol)`, the identity: see
+    /// [`ns_lookup_symbol_in_image`].
+    pub extern "C" fn ns_address_of_symbol(symbol: u64) -> u64 {
+        symbol
+    }
+
+    /// `void NSLinkEditError(NSLinkEditErrors *c, int *errorNumber,
+    /// const char **fileName, const char **errorString)`
+    ///
+    /// The strings stay valid until the next failure replaces them.
+    ///
+    /// # Safety
+    ///
+    /// Each out-parameter is null or writable.
+    pub unsafe extern "C" fn ns_link_edit_error(
+        kind: *mut i32,
+        errno: *mut i32,
+        file: *mut *const c_char,
+        message: *mut *const c_char,
+    ) {
+        let error = super::LINK_EDIT_ERROR
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let (k, n, f, m) = match error.as_ref() {
+            Some(e) => (e.kind, e.errno, e.file.as_ptr(), e.message.as_ptr()),
+            None => (0, 0, c"".as_ptr(), c"".as_ptr()),
+        };
+        // SAFETY: the caller states each is null or writable.
+        unsafe {
+            if !kind.is_null() {
+                kind.write(k);
+            }
+            if !errno.is_null() {
+                errno.write(n);
+            }
+            if !file.is_null() {
+                file.write(f);
+            }
+            if !message.is_null() {
+                message.write(m);
+            }
+        }
+    }
 }
 
 /// Every name [`provider`] defines, and the function it binds to.
-fn entries() -> [(&'static str, *const ()); 19] {
+fn entries() -> [(&'static str, *const ()); 25] {
     [
+        ("_NSAddImage", entry::ns_add_image as *const ()),
+        (
+            "_NSLookupSymbolInImage",
+            entry::ns_lookup_symbol_in_image as *const (),
+        ),
+        (
+            "_NSIsSymbolNameDefined",
+            entry::ns_is_symbol_name_defined as *const (),
+        ),
+        (
+            "_NSLookupAndBindSymbol",
+            entry::ns_lookup_and_bind_symbol as *const (),
+        ),
+        (
+            "_NSAddressOfSymbol",
+            entry::ns_address_of_symbol as *const (),
+        ),
+        ("_NSLinkEditError", entry::ns_link_edit_error as *const ()),
         ("_dlopen", entry::dlopen as *const ()),
         ("_dlsym", entry::dlsym as *const ()),
         ("_dlclose", entry::dlclose as *const ()),
@@ -2530,11 +2780,11 @@ mod tests {
         let host = unsafe {
             libc::dlsym(
                 handle as *mut libc::c_void,
-                c"CGLChoosePixelFormat".as_ptr(),
+                c"CGLDescribePixelFormat".as_ptr(),
             )
         };
         assert!(!host.is_null());
-        assert!(lookup(handle, "CGLChoosePixelFormat").is_none());
+        assert!(lookup(handle, "CGLDescribePixelFormat").is_none());
         assert!(lookup(handle, "gluPerspective").is_none());
         let expected = appkit::symbol("CGLGetCurrentContext").unwrap();
         assert_eq!(
@@ -2610,6 +2860,7 @@ mod tests {
         for name in [
             "_dlopen",
             "_dlclose",
+            "_NSAddImage",
             "__dyld_register_func_for_add_image",
             "__dyld_register_func_for_remove_image",
         ] {

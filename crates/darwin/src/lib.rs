@@ -54,7 +54,6 @@ pub mod fts;
 pub mod getopt;
 pub mod glob;
 pub mod heap;
-pub mod hostid;
 pub mod humanize;
 pub mod icu;
 pub mod idle;
@@ -217,7 +216,7 @@ fn load_host_libraries() {
 /// [`divergent`], or nothing anywhere defines it - and [`refusal`] says which.
 pub fn symbol(symbol: &str) -> Option<u64> {
     let name = base_name(symbol);
-    if let Some(addr) = implemented(name) {
+    if let Some(addr) = implemented_variant(symbol) {
         return Some(addr);
     }
     if divergent::contains(name)
@@ -242,7 +241,7 @@ fn stdio_refuses(name: &str) -> bool {
 /// mode asks for, not the fallback it withdraws - so it keeps its answer.
 pub fn shim_symbol(symbol: &str) -> Option<u64> {
     let name = base_name(symbol);
-    if let Some(addr) = implemented(name) {
+    if let Some(addr) = implemented_variant(symbol) {
         return Some(addr);
     }
     if divergent::contains(name) || !host_fallback_allowed(name) || stdio_refuses(name) {
@@ -376,7 +375,6 @@ static NONPORTABLE_MODULES: &[exports::Module] = &[
     termios::MODULE,
     sched::MODULE,
     random::MODULE,
-    hostid::MODULE,
     spi::MODULE,
     ioctl::MODULE,
     ulock::MODULE,
@@ -425,6 +423,18 @@ fn implemented(name: &str) -> Option<u64> {
     registered(name).or_else(|| modules().find_map(|module| (module.symbol)(name)))
 }
 
+/// [`implemented`] for a Mach-O spelling: the exact name first, as the import
+/// resolver tries it, since a module may define a variant apart from its base -
+/// x86-64's unsuffixed `stat` is not `stat$INODE64` - and then the base.
+fn implemented_variant(symbol: &str) -> Option<u64> {
+    let exact = c_name(symbol);
+    let base = base_name(symbol);
+    match exact == base {
+        true => implemented(base),
+        false => implemented(exact).or_else(|| implemented(base)),
+    }
+}
+
 pub fn is_implemented(symbol: &str) -> bool {
     implemented(base_name(symbol)).is_some()
 }
@@ -463,6 +473,9 @@ pub const LIBRARY_NAMES: &[&str] = &[
 pub fn provider() -> machish::resolve::SyntheticDylib {
     // Before the guest's initializers can register an exit handler of their own.
     stdio::register_cleanup();
+    // The zone registry, and its fork handlers ahead of any the guest installs.
+    #[cfg(not(target_os = "macos"))]
+    malloc::init();
     let mut lib = machish::resolve::SyntheticDylib::new("<darwin>");
     lib.flat(true);
     for name in LIBRARY_NAMES {

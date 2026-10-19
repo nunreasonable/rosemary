@@ -1,4 +1,4 @@
-use std::ffi::{CStr, CString, c_char, c_int};
+use std::ffi::{CStr, CString, c_char, c_int, c_void};
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 
@@ -779,9 +779,71 @@ unsafe fn write_back(template: *mut c_char, made: &[u8], room: usize) -> bool {
     true
 }
 
+/// `FSIOC_SYNC_VOLUME`, `_IOW('A', 1, uint32_t)`.
+const FSIOC_SYNC_VOLUME: u64 = 0x8004_4101;
+/// `FSOPT_NOFOLLOW`.
+const FSOPT_NOFOLLOW: u32 = 0x1;
+
+/// `int fsctl(const char *path, unsigned long request, void *data,
+/// unsigned int options)`
+///
+/// An `ioctl` on the volume holding `path`. Only the volume-independent
+/// request, syncing it, is answered; the rest are each file system's own
+/// (APFS snapshots, HFS allocation hints), and a host file system has none of
+/// them, so they fail as a Darwin file system without the request fails.
+///
+/// # Safety
+///
+/// `path` is a NUL-terminated string, and `data` is what `request` says.
+pub unsafe extern "C" fn fsctl(
+    path: *const c_char,
+    request: u64,
+    data: *mut c_void,
+    options: u32,
+) -> c_int {
+    if path.is_null() {
+        crate::errno::set(libc::EFAULT);
+        return -1;
+    }
+    let found = with_fallback(path, |path| {
+        let mut st = std::mem::MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: a host path and a `stat` to fill.
+        let rc = unsafe {
+            match options & FSOPT_NOFOLLOW {
+                0 => libc::stat(path, st.as_mut_ptr()),
+                _ => libc::lstat(path, st.as_mut_ptr()),
+            }
+        };
+        (rc, rc == 0)
+    });
+    if found != 0 {
+        return -1;
+    }
+    match request {
+        FSIOC_SYNC_VOLUME => {
+            // The argument is `FSCTL_SYNC_WAIT` and `FSCTL_SYNC_FULLSYNC`
+            // flags, which Darwin copies in before looking at.
+            if data.is_null() {
+                crate::errno::set(libc::EFAULT);
+                return -1;
+            }
+            // Every volume rather than the one: no portable call syncs a
+            // single file system.
+            // SAFETY: `sync` has no preconditions.
+            unsafe { libc::sync() };
+            0
+        }
+        _ => {
+            crate::errno::set(libc::ENOTTY);
+            -1
+        }
+    }
+}
+
 exports::exports! {
     functions {
         "chdir" => chdir,
+        "fsctl" => fsctl,
         "getcwd" => getcwd,
         "unlink" => unlink,
         "rmdir" => rmdir,
@@ -804,5 +866,31 @@ exports::exports! {
         "mkstemp" => mkstemp,
         "mkdtemp" => mkdtemp,
         "mkdtempat_np" => mkdtempat_np,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fsctl_syncs_a_volume_and_refuses_what_the_file_system_would() {
+        let mut flags = 0u32;
+        let data = (&raw mut flags).cast();
+        let tmp = c"/tmp";
+        assert_eq!(
+            unsafe { fsctl(tmp.as_ptr(), FSIOC_SYNC_VOLUME, data, 0) },
+            0
+        );
+
+        assert_eq!(unsafe { fsctl(tmp.as_ptr(), 0xc008_6801, data, 0) }, -1);
+        assert_eq!(crate::errno::get(), libc::ENOTTY);
+
+        let missing = c"/nonexistent-rosemary-fsctl";
+        assert_eq!(
+            unsafe { fsctl(missing.as_ptr(), FSIOC_SYNC_VOLUME, data, 0) },
+            -1
+        );
+        assert_eq!(crate::errno::get(), libc::ENOENT);
     }
 }

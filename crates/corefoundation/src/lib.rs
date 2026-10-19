@@ -51,12 +51,13 @@ pub fn bootstrap() {
 exports::exports! {
     functions {
         "CFRetain" => api::CFRetain,
-        "CFMakeCollectable" => api::CFMakeCollectable,
         "CFMachPortCreateRunLoopSource" => api::CFMachPortCreateRunLoopSource,
         "CFRelease" => api::CFRelease,
         "CFAutorelease" => api::CFAutorelease,
+        "CFMakeCollectable" => api::CFMakeCollectable,
         "CFGetRetainCount" => api::CFGetRetainCount,
         "CFGetTypeID" => api::CFGetTypeID,
+        "CFCopyDescription" => api::CFCopyDescription,
         "CFEqual" => api::CFEqual,
         "CFHash" => api::CFHash,
         "CFAllocatorGetTypeID" => api::CFAllocatorGetTypeID,
@@ -84,7 +85,6 @@ exports::exports! {
         "CFStringHasSuffix" => api::CFStringHasSuffix,
         "CFNullGetTypeID" => api::CFNullGetTypeID,
         "CFBagGetTypeID" => api::CFBagGetTypeID,
-        "CFCopyDescription" => api::CFCopyDescription,
         "CFCopyTypeIDDescription" => api::CFCopyTypeIDDescription,
         "CFStringCompareWithOptions" => api::CFStringCompareWithOptions,
         "CFStringFindWithOptions" => api::CFStringFindWithOptions,
@@ -320,6 +320,16 @@ pub fn data_symbols() -> Vec<(String, u64)> {
             "_kCFTypeDictionaryKeyCallBacks".to_string(),
             &callbacks::TYPE_KEY_CALLBACKS as *const _ as usize as u64,
         ),
+        // `CFSetCallBacks` has the dictionary key callbacks' layout: retain,
+        // release, description, equality and hash.
+        (
+            "_kCFTypeSetCallBacks".to_string(),
+            &callbacks::TYPE_KEY_CALLBACKS as *const _ as usize as u64,
+        ),
+        (
+            "_kCFCopyStringSetCallBacks".to_string(),
+            &callbacks::COPY_STRING_KEY_CALLBACKS as *const _ as usize as u64,
+        ),
         (
             "_kCFCopyStringDictionaryKeyCallBacks".to_string(),
             &callbacks::COPY_STRING_KEY_CALLBACKS as *const _ as usize as u64,
@@ -336,6 +346,7 @@ pub fn data_symbols() -> Vec<(String, u64)> {
         "_kCFAllocatorDefault",
         "_kCFAllocatorSystemDefault",
         "_kCFAllocatorMalloc",
+        "_kCFAllocatorMallocZone",
         "_kCFAllocatorNull",
     ] {
         out.push((name.to_string(), base::global_cell(name, 0)));
@@ -417,6 +428,24 @@ static KEY_STRINGS: &[(&str, &str)] = &[
     ("__kCFSystemVersionProductVersionKey", "ProductVersion"),
     ("__kCFSystemVersionBuildVersionKey", "ProductBuildVersion"),
     ("__kCFSystemVersionProductVersionExtraKey", "ProductVersionExtra"),
+    // CFError.c's user-info keys, which are Foundation's.
+    ("_kCFErrorDescriptionKey", "NSDescription"),
+    ("_kCFErrorLocalizedDescriptionKey", "NSLocalizedDescription"),
+    (
+        "_kCFErrorLocalizedFailureReasonKey",
+        "NSLocalizedFailureReason",
+    ),
+    (
+        "_kCFErrorLocalizedRecoverySuggestionKey",
+        "NSLocalizedRecoverySuggestion",
+    ),
+    ("_kCFErrorUnderlyingErrorKey", "NSUnderlyingError"),
+    ("_kCFErrorURLKey", "NSErrorFailingURLKey"),
+    ("_kCFErrorFilePathKey", "NSFilePath"),
+    ("_kCFErrorDomainPOSIX", "NSPOSIXErrorDomain"),
+    ("_kCFErrorDomainOSStatus", "NSOSStatusErrorDomain"),
+    ("_kCFErrorDomainMach", "NSMachErrorDomain"),
+    ("_kCFErrorDomainCocoa", "NSCocoaErrorDomain"),
     ("_kCFBundleIdentifierKey", "CFBundleIdentifier"),
     ("_kCFBundleNameKey", "CFBundleName"),
     ("_kCFBundleVersionKey", "CFBundleVersion"),

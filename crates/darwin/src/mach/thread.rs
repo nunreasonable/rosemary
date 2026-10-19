@@ -429,6 +429,72 @@ pub extern "C" fn thread_policy_set(
     }
 }
 
+const THREAD_EXTENDED_POLICY: u32 = 1;
+const THREAD_TIME_CONSTRAINT_POLICY: u32 = 2;
+const THREAD_PRECEDENCE_POLICY: u32 = 3;
+const THREAD_AFFINITY_POLICY: u32 = 4;
+const THREAD_LATENCY_QOS_POLICY: u32 = 7;
+const THREAD_THROUGHPUT_QOS_POLICY: u32 = 8;
+
+/// xnu's `std_quantum` in `mach_absolute_time` ticks, which are nanoseconds
+/// here; a timeshare thread's constraint is one quantum and its computation
+/// half of one.
+const STD_QUANTUM: u32 = 10_000_000;
+
+/// `kern_return_t thread_policy_get(thread_act_t, thread_policy_flavor_t,
+/// thread_policy_t, mach_msg_type_number_t *, boolean_t *)`
+///
+/// [`thread_policy_set`] keeps nothing, so every thread reads back as a fresh
+/// timeshare thread would. `get_default` is set where xnu sets it for such a
+/// thread: the time-constraint and affinity flavours.
+///
+/// # Safety
+///
+/// `count` and `get_default` are writable, and `info` is writable for
+/// `*count` 32-bit words.
+pub unsafe extern "C" fn thread_policy_get(
+    thread: Name,
+    flavor: u32,
+    info: *mut u32,
+    count: *mut u32,
+    get_default: *mut u32,
+) -> i32 {
+    if space::thread_of(thread).is_none() {
+        return KERN_INVALID_ARGUMENT;
+    }
+    if info.is_null() || count.is_null() || get_default.is_null() {
+        return KERN_INVALID_ARGUMENT;
+    }
+    let (words, defaulted): (&[u32], bool) = match flavor {
+        // `timeshare`.
+        THREAD_EXTENDED_POLICY => (&[1], false),
+        // `period`, `computation`, `constraint`, `preemptible`.
+        THREAD_TIME_CONSTRAINT_POLICY => (&[0, STD_QUANTUM / 2, STD_QUANTUM, 1], true),
+        // `importance`.
+        THREAD_PRECEDENCE_POLICY => (&[0], false),
+        // `THREAD_AFFINITY_TAG_NULL`.
+        THREAD_AFFINITY_POLICY => (&[0], true),
+        // `LATENCY_QOS_TIER_UNSPECIFIED` and its throughput counterpart.
+        THREAD_LATENCY_QOS_POLICY | THREAD_THROUGHPUT_QOS_POLICY => (&[0], false),
+        _ => return KERN_INVALID_ARGUMENT,
+    };
+    // SAFETY: the caller's out-parameters.
+    unsafe {
+        if (*count as usize) < words.len() {
+            // xnu answers a short extended-policy buffer by writing nothing.
+            return match flavor {
+                THREAD_EXTENDED_POLICY => KERN_SUCCESS,
+                _ => KERN_INVALID_ARGUMENT,
+            };
+        }
+        std::ptr::copy_nonoverlapping(words.as_ptr(), info, words.len());
+        if defaulted {
+            get_default.write(1);
+        }
+    }
+    KERN_SUCCESS
+}
+
 /// Run `f` on the saved context of `thread`, which must be suspended.
 fn with_context(thread: Name, f: impl FnOnce(&mut starnix::signal::Context, &Slot) -> i32) -> i32 {
     let Some(tid) = local_thread(thread) else {
@@ -717,6 +783,57 @@ mod state {
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicU64;
+
+    /// Whatever `thread_policy_set` was given, a thread reads back as a
+    /// timeshare thread with the default time constraint.
+    #[test]
+    fn a_thread_reports_the_default_timeshare_policy() {
+        let me = crate::mach::task::mach_thread_self();
+        let mut info = [u32::MAX; 4];
+        let mut count = 4;
+        let mut default = 0;
+        let rc = unsafe {
+            thread_policy_get(
+                me,
+                THREAD_TIME_CONSTRAINT_POLICY,
+                info.as_mut_ptr(),
+                &mut count,
+                &mut default,
+            )
+        };
+        assert_eq!(rc, KERN_SUCCESS);
+        assert_eq!(info, [0, STD_QUANTUM / 2, STD_QUANTUM, 1]);
+        assert_eq!(default, 1);
+
+        let mut info = [0u32; 1];
+        let mut count = 1;
+        let mut default = 0;
+        let rc = unsafe {
+            thread_policy_get(
+                me,
+                THREAD_EXTENDED_POLICY,
+                info.as_mut_ptr(),
+                &mut count,
+                &mut default,
+            )
+        };
+        assert_eq!(rc, KERN_SUCCESS);
+        assert_eq!((info[0], default), (1, 0));
+
+        // Too short for the flavour, and a flavour that does not exist.
+        let rc = unsafe {
+            thread_policy_get(
+                me,
+                THREAD_TIME_CONSTRAINT_POLICY,
+                info.as_mut_ptr(),
+                &mut count,
+                &mut default,
+            )
+        };
+        assert_eq!(rc, KERN_INVALID_ARGUMENT);
+        let rc = unsafe { thread_policy_get(me, 99, info.as_mut_ptr(), &mut count, &mut default) };
+        assert_eq!(rc, KERN_INVALID_ARGUMENT);
+    }
 
     /// A thread spinning on a counter stops advancing it while suspended, its
     /// state names a stack pointer inside its own stack, and it carries on

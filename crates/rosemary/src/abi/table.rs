@@ -400,6 +400,8 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("CFBundleGetMainBundle", P),
     sig!("CFBundleLoadExecutable", U8, P),
     sig!("CFBundleGetFunctionPointerForName", P, P, P),
+    sig!("CFBundleGetDataPointerForName", P, P, P),
+    sig!("CFBundleGetBundleWithIdentifier", P, P),
     sig!("CFBundleGetVersionNumber", U32, P),
     sig!("CFBundleGetValueForInfoDictionaryKey", P, P, P),
     sig!("CFStringGetCharactersPtr", P, P),
@@ -619,6 +621,8 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     // `CFStringCompareFlags` is a `CFOptionFlags` - both 64-bit on LP64.
     sig!("CFStringCompare", I64, P, P, U64),
     sig!("CFCopyDescription", P, P),
+    sig!("CFErrorCopyDescription", P, P),
+    sig!("CFMakeCollectable", P, P),
     sig!("CFCopyTypeIDDescription", P, U64),
     sig!("CFStringCompareWithOptions", I64, P, P, I64, I64, U64),
     // `Boolean CFStringFindWithOptions(CFStringRef, CFStringRef, CFRange,
@@ -764,6 +768,7 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("CGContextSetTextDrawingMode", V, P, I32),
     sig!("CGContextSetGrayFillColor", V, P, F64, F64),
     sig!("CGContextSetShouldSmoothFonts", V, P, BOOL),
+    sig!("CGDisplayBitsPerPixel", U64, U32),
     sig!("CGDisplayCopyAllDisplayModes", P, U32, P),
     sig!("CGDisplayCopyDisplayMode", P, U32),
     // Seven floats and a flag, and the `boolean_t` at the end is the argument
@@ -779,11 +784,7 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("CGDisplayIsOnline", I32, U32),
     sig!("CGDisplayIsAsleep", I32, U32),
     sig!("CGDisplaySerialNumber", U32, U32),
-    sig!("CGDisplayRegisterReconfigurationCallback", I32, P, P),
-    sig!("CGDisplayRemoveReconfigurationCallback", I32, P, P),
     sig!("CGDisplayPrimaryDisplay", U32, U32),
-    sig!("CGDisplayRelease", I32, U32),
-    sig!("CGDisplayRotation", F64, U32),
     sig!("CGDisplayMirrorsDisplay", U32, U32),
     sig!("CGDisplayModeCopyPixelEncoding", P, P),
     sig!("CGDisplayModeGetHeight", U64, P),
@@ -967,6 +968,25 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("FFEffectDownload", I32, P),
     sig!("FFEffectUnload", I32, P),
     sig!("FFDeviceGetForceFeedbackState", I32, P, P),
+    //
+    // Network.framework's path monitor. The three block-taking calls are
+    // shimmed in `crate::shims::block`, which thunks the block first.
+    sig!("nw_path_monitor_create", P),
+    sig!("nw_path_monitor_create_with_type", P, I32),
+    sig!("nw_path_monitor_set_queue", V, P, P),
+    sig!("nw_path_monitor_prohibit_interface_type", V, P, I32),
+    sig!("nw_path_monitor_start", V, P),
+    sig!("nw_path_monitor_cancel", V, P),
+    sig!("nw_path_get_status", I32, P),
+    sig!("nw_path_is_equal", BOOL, P, P),
+    sig!("nw_path_uses_interface_type", BOOL, P, I32),
+    sig!("nw_path_is_expensive", BOOL, P),
+    sig!("nw_path_is_constrained", BOOL, P),
+    sig!("nw_interface_get_type", I32, P),
+    sig!("nw_interface_get_name", P, P),
+    sig!("nw_interface_get_index", U32, P),
+    sig!("nw_retain", P, P),
+    sig!("nw_release", V, P),
     sig!("CVDisplayLinkCreateWithActiveCGDisplays", I32, P),
     sig!("CVDisplayLinkCreateWithCGDisplay", I32, U32, P),
     sig!("CVDisplayLinkGetActualOutputVideoRefreshPeriod", F64, P),
@@ -1601,6 +1621,13 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     cbsig!([0], "_dyld_register_func_for_remove_image", V, P),
     sig!("_dyld_get_image_name", P, U32),
     sig!("_dyld_find_unwind_sections", BOOL, P, P),
+    // Initializers run inside `NSAddImage`, as inside `dlopen`.
+    rsig!("NSAddImage", P, P, U32),
+    sig!("NSAddressOfSymbol", P, P),
+    sig!("NSIsSymbolNameDefined", BOOL, P),
+    sig!("NSLinkEditError", V, P, P, P, P),
+    sig!("NSLookupAndBindSymbol", P, P),
+    sig!("NSLookupSymbolInImage", P, P, P, U32),
     sig!("_exit", V, I32),
     // The Darwin spellings that skip the signal mask, imported as `__longjmp`
     // and `__setjmp`.
@@ -2737,9 +2764,11 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("mach_make_memory_entry_64", I32, U32, P, U64, I32, P, U32),
     sig!("mach_vm_allocate", I32, U32, P, U64, I32),
     sig!("mach_vm_deallocate", I32, U32, U64, U64),
+    sig!("mach_vm_copy", I32, U32, U64, U64, U64),
     sig!("mach_vm_region", I32, U32, P, P, I32, P, P, P),
     sig!("mach_vm_read_overwrite", I32, U32, U64, U64, U64, P),
     sig!("vm_allocate", I32, U32, P, U64, I32),
+    sig!("vm_copy", I32, U32, U64, U64, U64),
     sig!("vm_deallocate", I32, U32, U64, U64),
     sig!("vm_read_overwrite", I32, U32, U64, U64, U64, P),
     sig!("vm_region_64", I32, U32, P, P, I32, P, P, P),
@@ -3831,6 +3860,46 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("malloc_zone_print_ptr_info", V, P),
     sig!("malloc_zone_unregister", V, P),
     sig!("malloc_good_size", U64, U64),
+    sig!("malloc_zone_malloc_with_options", P, P, U64, U64, U64),
+    sig!("malloc_zone_malloc_with_options_np", P, P, U64, U64, U64),
+    sig!("malloc_zone_pressure_relief", U64, P, U64),
+    sig!("malloc_zone_claimed_address", I32, P, P),
+    sig!("malloc_claimed_address", I32, P),
+    sig!("malloc_make_purgeable", V, P),
+    sig!("malloc_make_nonpurgeable", I32, P),
+    sig!("malloc_zone_enable_discharge_checking", I32, P),
+    sig!("malloc_zone_disable_discharge_checking", V, P),
+    sig!("malloc_zone_discharge", V, P, P),
+    sig!("malloc_error_break", V),
+    sig!("malloc_engaged_nano", I32),
+    sig!("malloc_enter_process_memory_limit_warn_mode", V),
+    sig!("malloc_memory_event_handler", V, U64),
+    sig!("reallocarray", P, P, U64, U64),
+    sig!("reallocarrayf", P, P, U64, U64),
+    // The typed-allocation entry points of macOS 14: the untyped call and a
+    // `malloc_type_id_t`, which is a `uint64_t`.
+    sig!("malloc_type_malloc", P, U64, U64),
+    sig!("malloc_type_calloc", P, U64, U64, U64),
+    sig!("malloc_type_free", V, P, U64),
+    sig!("malloc_type_realloc", P, P, U64, U64),
+    sig!("malloc_type_valloc", P, U64, U64),
+    sig!("malloc_type_aligned_alloc", P, U64, U64, U64),
+    sig!("malloc_type_posix_memalign", I32, P, U64, U64, U64),
+    sig!("malloc_type_zone_malloc", P, P, U64, U64),
+    sig!("malloc_type_zone_calloc", P, P, U64, U64, U64),
+    sig!("malloc_type_zone_free", V, P, P, U64),
+    sig!("malloc_type_zone_realloc", P, P, P, U64, U64),
+    sig!("malloc_type_zone_valloc", P, P, U64, U64),
+    sig!("malloc_type_zone_memalign", P, P, U64, U64, U64),
+    sig!(
+        "malloc_type_zone_malloc_with_options",
+        P,
+        P,
+        U64,
+        U64,
+        U64,
+        U64
+    ),
     // `void *valloc(size_t)` and its private counterpart `vfree`, which
     // libsystem_malloc exports without a header.
     sig!("valloc", P, U64),
@@ -4169,6 +4238,20 @@ pub static REFUSED: &[(&str, &str)] = &[
     (
         "malloc_zone_register",
         "registers a zone of guest function pointers the host would call as arm64",
+    ),
+    // `kern_return_t malloc_get_all_zones(task_t, memory_reader_t *,
+    // vm_address_t **, unsigned *)` - the same shape once removed.
+    (
+        "malloc_get_all_zones",
+        "walks another task's zones through a guest reader callback",
+    ),
+    // `struct mstats mstats(void)` - forty bytes returned in memory.
+    ("mstats", AGGREGATE),
+    // `void malloc_zone_enumerate_discharged_pointers(malloc_zone_t *,
+    // void (^)(void *, void *))` - hands a zone a guest block to call.
+    (
+        "malloc_zone_enumerate_discharged_pointers",
+        "passes a guest block to a zone, which would call it as host code",
     ),
 ];
 

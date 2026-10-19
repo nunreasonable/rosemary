@@ -444,6 +444,16 @@ pub fn cpu_brand() -> Option<String> {
     sysctl::string_by_name(c"machdep.cpu.brand_string")
 }
 
+pub fn host_uuid() -> Option<[u8; 16]> {
+    let mut out = [0u8; 16];
+    let wait = libc::timespec {
+        tv_sec: 5,
+        tv_nsec: 0,
+    };
+    // SAFETY: sixteen writable bytes and a timeout.
+    (unsafe { libc::gethostuuid(out.as_mut_ptr(), &wait) } == 0).then_some(out)
+}
+
 pub fn peer(fd: RawFd) -> Option<Peer> {
     let (mut uid, mut gid) = (0, 0);
     // SAFETY: two writable ids.

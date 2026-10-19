@@ -408,7 +408,7 @@ mod tests {
         // The half of Mach that is still refused: reading or changing another
         // task, as opposed to asking the process server about it.
         assert!(contains("mach_vm_write"));
-        assert!(contains("task_suspend"));
+        assert!(contains("task_terminate"));
         for name in ["task_for_pid", "task_threads", "pid_for_task"] {
             assert!(!contains(name), "{name} is answered by the process server");
         }
