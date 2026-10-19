@@ -507,10 +507,10 @@ const MPO_INSERT_SEND_RIGHT: u32 = 0x10;
 /// mach_port_context_t, mach_port_name_t *)`: a receive right, with the
 /// options this runtime has a meaning for.
 ///
-/// A send right asked for with `MPO_INSERT_SEND_RIGHT` is the receive right's
-/// own name, which sends here already: a message to a receive right's name
-/// reaches its queue. The queue limit, the guard and the importance flags
-/// change nothing a single process can observe.
+/// A send right asked for with `MPO_INSERT_SEND_RIGHT` goes under the receive
+/// right's own name, and stays there when the receive right is sent away. The
+/// queue limit, the guard and the importance flags change nothing a single
+/// process can observe.
 ///
 /// # Safety
 ///
@@ -521,9 +521,16 @@ pub unsafe extern "C" fn mach_port_construct(
     _context: u64,
     out: *mut Name,
 ) -> i32 {
-    let _send_too = !options.is_null() && unsafe { (*options).flags } & MPO_INSERT_SEND_RIGHT != 0;
+    // SAFETY: null or the caller's options.
+    let send_too = !options.is_null() && unsafe { (*options).flags } & MPO_INSERT_SEND_RIGHT != 0;
     // SAFETY: the caller's `out`.
-    unsafe { mach_port_allocate(task, RIGHT_RECEIVE, out) }
+    let made = unsafe { mach_port_allocate(task, RIGHT_RECEIVE, out) };
+    if made == KERN_SUCCESS && send_too {
+        // SAFETY: just written by the allocation.
+        let name = unsafe { out.read() };
+        with(|space| *space.sends.entry(name).or_default() += 1);
+    }
+    made
 }
 
 /// `kern_return_t mach_port_destruct(ipc_space_t, mach_port_name_t,
@@ -536,6 +543,7 @@ pub extern "C" fn mach_port_destruct(task: Name, name: Name, _srdelta: i32, _gua
     with(|space| match space.names.get(&name) {
         Some(Right::Receive(_)) => {
             space.names.remove(&name);
+            space.sends.remove(&name);
             KERN_SUCCESS
         }
         Some(_) => KERN_INVALID_RIGHT,
@@ -1052,5 +1060,26 @@ mod tests {
         assert!(receiver(name).is_some(), "the right was put back");
         drop(held);
         assert!(move_receive(name).is_ok());
+    }
+
+    /// Chromium makes a channel's port with its send right under one name,
+    /// sends the receive right to the child and keeps sending on that name.
+    #[test]
+    fn a_constructed_send_right_outlives_its_receive_right_moving() {
+        let options = PortOptions {
+            flags: MPO_INSERT_SEND_RIGHT,
+            queue_limit: 0,
+            reserved: [0; 2],
+        };
+        let mut name = MACH_PORT_NULL;
+        // SAFETY: live locals for the options and the out-parameter.
+        let rc = unsafe { mach_port_construct(TASK_SELF, &options, 0, &mut name) };
+        assert_eq!(rc, KERN_SUCCESS);
+        let address = address_of(name).expect("an address");
+        let moved = move_receive(name).expect("the receive right moves");
+        assert_eq!(moved.address(), address);
+        assert_eq!(address_of(name), Some(address), "the name still sends to it");
+        assert_eq!(mach_port_deallocate(TASK_SELF, name), KERN_SUCCESS);
+        assert_eq!(address_of(name), None, "and that was its last reference");
     }
 }

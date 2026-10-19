@@ -89,6 +89,8 @@ mod refkind {
     /// Out-of-line memory: `address` bytes of the memory file at `fd_index`,
     /// which the receiver maps as its own copy.
     pub const OOL: u8 = 6;
+    /// A send right to a task, which `address` names by its host pid.
+    pub const TASK: u8 = 7;
 }
 
 #[derive(Clone, Copy)]
@@ -215,6 +217,7 @@ impl Reference {
                 None => MACH_PORT_DEAD,
             },
             refkind::DEAD => MACH_PORT_DEAD,
+            refkind::TASK => space::insert_task(self.address as i32),
             refkind::MEMORY | refkind::FILE => {
                 let Some(fd) = usize::try_from(self.fd_index).ok().and_then(|i| message.take_fd(i))
                 else {
@@ -359,6 +362,25 @@ fn export(name: Name, disposition: u32) -> Result<(Reference, Option<Pending>), 
             Some(Pending::Backed {
                 file,
                 moved: (disposition == MOVE_SEND).then_some(name),
+            }),
+        ));
+    }
+    // A task port has no queue here either: the receiver gets its own name
+    // for the same pid, as `task_for_pid` would have given it.
+    if let Some(pid) = space::task_pid(name) {
+        if !matches!(disposition, MAKE_SEND | COPY_SEND | MOVE_SEND) {
+            return Err(MACH_SEND_INVALID_RIGHT);
+        }
+        return Ok((
+            Reference {
+                kind: refkind::TASK,
+                disposition: MOVE_SEND as u8,
+                address: pid as u64,
+                ..Reference::NONE
+            },
+            Some(match disposition {
+                MOVE_SEND => Pending::Moved(name),
+                _ => Pending::Copied,
             }),
         ));
     }
@@ -1098,7 +1120,7 @@ unsafe fn trace(what: &str, msg: *const u8, rc: i32) {
     // SAFETY: the caller's header.
     let header: [u32; 6] = unsafe { core::ptr::read_unaligned(msg.cast()) };
     let mut kinds = String::new();
-    if rc == MACH_MSG_SUCCESS && header[0] & BITS_COMPLEX != 0 {
+    if (rc == MACH_MSG_SUCCESS || what == "send") && header[0] & BITS_COMPLEX != 0 {
         // SAFETY: a complex message's body follows its header.
         let count = unsafe { msg.add(HEADER).cast::<u32>().read_unaligned() }.min(16);
         let mut at = HEADER + BODY;
@@ -1550,6 +1572,48 @@ mod tests {
 
         space::destroy(service);
         space::destroy(arrived);
+    }
+
+    /// A child hands its parent its task port; within one process the name
+    /// that arrives is this task's own.
+    #[test]
+    fn a_task_port_crosses_as_the_same_task() {
+        let port = allocate_receive();
+        let mut descriptor = Vec::new();
+        descriptor.extend_from_slice(&1u32.to_le_bytes());
+        descriptor.extend_from_slice(&space::TASK_SELF.to_le_bytes());
+        descriptor.extend_from_slice(&0u32.to_le_bytes());
+        descriptor.extend_from_slice(&[0, 0, COPY_SEND as u8, DESCRIPTOR_PORT]);
+        let mut sent = message(BITS_COMPLEX, port, MACH_PORT_NULL, 1, &descriptor);
+        // SAFETY: a whole message of the size in its header.
+        let rc = unsafe {
+            mach_msg(
+                sent.as_mut_ptr().cast(),
+                SEND_MSG,
+                sent.len() as u32,
+                0,
+                MACH_PORT_NULL,
+                0,
+                MACH_PORT_NULL,
+            )
+        };
+        assert_eq!(rc, MACH_MSG_SUCCESS);
+        let mut buf = vec![0u8; 128];
+        // SAFETY: 128 writable bytes.
+        let rc = unsafe {
+            mach_msg(
+                buf.as_mut_ptr().cast(),
+                RCV_MSG | RCV_TIMEOUT,
+                0,
+                buf.len() as u32,
+                port,
+                1000,
+                MACH_PORT_NULL,
+            )
+        };
+        assert_eq!(rc, MACH_MSG_SUCCESS);
+        assert_eq!(word(&buf, HEADER + BODY), space::TASK_SELF);
+        space::destroy(port);
     }
 
     /// Out-of-line memory arrives as the receiver's own copy, whatever its
