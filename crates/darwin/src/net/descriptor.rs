@@ -1,5 +1,6 @@
 /// `int close(int fd)`
 pub(crate) unsafe extern "C" fn close(fd: i32) -> i32 {
+    crate::kqueue::descriptor_closing(fd);
     // SAFETY: an integer descriptor; the call touches no caller memory.
     let rc = unsafe { libc::close(fd) };
     if rc == 0 || crate::errno::get() == libc::EBADF {
@@ -21,6 +22,10 @@ unsafe extern "C" fn dup(fd: i32) -> i32 {
 
 /// `int dup2(int from, int to)`
 pub(crate) unsafe extern "C" fn dup2(from: i32, to: i32) -> i32 {
+    if from != to {
+        // `to` is closed first, and its watches with it.
+        crate::kqueue::descriptor_closing(to);
+    }
     // SAFETY: two integer descriptors; the call touches no caller memory.
     let copied = unsafe { libc::dup2(from, to) };
     if copied >= 0 && from != to {

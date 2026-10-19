@@ -129,7 +129,7 @@ pub unsafe extern "C" fn change_fdguard_np(
 /// `int guarded_close_np(int fd, const guardid_t *)`.
 pub unsafe extern "C" fn guarded_close_np(fd: c_int, _guard: *const u64) -> c_int {
     // SAFETY: closing the caller's descriptor, which is the call's purpose.
-    unsafe { libc::close(fd) }
+    unsafe { crate::net::descriptor::close(fd) }
 }
 
 /// `int fileport_makeport(int fd, fileport_t *port)`: a send right standing

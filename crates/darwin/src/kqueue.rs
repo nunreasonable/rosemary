@@ -993,6 +993,47 @@ fn register_waker(fd: c_int) -> Result<(), c_int> {
     Err(libc::ENOMEM)
 }
 
+/// `fd` is about to close: drop every registration that watches it, as
+/// Darwin does on `close`.
+///
+/// Before the close, because the host watches the open file rather than the
+/// number. A registration left behind keeps that file in the epoll set as long
+/// as another descriptor - a forked child's copy - holds it open, reporting it
+/// under a number that by then names something else, while the descriptor
+/// newly given that number is never watched at all.
+pub(crate) fn descriptor_closing(fd: c_int) {
+    if fd < 0 {
+        return;
+    }
+    let all: Vec<_> = queues()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .filter(|(queue, _)| **queue != fd)
+        .map(|(_, state)| Arc::clone(state))
+        .collect();
+    for state in all {
+        let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
+        let watched: Vec<(usize, i16)> = state
+            .registrations
+            .keys()
+            .filter(|(ident, filter)| {
+                *ident == fd as usize && matches!(*filter, EVFILT_READ | EVFILT_WRITE)
+            })
+            .copied()
+            .collect();
+        if watched.is_empty() {
+            continue;
+        }
+        let before = interest_for(&state.registrations, fd);
+        for key in watched {
+            state.registrations.remove(&key);
+        }
+        let after = interest_for(&state.registrations, fd);
+        let _ = state.backend.update(fd, before, after);
+    }
+}
+
 /// Before the descriptor closes, so its number is not written once it names
 /// something else.
 fn forget_waker(fd: c_int) {
@@ -1367,12 +1408,60 @@ fn poll_set(
 /// How many bytes can be read from `fd`, which is what `EVFILT_READ` reports as
 /// its `data` and what a caller sizes its next read from.
 fn readable_bytes(fd: c_int) -> isize {
+    if let Some(pending) = pending_connections(fd) {
+        return pending;
+    }
     let mut bytes: c_int = 0;
     // SAFETY: `FIONREAD` writes one `int` through the pointer it is given.
     match unsafe { libc::ioctl(fd, libc::FIONREAD, &raw mut bytes) } {
         0 => bytes as isize,
         _ => 0,
     }
+}
+
+/// For a listening socket, what Darwin's `EVFILT_READ` reports in `data`: the
+/// connections waiting to be accepted. libuv accepts only that many, so the
+/// byte count `FIONREAD` gives - always zero here - leaves them waiting.
+fn pending_connections(fd: c_int) -> Option<isize> {
+    let mut listening: c_int = 0;
+    let mut len = size_of::<c_int>() as libc::socklen_t;
+    // SAFETY: an int option, written through a pointer of that size.
+    let asked = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_ACCEPTCONN,
+            (&raw mut listening).cast(),
+            &raw mut len,
+        )
+    };
+    if asked != 0 || listening == 0 {
+        return None;
+    }
+    #[cfg(not(target_os = "linux"))]
+    return Some(1);
+    // A listening TCP socket's `tcpi_unacked` is its accept queue length.
+    // SAFETY: `tcp_info` is plain data, written up to `len` bytes.
+    #[cfg(target_os = "linux")]
+    let mut info: libc::tcp_info = unsafe { std::mem::zeroed() };
+    #[cfg(target_os = "linux")]
+    let mut len = size_of::<libc::tcp_info>() as libc::socklen_t;
+    #[cfg(target_os = "linux")]
+    let asked = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::IPPROTO_TCP,
+            libc::TCP_INFO,
+            (&raw mut info).cast(),
+            &raw mut len,
+        )
+    };
+    // Anything else listening, being readable, has at least one.
+    #[cfg(target_os = "linux")]
+    Some(match asked {
+        0 => (info.tcpi_unacked as isize).max(1),
+        _ => 1,
+    })
 }
 
 /// `int kevent(int kq, const struct kevent *changelist, int nchanges,
@@ -1770,10 +1859,39 @@ pub unsafe extern "C" fn kevent(
             }
         }
     }
+    trace_kevent(queue, changes, &out);
     // SAFETY: the caller states there is room for `nevents`, and `out` never
     // grew past that.
     unsafe { std::ptr::copy_nonoverlapping(out.as_ptr(), events, out.len()) };
     out.len() as c_int
+}
+
+/// `ROSEMARY_TRACE_KEVENT=1`: the changes and events of the first calls that
+/// return a descriptor event.
+fn trace_kevent(queue: c_int, changes: &[Kevent], out: &[Kevent]) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    static SEEN: AtomicI32 = AtomicI32::new(0);
+    if !*ON.get_or_init(|| std::env::var_os("ROSEMARY_TRACE_KEVENT").is_some()) {
+        return;
+    }
+    if !out.iter().any(|e| matches!(e.filter, EVFILT_READ | EVFILT_WRITE)) {
+        return;
+    }
+    if SEEN.fetch_add(1, Ordering::Relaxed) > 60 {
+        return;
+    }
+    let show = |e: &Kevent| {
+        format!(
+            "{{id {} filt {} flags {:#x} ff {:#x} data {} udata {:#x}}}",
+            e.ident, e.filter, e.flags, e.fflags, e.data, e.udata as usize
+        )
+    };
+    eprintln!(
+        "rosemary: kevent[{}] q{queue} changes {:?} -> {:?}",
+        std::process::id(),
+        changes.iter().map(show).collect::<Vec<_>>(),
+        out.iter().map(show).collect::<Vec<_>>()
+    );
 }
 
 /// The receive rights an `EVFILT_MACHPORT` registration on `name` watches:
@@ -1991,6 +2109,54 @@ mod tests {
         // SAFETY: a live array of two `int`.
         assert_eq!(unsafe { libc::pipe(ends.as_mut_ptr()) }, 0);
         (ends[0], ends[1])
+    }
+
+    /// Closing a watched descriptor ends its watch even while a copy keeps
+    /// the file open, so the number given to the next descriptor is watched
+    /// afresh rather than answering for the old file.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_closed_descriptor_stops_being_watched_though_a_copy_lives_on() {
+        let queue = kqueue();
+        let (read_end, write_end) = pipe();
+        // SAFETY: a descriptor of this test's.
+        let copy = unsafe { libc::dup(read_end) };
+        let add = |fd: c_int| Kevent {
+            ident: fd as usize,
+            filter: EVFILT_READ,
+            flags: EV_ADD,
+            ..Kevent::default()
+        };
+        let mut got = [Kevent::default(); 4];
+        // SAFETY: descriptors of this test's, one change, room for four.
+        unsafe {
+            let first = add(read_end);
+            kevent(queue, &raw const first, 1, got.as_mut_ptr(), 4, &raw const NO_WAIT);
+            assert_eq!(libc::write(write_end, c"x".as_ptr().cast(), 1), 1);
+            crate::net::descriptor::close(read_end);
+            assert_eq!(
+                kevent(queue, std::ptr::null(), 0, got.as_mut_ptr(), 4, &raw const NO_WAIT),
+                0,
+                "the old file is not reported once its descriptor closed"
+            );
+            let (again, other_write) = pipe();
+            assert_eq!(again, read_end, "the number is reused");
+            let second = add(again);
+            assert_eq!(
+                kevent(queue, &raw const second, 1, got.as_mut_ptr(), 4, &raw const NO_WAIT),
+                0,
+                "the new pipe is empty, whatever the old one holds"
+            );
+            assert_eq!(libc::write(other_write, c"y".as_ptr().cast(), 1), 1);
+            assert_eq!(
+                kevent(queue, std::ptr::null(), 0, got.as_mut_ptr(), 4, &raw const NO_WAIT),
+                1
+            );
+            for fd in [again, other_write, write_end, copy, queue] {
+                libc::close(fd);
+            }
+        }
+        assert_eq!(got[0].ident, read_end as usize);
     }
 
     /// The case the client needs: a descriptor is registered, nothing is ready,
