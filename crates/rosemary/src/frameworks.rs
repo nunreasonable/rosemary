@@ -351,10 +351,101 @@ const MEDIA_CONSTANTS: &[(&str, &str)] = &[
     ("_kCVPixelBufferPixelFormatTypeKey", "PixelFormatType"),
     ("_kCVPixelBufferWidthKey", "Width"),
     ("_kCVPixelBufferHeightKey", "Height"),
+    ("_kCVPixelBufferIOSurfacePropertiesKey", "IOSurfaceProperties"),
+    ("_kCVPixelBufferPoolAllocationThresholdKey", "AllocationThreshold"),
 ];
 
+/// Color and codec keys Chromium's media code puts in dictionaries and
+/// compares against what it reads back; the text is Apple's.
+const VIDEO_CONSTANTS: &[(&str, &str)] = &[
+    ("_kCVImageBufferColorPrimariesKey", "CVImageBufferColorPrimaries"),
+    ("_kCVImageBufferColorPrimaries_ITU_R_709_2", "ITU_R_709_2"),
+    ("_kCVImageBufferColorPrimaries_EBU_3213", "EBU_3213"),
+    ("_kCVImageBufferColorPrimaries_SMPTE_C", "SMPTE_C"),
+    ("_kCVImageBufferColorPrimaries_ITU_R_2020", "ITU_R_2020"),
+    ("_kCVImageBufferTransferFunctionKey", "CVImageBufferTransferFunction"),
+    ("_kCVImageBufferTransferFunction_ITU_R_709_2", "ITU_R_709_2"),
+    ("_kCVImageBufferTransferFunction_SMPTE_240M_1995", "SMPTE_240M_1995"),
+    ("_kCVImageBufferTransferFunction_UseGamma", "UseGamma"),
+    ("_kCVImageBufferTransferFunction_ITU_R_2020", "ITU_R_2020"),
+    ("_kCVImageBufferTransferFunction_SMPTE_ST_428_1", "SMPTE_ST_428_1"),
+    ("_kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ", "SMPTE_ST_2084_PQ"),
+    ("_kCVImageBufferTransferFunction_ITU_R_2100_HLG", "ITU_R_2100_HLG"),
+    ("_kCVImageBufferTransferFunction_sRGB", "IEC_sRGB"),
+    ("_kCVImageBufferTransferFunction_Linear", "Linear"),
+    ("_kCVImageBufferYCbCrMatrixKey", "CVImageBufferYCbCrMatrix"),
+    ("_kCVImageBufferYCbCrMatrix_ITU_R_709_2", "ITU_R_709_2"),
+    ("_kCVImageBufferYCbCrMatrix_ITU_R_601_4", "ITU_R_601_4"),
+    ("_kCVImageBufferYCbCrMatrix_SMPTE_240M_1995", "SMPTE_240M_1995"),
+    ("_kCVImageBufferYCbCrMatrix_ITU_R_2020", "ITU_R_2020"),
+    ("_kCVImageBufferGammaLevelKey", "CVImageBufferGammaLevel"),
+    ("_kCVImageBufferContentLightLevelInfoKey", "ContentLightLevelInfo"),
+    ("_kCVImageBufferMasteringDisplayColorVolumeKey", "MasteringDisplayColorVolume"),
+    ("_kCMFormatDescriptionColorPrimaries_DCI_P3", "DCI_P3"),
+    ("_kCMFormatDescriptionColorPrimaries_P3_D65", "P3_D65"),
+    ("_kCMFormatDescriptionColorPrimaries_ITU_R_2020", "ITU_R_2020"),
+    ("_kCMFormatDescriptionTransferFunction_ITU_R_2020", "ITU_R_2020"),
+    ("_kCMFormatDescriptionTransferFunction_ITU_R_2100_HLG", "ITU_R_2100_HLG"),
+    ("_kCMFormatDescriptionTransferFunction_SMPTE_ST_2084_PQ", "SMPTE_ST_2084_PQ"),
+    ("_kCMFormatDescriptionTransferFunction_SMPTE_ST_428_1", "SMPTE_ST_428_1"),
+    ("_kCMFormatDescriptionTransferFunction_sRGB", "IEC_sRGB"),
+    ("_kCMFormatDescriptionTransferFunction_Linear", "Linear"),
+    ("_kCMFormatDescriptionYCbCrMatrix_ITU_R_2020", "ITU_R_2020"),
+    ("_kCMFormatDescriptionExtension_ContentLightLevelInfo", "ContentLightLevelInfo"),
+    ("_kCMFormatDescriptionExtension_MasteringDisplayColorVolume", "MasteringDisplayColorVolume"),
+    ("_kCMFormatDescriptionExtension_Depth", "Depth"),
+    ("_kCMFormatDescriptionExtension_FormatName", "FormatName"),
+    ("_kCMFormatDescriptionExtension_FullRangeVideo", "FullRangeVideo"),
+    (
+        "_kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms",
+        "SampleDescriptionExtensionAtoms",
+    ),
+    ("_kCMSampleAttachmentKey_NotSync", "NotSync"),
+    ("_kCMSampleAttachmentKey_DisplayImmediately", "DisplayImmediately"),
+    ("_kCMSampleAttachmentKey_IsDependedOnByOthers", "IsDependedOnByOthers"),
+    ("_kVTCompressionPropertyKey_AllowFrameReordering", "AllowFrameReordering"),
+    ("_kVTCompressionPropertyKey_AverageBitRate", "AverageBitRate"),
+    ("_kVTCompressionPropertyKey_BaseLayerFrameRateFraction", "BaseLayerFrameRateFraction"),
+    ("_kVTCompressionPropertyKey_DataRateLimits", "DataRateLimits"),
+    ("_kVTCompressionPropertyKey_ExpectedFrameRate", "ExpectedFrameRate"),
+    ("_kVTCompressionPropertyKey_MaxFrameDelayCount", "MaxFrameDelayCount"),
+    ("_kVTCompressionPropertyKey_MaxKeyFrameInterval", "MaxKeyFrameInterval"),
+    ("_kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration", "MaxKeyFrameIntervalDuration"),
+    ("_kVTCompressionPropertyKey_ProfileLevel", "ProfileLevel"),
+    ("_kVTCompressionPropertyKey_RealTime", "RealTime"),
+    ("_kVTEncodeFrameOptionKey_ForceKeyFrame", "ForceKeyFrame"),
+    ("_kVTProfileLevel_H264_Baseline_AutoLevel", "H264_Baseline_AutoLevel"),
+    ("_kVTProfileLevel_H264_Main_AutoLevel", "H264_Main_AutoLevel"),
+    ("_kVTProfileLevel_H264_High_AutoLevel", "H264_High_AutoLevel"),
+    (
+        "_kVTVideoDecoderSpecification_EnableHardwareAcceleratedVideoDecoder",
+        "EnableHardwareAcceleratedVideoDecoder",
+    ),
+    (
+        "_kVTVideoDecoderSpecification_RequireHardwareAcceleratedVideoDecoder",
+        "RequireHardwareAcceleratedVideoDecoder",
+    ),
+    (
+        "_kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder",
+        "RequireHardwareAcceleratedVideoEncoder",
+    ),
+    (
+        "_kVTVideoEncoderSpecification_EnableLowLatencyRateControl",
+        "EnableLowLatencyRateControl",
+    ),
+];
+
+/// `kCMTimeInvalid`: a `CMTime` with no flags set, all zero.
+static CM_TIME_INVALID: [u64; 3] = [0; 3];
+
 fn media_constants() -> Vec<(String, u64)> {
-    corefoundation::base::string_globals(MEDIA_CONSTANTS)
+    let mut out = corefoundation::base::string_globals(MEDIA_CONSTANTS);
+    out.extend(corefoundation::base::string_globals(VIDEO_CONSTANTS));
+    out.push((
+        "_kCMTimeInvalid".to_string(),
+        &CM_TIME_INVALID as *const [u64; 3] as usize as u64,
+    ));
+    out
 }
 
 fn shimmed() -> Vec<(&'static str, *const ())> {
