@@ -1500,7 +1500,9 @@ name = "iosurface"
 version = "0.3.0"
 dependencies = [
  "corefoundation",
+ "darwin",
  "exports",
+ "libc",
  "objc",
 ]
 

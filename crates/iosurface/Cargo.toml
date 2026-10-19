@@ -9,3 +9,5 @@ license.workspace = true
 exports.workspace = true
 corefoundation.workspace = true
 objc.workspace = true
+darwin.workspace = true
+libc.workspace = true

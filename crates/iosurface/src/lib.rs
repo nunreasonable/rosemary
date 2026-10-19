@@ -8,13 +8,19 @@
 //! store decides whether a buffer is still on screen and it must draw into
 //! another one.
 //!
+//! The memory is a memory file, so that a surface can be handed to another
+//! process: `IOSurfaceCreateMachPort` makes a send right that carries the file,
+//! and `IOSurfaceLookupFromMachPort` maps it. The file's first page describes
+//! the surface - its size and layout - so the process that maps it can rebuild
+//! the same surface; the pixels follow.
+//!
 //! Planar surfaces (`kIOSurfacePlaneInfo`) are refused rather than laid out as
 //! one plane.
 
 #![allow(non_snake_case, clippy::missing_safety_doc)]
 
-use std::alloc::Layout;
 use std::ffi::c_void;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
 
@@ -60,6 +66,12 @@ const KEYS: &[(&str, &str)] = &[
     ("_kIOSurfaceOffset", OFFSET),
     ("_kIOSurfacePixelFormat", PIXEL_FORMAT),
     ("_kIOSurfacePlaneInfo", PLANE_INFO),
+    ("_kIOSurfacePlaneWidth", "IOSurfacePlaneWidth"),
+    ("_kIOSurfacePlaneHeight", "IOSurfacePlaneHeight"),
+    ("_kIOSurfacePlaneBytesPerRow", "IOSurfacePlaneBytesPerRow"),
+    ("_kIOSurfacePlaneBytesPerElement", "IOSurfacePlaneBytesPerElement"),
+    ("_kIOSurfacePlaneOffset", "IOSurfacePlaneOffset"),
+    ("_kIOSurfacePlaneSize", "IOSurfacePlaneSize"),
     ("_kIOSurfaceCacheMode", "IOSurfaceCacheMode"),
     ("_kIOSurfaceIsGlobal", "IOSurfaceIsGlobal"),
     (
@@ -102,8 +114,12 @@ struct State {
     pixel_format: u32,
     offset: usize,
     alloc_size: usize,
+    /// The pixels: one page past the start of `mapping`.
     memory: *mut u8,
-    layout: Layout,
+    /// The whole memory file, mapped: the description page and the pixels.
+    mapping: *mut u8,
+    mapped: usize,
+    file: std::sync::Arc<OwnedFd>,
     use_count: AtomicI32,
     seed: AtomicU32,
     locks: AtomicI32,
@@ -113,8 +129,8 @@ struct State {
 
 impl Drop for State {
     fn drop(&mut self) {
-        // SAFETY: allocated in `IOSurfaceCreate` with exactly this layout.
-        unsafe { std::alloc::dealloc(self.memory, self.layout) };
+        // SAFETY: mapped by `map` with exactly this length.
+        unsafe { libc::munmap(self.mapping.cast(), self.mapped) };
         for (key, value) in self
             .values
             .get_mut()
@@ -279,18 +295,94 @@ pub unsafe extern "C" fn IOSurfaceCreate(properties: CFTypeRef) -> CFTypeRef {
     let Some(alloc_size) = align_up(requested_size.max(needed), PAGE) else {
         return std::ptr::null();
     };
-    let Ok(layout) = Layout::from_size_align(alloc_size, PAGE) else {
-        return std::ptr::null();
-    };
-    // SAFETY: a non-zero size, since width and height are positive.
-    let memory = unsafe { std::alloc::alloc_zeroed(layout) };
-    if memory.is_null() {
+    let pixel_format = number(properties, PIXEL_FORMAT).map_or(0, |v| v as u32);
+    // SAFETY: a fresh, unnamed memory file.
+    let fd = unsafe { libc::memfd_create(c"IOSurface".as_ptr(), libc::MFD_CLOEXEC) };
+    if fd < 0 {
+        return refuse("no memory file could be made");
+    }
+    // SAFETY: just made, and owned by nothing else.
+    let file = unsafe { OwnedFd::from_raw_fd(fd) };
+    let mapped = PAGE + alloc_size;
+    // SAFETY: an open memory file.
+    if unsafe { libc::ftruncate(file.as_raw_fd(), mapped as libc::off_t) } != 0 {
         return refuse(&format!("{alloc_size} bytes could not be allocated"));
     }
-    let pixel_format = number(properties, PIXEL_FORMAT).map_or(0, |v| v as u32);
-
     static NEXT_ID: AtomicU32 = AtomicU32::new(1);
-    let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+    // Unique across processes as well as within one: the process id in the
+    // high bits, as a surface that crosses keeps the id it was made with.
+    let id = (std::process::id() << 12) ^ NEXT_ID.fetch_add(1, Ordering::Relaxed);
+    let header = Header {
+        magic: HEADER_MAGIC,
+        id,
+        width: width as u64,
+        height: height as u64,
+        bytes_per_element: bytes_per_element as u64,
+        bytes_per_row: bytes_per_row as u64,
+        element_width: element_width as u64,
+        element_height: element_height as u64,
+        pixel_format,
+        offset: offset as u64,
+        alloc_size: alloc_size as u64,
+    };
+    match make(std::sync::Arc::new(file), mapped, Some(header)) {
+        Some(surface) => surface,
+        None => refuse(&format!("{alloc_size} bytes could not be mapped")),
+    }
+}
+
+/// What a surface's memory file says about it, in its first page.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct Header {
+    magic: u32,
+    id: u32,
+    width: u64,
+    height: u64,
+    bytes_per_element: u64,
+    bytes_per_row: u64,
+    element_width: u64,
+    element_height: u64,
+    pixel_format: u32,
+    offset: u64,
+    alloc_size: u64,
+}
+
+const HEADER_MAGIC: u32 = u32::from_be_bytes(*b"IOSf");
+
+/// A surface over the memory file `file`, `mapped` bytes long: written with
+/// `header` when it is new, read from its own first page when it arrived from
+/// another process.
+fn make(file: std::sync::Arc<OwnedFd>, mapped: usize, header: Option<Header>) -> Option<CFTypeRef> {
+    // SAFETY: a shared mapping of the whole file, which is `mapped` long.
+    let mapping = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            mapped,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_SHARED,
+            file.as_raw_fd(),
+            0,
+        )
+    };
+    if mapping == libc::MAP_FAILED {
+        return None;
+    }
+    let mapping = mapping as *mut u8;
+    let header = match header {
+        Some(header) => {
+            // SAFETY: the first page of a fresh mapping.
+            unsafe { (mapping as *mut Header).write(header) };
+            header
+        }
+        // SAFETY: the first page of a mapping of a surface's file.
+        None => unsafe { (mapping as *const Header).read() },
+    };
+    if header.magic != HEADER_MAGIC || PAGE + header.alloc_size as usize > mapped {
+        // SAFETY: the mapping made above.
+        unsafe { libc::munmap(mapping.cast(), mapped) };
+        return None;
+    }
     // SAFETY: `Surface` is the registered layout.
     let surface = unsafe { corefoundation::base::allocate::<Surface>(class()) };
     // SAFETY: a fresh, zeroed allocation whose state is written once here.
@@ -298,18 +390,20 @@ pub unsafe extern "C" fn IOSurfaceCreate(properties: CFTypeRef) -> CFTypeRef {
         std::ptr::write(
             &mut (*surface).state,
             State {
-                id,
-                width,
-                height,
-                bytes_per_element,
-                bytes_per_row,
-                element_width,
-                element_height,
-                pixel_format,
-                offset,
-                alloc_size,
-                memory,
-                layout,
+                id: header.id,
+                width: header.width as usize,
+                height: header.height as usize,
+                bytes_per_element: header.bytes_per_element as usize,
+                bytes_per_row: header.bytes_per_row as usize,
+                element_width: header.element_width as usize,
+                element_height: header.element_height as usize,
+                pixel_format: header.pixel_format,
+                offset: header.offset as usize,
+                alloc_size: header.alloc_size as usize,
+                memory: mapping.add(PAGE),
+                mapping,
+                mapped,
+                file,
                 use_count: AtomicI32::new(0),
                 seed: AtomicU32::new(0),
                 locks: AtomicI32::new(0),
@@ -319,8 +413,103 @@ pub unsafe extern "C" fn IOSurfaceCreate(properties: CFTypeRef) -> CFTypeRef {
     }
     IDS.lock()
         .unwrap_or_else(|e| e.into_inner())
-        .push((id, surface as usize));
-    surface as CFTypeRef
+        .push((header.id, surface as usize));
+    Some(surface as CFTypeRef)
+}
+
+/// `mach_port_t IOSurfaceCreateMachPort(IOSurfaceRef)`: a send right that
+/// carries the surface's memory, for another process to map with
+/// `IOSurfaceLookupFromMachPort`.
+pub unsafe extern "C" fn IOSurfaceCreateMachPort(surface: CFTypeRef) -> u32 {
+    let Some(state) = state(surface) else {
+        return 0;
+    };
+    if trace() {
+        eprintln!(
+            "rosemary: iosurface: {} sends {:#x} ({}x{})",
+            std::process::id(),
+            state.id,
+            state.width,
+            state.height
+        );
+    }
+    darwin::mach::space::insert(darwin::mach::space::Right::Memory {
+        file: state.file.clone(),
+        offset: 0,
+        size: state.mapped as u64,
+        refs: 1,
+    })
+}
+
+/// `IOSurfaceRef IOSurfaceLookupFromMachPort(mach_port_t)`: the surface a
+/// right from `IOSurfaceCreateMachPort` stands for, owned by the caller. The
+/// right itself stays the caller's to release.
+pub unsafe extern "C" fn IOSurfaceLookupFromMachPort(port: u32) -> CFTypeRef {
+    let Some((file, offset, size)) = darwin::mach::space::memory(port) else {
+        return std::ptr::null();
+    };
+    if offset != 0 {
+        return std::ptr::null();
+    }
+    let surface = make(file, size as usize, None).unwrap_or(std::ptr::null());
+    if trace() {
+        eprintln!(
+            "rosemary: iosurface: {} receives {:#x}",
+            std::process::id(),
+            state(surface).map_or(0, |s| s.id)
+        );
+    }
+    surface
+}
+
+/// `ROSEMARY_TRACE_IOSURFACE=1`: say when a surface crosses a process.
+fn trace() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("ROSEMARY_TRACE_IOSURFACE").is_some())
+}
+
+/// `size_t IOSurfaceGetPlaneCount(IOSurfaceRef)`: zero, which is what a
+/// surface with no planes - every one here - reports.
+pub unsafe extern "C" fn IOSurfaceGetPlaneCount(_surface: CFTypeRef) -> usize {
+    0
+}
+
+/// The plane accessors, answered for plane 0 of a non-planar surface as the
+/// surface itself, which is Apple's rule.
+pub unsafe extern "C" fn IOSurfaceGetWidthOfPlane(surface: CFTypeRef, plane: usize) -> usize {
+    if plane != 0 {
+        return 0;
+    }
+    state(surface).map_or(0, |s| s.width)
+}
+
+pub unsafe extern "C" fn IOSurfaceGetHeightOfPlane(surface: CFTypeRef, plane: usize) -> usize {
+    if plane != 0 {
+        return 0;
+    }
+    state(surface).map_or(0, |s| s.height)
+}
+
+pub unsafe extern "C" fn IOSurfaceGetBytesPerRowOfPlane(surface: CFTypeRef, plane: usize) -> usize {
+    if plane != 0 {
+        return 0;
+    }
+    state(surface).map_or(0, |s| s.bytes_per_row)
+}
+
+pub unsafe extern "C" fn IOSurfaceGetBytesPerElementOfPlane(surface: CFTypeRef, plane: usize) -> usize {
+    if plane != 0 {
+        return 0;
+    }
+    state(surface).map_or(0, |s| s.bytes_per_element)
+}
+
+pub unsafe extern "C" fn IOSurfaceGetBaseAddressOfPlane(surface: CFTypeRef, plane: usize) -> *mut c_void {
+    if plane != 0 {
+        return std::ptr::null_mut();
+    }
+    // SAFETY: forwarded.
+    unsafe { IOSurfaceGetBaseAddress(surface) }
 }
 
 /// `IOSurfaceRef IOSurfaceLookup(IOSurfaceID)`: retained, as the name's
@@ -608,6 +797,14 @@ pub fn is_surface(object: CFTypeRef) -> bool {
 
 exports::exports! {
     functions {
+        "IOSurfaceCreateMachPort" => IOSurfaceCreateMachPort,
+        "IOSurfaceLookupFromMachPort" => IOSurfaceLookupFromMachPort,
+        "IOSurfaceGetPlaneCount" => IOSurfaceGetPlaneCount,
+        "IOSurfaceGetWidthOfPlane" => IOSurfaceGetWidthOfPlane,
+        "IOSurfaceGetHeightOfPlane" => IOSurfaceGetHeightOfPlane,
+        "IOSurfaceGetBytesPerRowOfPlane" => IOSurfaceGetBytesPerRowOfPlane,
+        "IOSurfaceGetBytesPerElementOfPlane" => IOSurfaceGetBytesPerElementOfPlane,
+        "IOSurfaceGetBaseAddressOfPlane" => IOSurfaceGetBaseAddressOfPlane,
         "IOSurfaceCreate" => IOSurfaceCreate,
         "IOSurfaceLookup" => IOSurfaceLookup,
         "IOSurfaceGetID" => IOSurfaceGetID,

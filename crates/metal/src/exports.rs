@@ -107,18 +107,43 @@ pub fn data_symbols() -> Vec<(String, u64)> {
     .collect()
 }
 
+/// `NSArray<id<MTLDevice>> *MTLCopyAllDevicesWithObserver(id<NSObject> *observer,
+/// MTLDeviceNotificationHandler)`: every device, and an observer token for
+/// `MTLRemoveDeviceObserver`. The handler is kept by nobody and never called -
+/// no GPU is added or removed while a program runs here.
+///
+/// # Safety
+///
+/// `observer` is null or writable.
+pub unsafe extern "C" fn MTLCopyAllDevicesWithObserver(observer: *mut Id, _handler: Id) -> Id {
+    if !observer.is_null() {
+        let class = objc::class::lookup(c"NSObject").expect("the runtime's NSObject");
+        // SAFETY: writable, per the caller; the token is the caller's.
+        unsafe { observer.write(objc::object::create_instance(class, 0)) };
+    }
+    // SAFETY: no arguments.
+    unsafe { MTLCopyAllDevices() }
+}
+
+/// `void MTLRemoveDeviceObserver(id<NSObject>)`: the token is the caller's
+/// to release.
+pub unsafe extern "C" fn MTLRemoveDeviceObserver(_observer: Id) {}
+
 /// Metal's entry points.
 ///
 /// The crate has a module of this name too, so the macro is spelled absolutely.
 mod entries {
     use super::{
-        CGDirectDisplayCopyCurrentMetalDevice, MTLCopyAllDevices, MTLCreateSystemDefaultDevice,
+        CGDirectDisplayCopyCurrentMetalDevice, MTLCopyAllDevices, MTLCopyAllDevicesWithObserver,
+        MTLCreateSystemDefaultDevice, MTLRemoveDeviceObserver,
     };
 
     ::exports::exports! {
         functions {
             "MTLCreateSystemDefaultDevice" => MTLCreateSystemDefaultDevice,
             "MTLCopyAllDevices" => MTLCopyAllDevices,
+            "MTLCopyAllDevicesWithObserver" => MTLCopyAllDevicesWithObserver,
+            "MTLRemoveDeviceObserver" => MTLRemoveDeviceObserver,
             "CGDirectDisplayCopyCurrentMetalDevice" => CGDirectDisplayCopyCurrentMetalDevice,
         }
     }

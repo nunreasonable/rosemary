@@ -138,6 +138,13 @@ pub(crate) fn live_buffers(delta: i64) -> i64 {
 
 pub(crate) unsafe extern "C" fn no_op(_receiver: Id, _sel: Sel) {}
 
+/// `-readWriteTextureSupport`: `MTLReadWriteTextureTierNone`. Shader writes
+/// to a texture it also reads are not something this runtime's translation
+/// promises, and a caller told so takes its other path.
+unsafe extern "C" fn read_write_texture_tier(_receiver: Id, _sel: Sel) -> u64 {
+    0
+}
+
 pub(crate) unsafe extern "C" fn zero(_receiver: Id, _sel: Sel) -> u64 {
     0
 }
@@ -179,6 +186,7 @@ pub fn bootstrap() {
             "supportsFeatureSet:" => supports_feature_set, c"B24@0:8Q16";
             "supportsFamily:" => supports_family, c"B24@0:8Q16";
             "argumentBuffersSupport" => argument_buffers_tier, c"Q16@0:8";
+            "readWriteTextureSupport" => read_write_texture_tier, c"Q16@0:8";
             "argumentBuffersTier" => argument_buffers_tier, c"Q16@0:8";
             "supportsShaderBarycentricCoordinates" => no, c"B16@0:8";
             "areBarycentricCoordsSupported" => no, c"B16@0:8";
