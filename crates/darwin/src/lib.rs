@@ -110,6 +110,7 @@ mod unfair_lock;
 #[cfg(not(target_os = "macos"))]
 pub mod utmpx;
 pub mod uuid;
+pub mod vdsp;
 #[cfg(not(target_os = "macos"))]
 pub mod vis;
 pub mod vmmap;
@@ -321,6 +322,7 @@ static DEFAULT_MODULES: &[exports::Module] = &[
     sysinfo::MODULE,
     commoncrypto::MODULE,
     math::MODULE,
+    vdsp::MODULE,
     spawn::MODULE,
     icu::MODULE,
     progname::MODULE,
