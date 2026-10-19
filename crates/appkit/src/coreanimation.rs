@@ -445,7 +445,50 @@ unsafe extern "C" fn contents(receiver: Id, _sel: Sel) -> Id {
 
 /// `-setContents:`. A surface shown by a layer is in use for as long as it is
 /// shown, as the window server's use of one is on a Mac.
+/// `ROSEMARY_TRACE_LAYERS=1`: say what layer contents arrive and where they
+/// are drawn, the first times and then now and again.
+fn trace_layers(count: &std::sync::atomic::AtomicU64) -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("ROSEMARY_TRACE_LAYERS").is_some()) {
+        return false;
+    }
+    let n = count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    n < 20 || n % 200 == 0
+}
+
 unsafe extern "C" fn set_contents(receiver: Id, _sel: Sel, contents: Id) {
+    static SEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    if trace_layers(&SEEN) {
+        let size = iosurface::pixels(contents as CFTypeRef).map(|p| {
+            // SAFETY: the surface's pixels, `bytes_per_row` bytes a row.
+            let bytes = unsafe { std::slice::from_raw_parts(p.data, p.bytes_per_row * p.height) };
+            if let Some(dir) = std::env::var_os("ROSEMARY_DUMP_LAYERS") {
+                let n = SEEN.load(std::sync::atomic::Ordering::Relaxed);
+                let path = std::path::Path::new(&dir).join(format!(
+                    "{}-{n:04}-{}x{}.ppm",
+                    std::process::id(),
+                    p.width,
+                    p.height
+                ));
+                let mut out = format!("P6 {} {} 255\n", p.width, p.height).into_bytes();
+                for row in 0..p.height {
+                    for px in bytes[row * p.bytes_per_row..][..p.width * 4].chunks(4) {
+                        out.extend_from_slice(&[px[2], px[1], px[0]]);
+                    }
+                }
+                let _ = std::fs::write(path, out);
+            }
+            (p.width, p.height, bytes.iter().filter(|&&b| b != 0).count())
+        });
+        // SAFETY: a layer of this crate's.
+        let view = unsafe { crate::layer::view_of(root_of(receiver)) };
+        eprintln!(
+            "rosemary: layers: {} setContents {receiver:p} <- {contents:p} surface {size:?} view {view:p} frame {:?}",
+            std::process::id(),
+            // SAFETY: as above.
+            unsafe { frame(receiver, objc::sel::get("frame")) },
+        );
+    }
     let retained = objc::arc::retain(contents) as usize;
     if iosurface::is_surface(contents as CFTypeRef) {
         // SAFETY: a live surface.
@@ -1429,6 +1472,32 @@ fn draw_contents(
             width: i64::from(store.width),
             height: i64::from(store.height),
         });
+        static DRAWN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        if trace_layers(&DRAWN) {
+            let (mut opaque, mut clear, mut lit) = (0usize, 0usize, 0usize);
+            for row in (0..source.height).step_by(16) {
+                for column in (0..source.width).step_by(16) {
+                    let at = row * source.stride + column * 4;
+                    let t = &source.bytes[at..at + 4];
+                    match t[3] {
+                        0 => clear += 1,
+                        255 => opaque += 1,
+                        _ => {}
+                    }
+                    if t[0] as u32 + t[1] as u32 + t[2] as u32 > 30 {
+                        lit += 1;
+                    }
+                }
+            }
+            eprintln!(
+                "rosemary: layers: {} draws {layer:p} {}x{} into {area:?} (store {}x{}): samples opaque {opaque} clear {clear} lit {lit}",
+                std::process::id(),
+                source.width,
+                source.height,
+                store.width,
+                store.height
+            );
+        }
         if area.is_empty() {
             return;
         }
