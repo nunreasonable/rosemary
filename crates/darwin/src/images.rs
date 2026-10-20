@@ -23,6 +23,8 @@ pub struct Loader {
     /// The host path of the guest image an address lies in, the main program
     /// included.
     pub image_path: fn(u64) -> Option<String>,
+    /// Host paths of loaded guest images, including startup dependencies.
+    pub image_paths: fn() -> Vec<String>,
 }
 
 static LOADER: OnceLock<Loader> = OnceLock::new();
@@ -68,6 +70,10 @@ pub fn open(path: Option<&str>) -> Option<u64> {
 /// The host path of the guest image containing `address`.
 pub fn image_path(address: u64) -> Option<String> {
     (LOADER.get()?.image_path)(address)
+}
+
+pub fn image_paths() -> Vec<String> {
+    LOADER.get().map_or_else(Vec::new, |loader| (loader.image_paths)())
 }
 
 /// Find `name` in the image `handle` names.

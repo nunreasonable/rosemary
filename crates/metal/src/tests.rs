@@ -69,6 +69,10 @@ fn device_registers_the_metal_object_graph() {
             "newRenderPipelineStateWithDescriptor:error:",
         ),
         (
+            c"RosemaryMTLDevice",
+            "newRenderPipelineStateWithDescriptor:options:reflection:error:",
+        ),
+        (
             c"RosemaryMTLCommandEncoder",
             "drawPrimitives:vertexStart:vertexCount:instanceCount:",
         ),
@@ -99,6 +103,45 @@ fn device_registers_the_metal_object_graph() {
             "{selector} is not registered"
         );
     }
+}
+
+#[test]
+fn render_pipeline_failure_clears_reflection_output() {
+    let device = device_for_tests();
+    let mut reflection = device;
+    let mut error = std::ptr::null_mut();
+    // SAFETY: valid device and writable out parameters. Unsupported options
+    // are rejected before a descriptor is needed.
+    let state = unsafe {
+        new_render_pipeline_with_reflection(
+            device,
+            std::ptr::null(),
+            std::ptr::null_mut(),
+            3,
+            &mut reflection,
+            &mut error,
+        )
+    };
+    assert!(state.is_null());
+    assert!(reflection.is_null());
+    assert!(!error.is_null());
+    // With no reflection requested, ordinary descriptor validation applies.
+    reflection = device;
+    error = std::ptr::null_mut();
+    let state = unsafe {
+        new_render_pipeline_with_reflection(
+            device,
+            std::ptr::null(),
+            std::ptr::null_mut(),
+            0,
+            &mut reflection,
+            &mut error,
+        )
+    };
+    assert!(state.is_null());
+    assert!(reflection.is_null());
+    assert!(!error.is_null());
+    objc::arc::release(device);
 }
 
 /// A device which answers "no" to every family and feature set reads as
@@ -1118,7 +1161,18 @@ fn a_translated_triangle_draws_on_the_gpu() {
     }
     let mut error = std::ptr::null_mut();
     // SAFETY: a device and a descriptor this test made.
-    let state = unsafe { new_render_pipeline(device, std::ptr::null(), descriptor, &mut error) };
+    let mut reflection = std::ptr::null_mut();
+    let state = unsafe {
+        new_render_pipeline_with_reflection(
+            device,
+            std::ptr::null(),
+            descriptor,
+            3,
+            &mut reflection,
+            &mut error,
+        )
+    };
+    assert!(!reflection.is_null(), "render reflection was not returned");
     assert!(!state.is_null(), "render pipeline creation failed");
 
     // The colour attachment, the vertices and the buffer read back into.
@@ -1708,4 +1762,53 @@ fn recording_cost() {
         compute.as_secs_f64() * 1e6 / DISPATCHES as f64,
         render.as_secs_f64() * 1e6 / DRAWS as f64,
     );
+}
+
+#[test]
+fn vertex_reset_restores_defaults_and_preserves_live_elements() {
+    bootstrap();
+    for class in [c"MTLVertexDescriptor", c"MTLStageInputOutputDescriptor"] {
+        let descriptor = object::make(
+            class,
+            resource::VertexDescriptor {
+                layouts: [resource::VertexLayout::default(); resource::VERTEX_SLOTS],
+                attributes: [resource::VertexAttribute::default(); resource::VERTEX_SLOTS],
+                layout_objects: std::ptr::null_mut(),
+                attribute_objects: std::ptr::null_mut(),
+            },
+        );
+        unsafe {
+            let layouts = objc::arc::retain(send(descriptor, "layouts"));
+            let attributes = objc::arc::retain(send(descriptor, "attributes"));
+            let layout = element_at(layouts, 30);
+            let attribute = element_at(attributes, 30);
+            send_number(layout, "setStride:", 48);
+            send_number(layout, "setStepFunction:", 2);
+            send_number(layout, "setStepRate:", 4);
+            send_number(attribute, "setFormat:", 30);
+            send_number(attribute, "setOffset:", 16);
+            send_number(attribute, "setBufferIndex:", 3);
+            send_void(descriptor, "reset");
+            assert_eq!(send(descriptor, "layouts"), layouts);
+            assert_eq!(send(descriptor, "attributes"), attributes);
+            for (object, selector, expected) in [
+                (layout, "stride", 0),
+                (layout, "stepFunction", 1),
+                (layout, "stepRate", 1),
+                (attribute, "format", 0),
+                (attribute, "offset", 0),
+                (attribute, "bufferIndex", 0),
+            ] {
+                assert_eq!(send_number_result(object, selector), expected);
+            }
+            send_number(layout, "setStride:", 24);
+            assert_eq!(
+                object::body::<resource::VertexDescriptor>(descriptor).layouts[30].stride,
+                24
+            );
+            objc::arc::release(descriptor);
+            objc::arc::release(layouts);
+            objc::arc::release(attributes);
+        }
+    }
 }

@@ -22,6 +22,8 @@ pub struct View {
     /// ever says which ones the view *would* accept.
     allowed_touch_types: usize,
     frame: NSRect,
+    bounds: NSRect,
+    custom_bounds: usize,
     wants_best_resolution: usize,
     /// `-setPostsFrameChangedNotifications:` and its bounds twin, as the two
     /// low bits. A view posts nothing until it is asked to, which is AppKit's
@@ -104,7 +106,7 @@ fn note_geometry_change(receiver: Id, before: NSRect) {
     if posts & POSTS_FRAME != 0 {
         foundation::notification::post(FRAME_DID_CHANGE, receiver, std::ptr::null_mut());
     }
-    if posts & POSTS_BOUNDS != 0 && view.frame.size != before.size {
+    if posts & POSTS_BOUNDS != 0 && view.custom_bounds == 0 && view.frame.size != before.size {
         foundation::notification::post(BOUNDS_DID_CHANGE, receiver, std::ptr::null_mut());
     }
     // Moving or resizing the focused editor also moves the host IME UI.
@@ -713,6 +715,11 @@ fn y_from_superview(frame: NSRect, flipped: bool, outer_flipped: bool, y: f64) -
 /// A point in `view`'s coordinates, in its superview's.
 fn to_superview(view: Id, point: NSPoint) -> NSPoint {
     let v = view_of(view);
+    let bounds = bounds_of(view);
+    let point = NSPoint {
+        x: (point.x - bounds.origin.x) * axis_scale(v.frame.size.width, bounds.size.width),
+        y: (point.y - bounds.origin.y) * axis_scale(v.frame.size.height, bounds.size.height),
+    };
     NSPoint {
         x: point.x + v.frame.origin.x,
         y: y_to_superview(v.frame, is_flipped(view), is_flipped(v.superview), point.y),
@@ -722,10 +729,16 @@ fn to_superview(view: Id, point: NSPoint) -> NSPoint {
 /// A point in `view`'s superview's coordinates, in the view's own.
 fn from_superview(view: Id, point: NSPoint) -> NSPoint {
     let v = view_of(view);
+    let bounds = bounds_of(view);
     NSPoint {
-        x: point.x - v.frame.origin.x,
-        y: y_from_superview(v.frame, is_flipped(view), is_flipped(v.superview), point.y),
+        x: (point.x - v.frame.origin.x) * axis_scale(bounds.size.width, v.frame.size.width) + bounds.origin.x,
+        y: y_from_superview(v.frame, is_flipped(view), is_flipped(v.superview), point.y)
+            * axis_scale(bounds.size.height, v.frame.size.height) + bounds.origin.y,
     }
+}
+
+fn axis_scale(to: f64, from: f64) -> f64 {
+    if from == 0.0 { 1.0 } else { to / from }
 }
 
 /// A point in `view`'s coordinates, in its window's base coordinates.
@@ -1173,9 +1186,11 @@ unsafe extern "C" fn set_frame_origin(receiver: Id, _sel: Sel, origin: NSPoint) 
     note_geometry_change(receiver, before);
 }
 
-/// `-bounds`: the frame's size at the origin, which is what a view with no
-/// transform of its own has.
+/// Unmodified bounds follow the frame; explicit bounds define local coordinates.
 unsafe extern "C" fn bounds(receiver: Id, _sel: Sel) -> NSRect {
+    if view_of(receiver).custom_bounds != 0 {
+        return view_of(receiver).bounds;
+    }
     NSRect {
         origin: NSPoint::default(),
         size: view_of(receiver).frame.size,
@@ -1183,9 +1198,33 @@ unsafe extern "C" fn bounds(receiver: Id, _sel: Sel) -> NSRect {
 }
 
 unsafe extern "C" fn set_bounds(receiver: Id, _sel: Sel, bounds: NSRect) {
-    let before = view_of(receiver).frame;
-    view_of(receiver).frame.size = bounds.size;
-    note_geometry_change(receiver, before);
+    let before = bounds_of(receiver);
+    let view = view_of(receiver);
+    view.bounds = bounds;
+    view.custom_bounds = 1;
+    if before == bounds { return; }
+    if !view.layer.is_null() {
+        crate::layer::set_bounds_of(view.layer, bounds);
+    }
+    if view.posts & POSTS_BOUNDS != 0 {
+        foundation::notification::post(BOUNDS_DID_CHANGE, receiver, std::ptr::null_mut());
+    }
+    // SAFETY: the receiver is the live view whose coordinate system changed.
+    unsafe { crate::window::refresh_text_input_area_for(receiver) };
+}
+
+unsafe extern "C" fn set_bounds_size(receiver: Id, sel: Sel, size: NSSize) {
+    let mut bounds = bounds_of(receiver);
+    bounds.size = size;
+    // SAFETY: forwarded with the same receiver and a complete bounds rectangle.
+    unsafe { set_bounds(receiver, sel, bounds) };
+}
+
+unsafe extern "C" fn set_bounds_origin(receiver: Id, sel: Sel, origin: NSPoint) {
+    let mut bounds = bounds_of(receiver);
+    bounds.origin = origin;
+    // SAFETY: forwarded with the same receiver and a complete bounds rectangle.
+    unsafe { set_bounds(receiver, sel, bounds) };
 }
 
 /// `-visibleRect`: the part of the view not clipped away by an ancestor.
@@ -1903,6 +1942,8 @@ pub(crate) fn install() {
         "bounds" => bounds, c"{CGRect={CGPoint=dd}{CGSize=dd}}16@0:8";
         "visibleRect" => visible_rect, c"{CGRect={CGPoint=dd}{CGSize=dd}}16@0:8";
         "setBounds:" => set_bounds, c"v48@0:8{CGRect={CGPoint=dd}{CGSize=dd}}16";
+        "setBoundsSize:" => set_bounds_size, c"v32@0:8{CGSize=dd}16";
+        "setBoundsOrigin:" => set_bounds_origin, c"v32@0:8{CGPoint=dd}16";
         "convertRectToBacking:" => convert_rect_to_backing,
             c"{CGRect={CGPoint=dd}{CGSize=dd}}48@0:8{CGRect={CGPoint=dd}{CGSize=dd}}16";
         "convertRectFromBacking:" => convert_rect_from_backing,
@@ -2018,6 +2059,25 @@ pub(crate) fn install() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bounds_size_preserves_frame_and_scales_coordinates() {
+        let view = view(rect(10.0, 20.0, 200.0, 100.0));
+        let sel = objc::sel::get("x");
+        // SAFETY: a live NSView with the registered layout.
+        unsafe {
+            set_bounds_size(view, sel, NSSize { width: 100.0, height: 50.0 });
+            set_bounds_origin(view, sel, NSPoint { x: 5.0, y: 10.0 });
+            assert_eq!(view_of(view).frame, rect(10.0, 20.0, 200.0, 100.0));
+            assert_eq!(bounds_of(view), rect(5.0, 10.0, 100.0, 50.0));
+            let point = NSPoint { x: 30.0, y: 35.0 };
+            assert_eq!(point_to_window(view, point), NSPoint { x: 60.0, y: 70.0 });
+            assert_eq!(point_from_window(view, point_to_window(view, point)), point);
+            set_frame_size(view, sel, NSSize { width: 400.0, height: 200.0 });
+            assert_eq!(bounds_of(view), rect(5.0, 10.0, 100.0, 50.0));
+        }
+        objc::arc::release(view);
+    }
 
     fn view(frame: NSRect) -> Id {
         crate::bootstrap();

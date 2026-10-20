@@ -4,6 +4,7 @@ pub(super) fn encode(key: &[u8; 32], library: &TranslatedLibrary) -> Vec<u8> {
     let mut payload = Vec::new();
     write_u32(&mut payload, library.entries.len() as u32);
     for entry in &library.entries {
+        write_arguments(&mut payload, entry.arguments.as_deref());
         write_string(&mut payload, &entry.name);
         payload.push(stage_tag(entry.stage));
         write_u32(&mut payload, entry.words.len() as u32);
@@ -74,6 +75,7 @@ pub(super) fn decode(bytes: &[u8], key: &[u8; 32]) -> Option<TranslatedLibrary> 
     let count = reader.u32()? as usize;
     let mut entries = Vec::with_capacity(count.min(1024));
     for _ in 0..count {
+        let arguments = read_arguments(&mut reader)?;
         let name = reader.string()?;
         let stage = stage_of_tag(reader.u8()?)?;
         let word_count = reader.u32()? as usize;
@@ -113,6 +115,7 @@ pub(super) fn decode(bytes: &[u8], key: &[u8; 32]) -> Option<TranslatedLibrary> 
         }
         let [vertex_inputs, varyings] = lists;
         entries.push(EntryArtifact {
+            arguments,
             name,
             stage,
             words,
@@ -325,4 +328,123 @@ fn read_inline_sampler(reader: &mut Reader<'_>) -> Option<Option<crate::ir::Inli
         lod_min_clamp: reader.u32()?,
         lod_max_clamp: reader.u32()?,
     }))
+}
+
+fn write_shader_type(bytes: &mut Vec<u8>, ty: &crate::reflection::ShaderType) {
+    bytes.extend_from_slice(&ty.data_type.to_le_bytes());
+    for n in [ty.size, ty.alignment, ty.length, ty.stride] {
+        write_u32(bytes, n);
+    }
+    write_u32(bytes, ty.members.len() as u32);
+    for member in &ty.members {
+        write_string(bytes, &member.name);
+        write_u32(bytes, member.offset);
+        write_shader_type(bytes, &member.ty);
+    }
+    bytes.push(u8::from(ty.element.is_some()));
+    if let Some(element) = &ty.element {
+        write_shader_type(bytes, element);
+    }
+}
+
+fn read_shader_type(
+    reader: &mut Reader<'_>,
+    depth: usize,
+) -> Option<crate::reflection::ShaderType> {
+    use crate::reflection::{Member, ShaderType};
+    if depth > 64 {
+        return None;
+    }
+    let data_type = reader.u64()?;
+    let size = reader.u32()?;
+    let alignment = reader.u32()?;
+    if alignment == 0 {
+        return None;
+    }
+    let length = reader.u32()?;
+    let stride = reader.u32()?;
+    let count = reader.u32()?;
+    if count > 65536 {
+        return None;
+    }
+    let mut members = Vec::new();
+    for _ in 0..count {
+        members.push(Member {
+            name: reader.string()?,
+            offset: reader.u32()?,
+            ty: read_shader_type(reader, depth + 1)?,
+        });
+    }
+    let element = if reader.boolean()? {
+        Some(Box::new(read_shader_type(reader, depth + 1)?))
+    } else {
+        None
+    };
+    Some(ShaderType {
+        data_type,
+        size,
+        alignment,
+        members,
+        element,
+        length,
+        stride,
+    })
+}
+
+fn write_arguments(bytes: &mut Vec<u8>, args: Option<&[crate::reflection::Argument]>) {
+    bytes.push(u8::from(args.is_some()));
+    let Some(args) = args else { return };
+    write_u32(bytes, args.len() as u32);
+    for a in args {
+        bytes.push(u8::from(a.active));
+        write_string(bytes, &a.name);
+        write_u32(bytes, a.index);
+        write_u32(bytes, a.count);
+        for n in [a.kind, a.access, a.texture_type] {
+            bytes.extend_from_slice(&n.to_le_bytes());
+        }
+        bytes.push(u8::from(a.depth));
+        bytes.push(u8::from(a.ty.is_some()));
+        if let Some(ty) = &a.ty {
+            write_shader_type(bytes, ty);
+        }
+    }
+}
+
+fn read_arguments(reader: &mut Reader<'_>) -> Option<Option<Vec<crate::reflection::Argument>>> {
+    if !reader.boolean()? {
+        return Some(None);
+    }
+    let count = reader.u32()?;
+    if count > 65536 {
+        return None;
+    }
+    let mut args = Vec::new();
+    for _ in 0..count {
+        let active = reader.boolean()?;
+        let name = reader.string()?;
+        let index = reader.u32()?;
+        let count = reader.u32()?;
+        let kind = reader.u64()?;
+        let access = reader.u64()?;
+        let texture_type = reader.u64()?;
+        let depth = reader.boolean()?;
+        let ty = if reader.boolean()? {
+            Some(read_shader_type(reader, 0)?)
+        } else {
+            None
+        };
+        args.push(crate::reflection::Argument {
+            active,
+            name,
+            index,
+            count,
+            kind,
+            access,
+            texture_type,
+            depth,
+            ty,
+        });
+    }
+    Some(Some(args))
 }

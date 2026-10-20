@@ -53,7 +53,7 @@ pub(super) fn air_intrinsic(
     if operation == "convert" {
         // `air.convert.<result kind>.<result type>.<source kind>.<source type>`
         let suffix: Vec<_> = parts.collect();
-        let [result_kind, _, source_kind, _] = suffix.as_slice() else {
+        let [result_kind, result_type, source_kind, source_type] = suffix.as_slice() else {
             return Err(unsupported());
         };
         let op = match (*result_kind, *source_kind) {
@@ -64,6 +64,29 @@ pub(super) fn air_intrinsic(
             // Metal spells `half(x)` and `float(h)` as a conversion between
             // two floating kinds; the type suffixes say which widths.
             ("f", "f") => ConvertOp::FloatResize,
+            ("s" | "u", "s" | "u") => {
+                let shape = |name: &str| -> Option<(u8, u8)> {
+                    let (lanes, scalar) = if let Some(vector) = name.strip_prefix('v') {
+                        let (lanes, bits) = vector.split_once('i')?;
+                        (lanes.parse().ok()?, bits)
+                    } else {
+                        (1, name.strip_prefix('i')?)
+                    };
+                    let bits = scalar.parse().ok()?;
+                    (lanes > 0 && matches!(bits, 1 | 8 | 16 | 32 | 64)).then_some((lanes, bits))
+                };
+                let (to_lanes, to_bits) = shape(result_type).ok_or_else(unsupported)?;
+                let (from_lanes, from_bits) = shape(source_type).ok_or_else(unsupported)?;
+                if to_lanes != from_lanes {
+                    return Err(unsupported());
+                }
+                match to_bits.cmp(&from_bits) {
+                    std::cmp::Ordering::Less => ConvertOp::IntegerTruncate,
+                    std::cmp::Ordering::Equal => ConvertOp::Bitcast,
+                    std::cmp::Ordering::Greater if *source_kind == "s" => ConvertOp::SignExtend,
+                    std::cmp::Ordering::Greater => ConvertOp::ZeroExtend,
+                }
+            }
             _ => return Err(unsupported()),
         };
         let [value] = arguments else {
@@ -414,6 +437,9 @@ pub(super) fn air_texture_intrinsic(
     operation: &str,
     arguments: &[Operand],
 ) -> Result<Option<InstructionKind>, TranslateError> {
+    if let Some(shape) = operation.strip_prefix("sample_compare_depth_") {
+        return depth_compare_sample(operation, shape, arguments).map(Some);
+    }
     let Some((access, shape)) = operation.split_once("_texture") else {
         return Ok(None);
     };
@@ -607,4 +633,66 @@ pub(super) fn optional(flag: &Operand, value: &Operand) -> Result<Option<Operand
             "AIR texture sampling option is not a constant flag: {other:?}"
         ))),
     }
+}
+
+// Depth comparisons carry a selector before their coordinates, unlike color
+// samples. Only the observed selector 1 is supported; do not discard others.
+fn depth_compare_sample(
+    operation: &str,
+    shape: &str,
+    arguments: &[Operand],
+) -> Result<InstructionKind, TranslateError> {
+    let malformed = || {
+        semantic(format!(
+            "AIR intrinsic air.{operation} has unsupported operands"
+        ))
+    };
+    if !matches!(shape, "2d" | "2d_array" | "cube" | "cube_array") {
+        return Err(malformed());
+    }
+    let [
+        texture,
+        sampler,
+        Operand::Integer { value: 1, .. },
+        coordinate,
+        rest @ ..,
+    ] = arguments
+    else {
+        return Err(malformed());
+    };
+    let (array_index, rest) = if shape.ends_with("_array") {
+        let [index, rest @ ..] = rest else {
+            return Err(malformed());
+        };
+        (Some(index.clone()), rest)
+    } else {
+        (None, rest)
+    };
+    let [reference, rest @ ..] = rest else {
+        return Err(malformed());
+    };
+    let (offset, rest) = if shape.starts_with("2d") {
+        let [flag, offset, rest @ ..] = rest else {
+            return Err(malformed());
+        };
+        (optional(flag, offset)?, rest)
+    } else {
+        (None, rest)
+    };
+    let [flag, level] = rest else {
+        return Err(malformed());
+    };
+    let (lod, bias) = level_or_bias(flag, level)?;
+    Ok(InstructionKind::TextureSample {
+        texture: texture.clone(),
+        sampler: sampler.clone(),
+        coordinate: coordinate.clone(),
+        array_index,
+        offset,
+        lod,
+        bias,
+        gradient: None,
+        gather: None,
+        compare: Some(reference.clone()),
+    })
 }

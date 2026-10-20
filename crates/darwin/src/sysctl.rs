@@ -644,6 +644,14 @@ const BY_NAME: &[(&str, &[i32])] = &[
     ("hw.machinearch", &[CTL_HW, HW_MACHINE_ARCH]),
     ("hw.model", &[CTL_HW, HW_MODEL]),
     ("hw.ncpu", &[CTL_HW, HW_NCPU]),
+    // These named OIDs are assigned at boot on Darwin. Private IDs keep
+    // name-to-MIB queries consistent on hosts without Darwin's sysctl tree.
+    #[cfg(not(target_os = "macos"))]
+    ("hw.logicalcpu", &[CTL_HW, 0x7ffe_0001]),
+    #[cfg(not(target_os = "macos"))]
+    ("hw.logicalcpu_max", &[CTL_HW, 0x7ffe_0002]),
+    #[cfg(not(target_os = "macos"))]
+    ("hw.physicalcpu_max", &[CTL_HW, 0x7ffe_0003]),
     ("hw.availcpu", &[CTL_HW, HW_AVAILCPU]),
     ("hw.byteorder", &[CTL_HW, HW_BYTEORDER]),
     ("hw.pagesize", &[CTL_HW, HW_PAGESIZE]),
@@ -678,6 +686,13 @@ const BY_NAME: &[(&str, &[i32])] = &[
 /// Values supplied on non-macOS hosts after resolving a name or MIB.
 fn named(name: &str) -> Option<Value> {
     match name {
+        "hw.logicalcpu" => Some(Value::U32(ncpu())),
+        "hw.logicalcpu_max" => {
+            // SAFETY: sysconf queries the host's configured processor count.
+            let count = unsafe { libc::sysconf(libc::_SC_NPROCESSORS_CONF) };
+            u32::try_from(count).ok().filter(|n| *n > 0).map(Value::U32)
+        }
+        "hw.physicalcpu_max" => starnix::system::physical_cores().map(Value::U32),
         "machdep.cpu.brand_string" => Some(Value::Str(brand_string())),
         "hw.cpufamily" | "hw.cpusubfamily" => Some(Value::U32(0)),
         // Both guest architectures are 64-bit. A caller that reads a missing
@@ -920,6 +935,23 @@ pub(crate) fn lock_guest_arch(arch: GuestArch) -> std::sync::MutexGuard<'static,
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(not(target_os = "macos"))]
+    fn cpu_topology_queries_report_host_counts() {
+        assert_eq!(
+            ask_name("hw.logicalcpu"),
+            Some(ncpu().to_ne_bytes().to_vec())
+        );
+        assert_eq!(
+            ask_name("hw.physicalcpu_max"),
+            starnix::system::physical_cores().map(|n| n.to_ne_bytes().to_vec())
+        );
+        for name in ["hw.logicalcpu", "hw.logicalcpu_max", "hw.physicalcpu_max"] {
+            let mib = BY_NAME.iter().find(|(key, _)| *key == name).unwrap().1;
+            assert_eq!(ask_name(name), ask(mib));
+        }
+    }
 
     #[test]
     fn the_release_and_the_macos_version_keep_agreeing() {

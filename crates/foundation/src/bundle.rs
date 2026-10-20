@@ -983,6 +983,7 @@ mod tests {
             open: |_| None,
             symbol: |_, _| None,
             image_path: |_| None,
+            image_paths: Vec::new,
         });
         let layout =
             Layout::provided_framework("/System/Library/Frameworks/RosemaryProbe.framework/")
@@ -1046,6 +1047,25 @@ mod tests {
         <key>NSMainNibFile</key><string>MainMenu</string>
         <key>NSPrincipalClass</key><string>ThingApplication</string>
         </dict></plist>"#;
+
+    #[test]
+    fn loaded_framework_list_excludes_apps_and_duplicates() {
+        crate::bootstrap();
+        let app = scratch("framework-list", INFO);
+        let root = app.parent().unwrap().join("Thing.framework");
+        std::fs::create_dir_all(root.join("Resources")).unwrap();
+        std::fs::write(root.join("Resources/Info.plist"), INFO).unwrap();
+        std::fs::write(root.join("Thing"), b"").unwrap();
+        let path = root.join("Thing").to_string_lossy().into_owned();
+        let class = objc::class::ptr(objc::class::lookup(c"NSBundle").unwrap()) as objc::object::Id;
+        let pool = objc::arc::pool_push();
+        let array = class::frameworks_from_paths(class, vec![
+            path.clone(), path, app.to_string_lossy().into_owned(),
+        ]);
+        // SAFETY: the helper returns a live NSArray/CFArray.
+        assert_eq!(unsafe { corefoundation::api::CFArrayGetCount(array.cast()) }, 1);
+        objc::arc::pool_pop(pool);
+    }
 
     #[test]
     fn a_bundle_is_recognised_by_shape_and_read_through() {
@@ -1188,6 +1208,32 @@ pub(crate) mod class {
 
     /// Every provided-framework bundle object made, by guest path.
     static PROVIDED: std::sync::Mutex<Vec<(String, usize)>> = std::sync::Mutex::new(Vec::new());
+
+    unsafe extern "C" fn all_frameworks(class: Id, _sel: Sel) -> Id {
+        frameworks_from_paths(class, darwin::images::image_paths())
+    }
+
+    pub(super) fn frameworks_from_paths(class: Id, paths: Vec<String>) -> Id {
+        let mut bundles = Vec::new();
+        for path in paths {
+            let path = std::path::PathBuf::from(path);
+            let Some(layout) = super::Layout::enclosing(&path) else { continue };
+            if layout.root.extension().is_none_or(|ext| ext != "framework") {
+                continue;
+            }
+            let bundle = interned(class, layout) as corefoundation::base::CFTypeRef;
+            if !bundle.is_null() && !bundles.contains(&bundle) {
+                bundles.push(bundle);
+            }
+        }
+        let array = corefoundation::collections::new_array(
+            &bundles,
+            corefoundation::callbacks::Policy::from_type_callbacks(),
+            false,
+        );
+        // SAFETY: a newly created array retaining the interned bundles.
+        unsafe { corefoundation::api::CFAutorelease(array) as Id }
+    }
 
     /// A bundle object already made whose identifier is `identifier`, in the
     /// order they were made, or nil.
@@ -1773,6 +1819,7 @@ pub(crate) mod class {
             "pathsForResourcesOfType:inDirectory:" => paths_for_resources_of_type, c"@32@0:8@16@24"
         });
         class_methods!(class, {
+            "allFrameworks" => all_frameworks, c"@16@0:8";
             "mainBundle" => main_bundle, c"@16@0:8";
             "bundleForClass:" => bundle_for_class, c"@24@0:8#16";
             "pathsForResourcesOfType:inDirectory:" => class_paths_for_resources_of_type, c"@32@0:8@16@24";

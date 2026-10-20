@@ -171,18 +171,14 @@ unsafe extern "C" fn value_with_bytes(
     }
     // SAFETY: a NUL-terminated encoding the caller supplied.
     let encoding = unsafe { CStr::from_ptr(encoding) };
-    // The size is what the encoding says, and this runtime only knows the four
-    // it makes itself. Anything else is refused by name rather than boxed at a
-    // guessed width, which would read past the caller's value.
-    let size = match encoding.to_bytes() {
-        b if b == encoding::POINT.to_bytes() || b == encoding::SIZE.to_bytes() => 16,
-        b if b == encoding::RECT.to_bytes() => 32,
-        b if b == encoding::RANGE.to_bytes() => 16,
-        _ => objc::fail!(
+    // Share the method-signature layout rules, including nested structures
+    // and pointer fields. Never guess the width of an unsupported encoding.
+    let size = crate::signature::size_of_type(encoding.to_bytes()).unwrap_or_else(|| {
+        objc::fail!(
             "+[NSValue valueWithBytes:objCType:]: this runtime does not know the width of {}",
             encoding.to_string_lossy()
-        ),
-    };
+        )
+    });
     // SAFETY: the caller says `bytes` points at a value of this encoding.
     make(unsafe { std::slice::from_raw_parts(bytes, size) }, encoding)
 }
@@ -297,6 +293,24 @@ mod tests {
     /// does to these is `rosemary`'s marshaller's business and is covered by
     /// `tests/msgsend.rs`. What this pins is that the storage is the right width
     /// and the encoding is the right string.
+    #[test]
+    fn custom_nested_structure_round_trips() {
+        crate::bootstrap();
+        let pool = objc::arc::pool_push();
+        let encoding = c"{WindowParameters={CGRect={CGPoint=dd}{CGSize=dd}}^v^@}";
+        let bytes = [0x5au8; 48];
+        let mut out = [0u8; 48];
+        // SAFETY: the encoding describes 48 bytes and both buffers have that size.
+        unsafe {
+            let sel = objc::sel::get("x");
+            let value = value_with_bytes(std::ptr::null_mut(), sel, bytes.as_ptr(), encoding.as_ptr());
+            get_value(value, sel, out.as_mut_ptr());
+            assert_eq!(out, bytes);
+            assert_eq!(CStr::from_ptr(obj_c_type(value, sel)), encoding);
+        }
+        objc::arc::pool_pop(pool);
+    }
+
     #[test]
     fn the_three_aggregates_round_trip() {
         crate::bootstrap();

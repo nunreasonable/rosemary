@@ -32,6 +32,78 @@ struct Listing {
 
 static ITERATORS: Mutex<BTreeMap<IoObject, Listing>> = Mutex::new(BTreeMap::new());
 
+// Root handles share one registry identity, but own independent references.
+// Allocate in the same namespace as iterators, away from SDL device ids.
+static ROOT_HANDLES: Mutex<BTreeMap<IoObject, u32>> = Mutex::new(BTreeMap::new());
+const ROOT_ID: u64 = u64::MAX;
+const BAD_ARGUMENT: IOReturn = 0xe000_02c2u32 as i32;
+const NO_RESOURCES: IOReturn = 0xe000_02beu32 as i32;
+
+fn new_handle() -> Option<IoObject> {
+    let mut current = NEXT_ITERATOR.load(Ordering::Relaxed);
+    loop {
+        let next = current.checked_add(1)?;
+        match NEXT_ITERATOR.compare_exchange_weak(
+            current,
+            next,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return Some(current),
+            Err(actual) => current = actual,
+        }
+    }
+}
+
+fn is_root(entry: IoObject) -> bool {
+    ROOT_HANDLES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains_key(&entry)
+}
+
+/// A retained handle to Rosemary's registry root. Only the default main port
+/// is exposed by IOMasterPort; arbitrary ports are not registry connections.
+pub unsafe extern "C" fn IORegistryGetRootEntry(port: u32) -> IoObject {
+    if port != 0 {
+        return 0;
+    }
+    let Some(handle) = new_handle() else {
+        return 0;
+    };
+    ROOT_HANDLES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(handle, 1);
+    crate::trace_hid(format_args!("IORegistryGetRootEntry -> {handle}"));
+    handle
+}
+
+fn root_property(key: &[u8]) -> CFTypeRef {
+    if key != b"IORegistryPlanes" {
+        return std::ptr::null();
+    }
+    // Advertise only the plane this registry actually implements.
+    let name = corefoundation::string::from_bytes(b"IOService", false);
+    let planes = collections::new_dictionary(
+        &[(name, name)],
+        Policy::from_key_callbacks(),
+        Policy::from_type_callbacks(),
+        false,
+    );
+    unsafe { corefoundation::api::CFRelease(name) };
+    planes
+}
+
+fn root_properties() -> CFTypeRef {
+    let key = corefoundation::string::from_bytes(b"IORegistryPlanes", false);
+    matching_dictionary(key, root_property(b"IORegistryPlanes"))
+}
+
+unsafe fn service_plane(plane: *const c_char) -> bool {
+    (unsafe { corefoundation::string::cstr_bytes(plane) }) == Some(b"IOService".as_slice())
+}
+
 /// `mach_port_t kIOMasterPortDefault` - and `kIOMainPortDefault`, its current
 /// spelling.
 ///
@@ -165,7 +237,10 @@ pub unsafe extern "C" fn IOServiceGetMatchingServices(
     // SAFETY: the reference the caller handed over.
     unsafe { consume(matching) };
     if !existing.is_null() {
-        let iterator = NEXT_ITERATOR.fetch_add(1, Ordering::Relaxed);
+        let Some(iterator) = new_handle() else {
+            unsafe { existing.write(0) };
+            return NO_RESOURCES;
+        };
         {
             ITERATORS.lock().unwrap_or_else(|e| e.into_inner()).insert(
                 iterator,
@@ -233,6 +308,15 @@ pub unsafe extern "C" fn IOIteratorIsValid(_iterator: IoObject) -> u32 {
 }
 
 pub unsafe extern "C" fn IOObjectRelease(object: IoObject) -> KernReturn {
+    let mut roots = ROOT_HANDLES.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(count) = roots.get_mut(&object) {
+        *count -= 1;
+        if *count == 0 {
+            roots.remove(&object);
+        }
+        return SUCCESS;
+    }
+    drop(roots);
     ITERATORS
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -240,43 +324,110 @@ pub unsafe extern "C" fn IOObjectRelease(object: IoObject) -> KernReturn {
     SUCCESS
 }
 
-pub unsafe extern "C" fn IOObjectRetain(_object: IoObject) -> KernReturn {
+pub unsafe extern "C" fn IOObjectRetain(object: IoObject) -> KernReturn {
+    if let Some(count) = ROOT_HANDLES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get_mut(&object)
+    {
+        let Some(next) = count.checked_add(1) else {
+            return NO_RESOURCES;
+        };
+        *count = next;
+    }
     SUCCESS
 }
 
 pub unsafe extern "C" fn IOObjectIsEqualTo(a: IoObject, b: IoObject) -> u32 {
-    u32::from(a == b)
+    u32::from(a == b || (is_root(a) && is_root(b)))
 }
 
 /// `io_registry_entry_t IORegistryEntryFromPath(port, const io_string_t path)`.
-pub unsafe extern "C" fn IORegistryEntryFromPath(_port: u32, _path: *const c_char) -> IoObject {
-    0
+pub unsafe extern "C" fn IORegistryEntryFromPath(port: u32, path: *const c_char) -> IoObject {
+    let Some(path) = (unsafe { corefoundation::string::cstr_bytes(path) }) else {
+        return 0;
+    };
+    if path == b"IOService:/" {
+        return unsafe { IORegistryGetRootEntry(port) };
+    }
+    if port != 0 {
+        return 0;
+    }
+    let Some(id) = path
+        .strip_prefix(b"IOService:/IOHIDDevice@")
+        .and_then(|id| std::str::from_utf8(id).ok())
+        .and_then(|id| u32::from_str_radix(id, 16).ok())
+    else {
+        return 0;
+    };
+    crate::api::device_for_service(id).map_or(0, |d| d.id)
+}
+
+/// `path` is the caller's io_string_t (512 bytes).
+pub unsafe extern "C" fn IORegistryEntryGetPath(
+    entry: IoObject,
+    plane: *const c_char,
+    path: *mut c_char,
+) -> KernReturn {
+    if path.is_null() {
+        return BAD_ARGUMENT;
+    }
+    unsafe { path.write(0) };
+    if !unsafe { service_plane(plane) } {
+        return NO_DEVICE;
+    }
+    let name = if is_root(entry) {
+        "IOService:/".to_string()
+    } else if crate::api::device_for_service(entry).is_some() {
+        format!("IOService:/IOHIDDevice@{entry:x}")
+    } else {
+        return NO_DEVICE;
+    };
+    // Both paths fit the fixed io_string_t buffer, including the terminator.
+    unsafe {
+        std::ptr::copy_nonoverlapping(name.as_ptr().cast(), path, name.len());
+        path.add(name.len()).write(0);
+    }
+    SUCCESS
 }
 
 pub unsafe extern "C" fn IORegistryEntryGetParentEntry(
-    _entry: IoObject,
-    _plane: *const c_char,
+    entry: IoObject,
+    plane: *const c_char,
     parent: *mut IoObject,
 ) -> KernReturn {
-    if !parent.is_null() {
-        // SAFETY: an out parameter the caller sized.
-        unsafe { parent.write(0) };
+    if parent.is_null() {
+        return BAD_ARGUMENT;
     }
-    NO_DEVICE
+    unsafe { parent.write(0) };
+    if !unsafe { service_plane(plane) }
+        || is_root(entry)
+        || crate::api::device_for_service(entry).is_none()
+    {
+        return NO_DEVICE;
+    }
+    let root = unsafe { IORegistryGetRootEntry(0) };
+    unsafe { parent.write(root) };
+    if root == 0 { NO_RESOURCES } else { SUCCESS }
 }
 
 pub unsafe extern "C" fn IORegistryEntryGetRegistryEntryID(
     entry: IoObject,
     id: *mut u64,
 ) -> KernReturn {
-    if !id.is_null() {
-        // SAFETY: an out parameter the caller sized.
-        unsafe { id.write(entry as u64) };
+    if id.is_null() {
+        return BAD_ARGUMENT;
     }
-    match entry {
-        0 => NO_DEVICE,
-        _ => SUCCESS,
-    }
+    let value = if is_root(entry) {
+        ROOT_ID
+    } else if crate::api::device_for_service(entry).is_some() {
+        entry as u64
+    } else {
+        unsafe { id.write(0) };
+        return NO_DEVICE;
+    };
+    unsafe { id.write(value) };
+    SUCCESS
 }
 
 fn property(device: &crate::hid::Device, key: &[u8]) -> CFTypeRef {
@@ -409,9 +560,13 @@ pub unsafe extern "C" fn IORegistryEntryCreateCFProperty(
     let key = unsafe { corefoundation::string::as_string(key) }
         .map(|s| s.utf8())
         .unwrap_or_default();
-    let value = crate::api::device_for_service(entry)
-        .map(|device| property(&device, &key))
-        .unwrap_or(std::ptr::null_mut());
+    let value = if is_root(entry) {
+        root_property(&key)
+    } else {
+        crate::api::device_for_service(entry)
+            .map(|device| property(&device, &key))
+            .unwrap_or(std::ptr::null_mut())
+    };
     crate::trace_hid(format_args!(
         "IORegistryEntryCreateCFProperty entry={entry} key={} -> {}",
         String::from_utf8_lossy(&key),
@@ -443,7 +598,14 @@ pub unsafe extern "C" fn IORegistryEntryCreateCFProperties(
     _allocator: CFTypeRef,
     _options: u32,
 ) -> KernReturn {
-    let values = crate::api::device_for_service(entry).map(|device| registry_properties(&device));
+    if properties.is_null() {
+        return BAD_ARGUMENT;
+    }
+    let values = if is_root(entry) {
+        Some(root_properties())
+    } else {
+        crate::api::device_for_service(entry).map(|device| registry_properties(&device))
+    };
     crate::trace_hid(format_args!(
         "IORegistryEntryCreateCFProperties entry={entry} -> {}",
         values.is_some()
@@ -572,18 +734,39 @@ pub unsafe extern "C" fn IOBSDNameMatching(
     unsafe { matching_on(b"BSD Name", name) }
 }
 
-/// `kern_return_t IORegistryEntryCreateIterator(entry, plane, options, io_iterator_t *)`:
-/// an empty iterator, as the registry here has no children to walk.
+/// Iterate the supported IOService tree. Its root directly owns the HID
+/// services, so recursive and non-recursive child walks have the same result.
 pub unsafe extern "C" fn IORegistryEntryCreateIterator(
-    _entry: IoObject,
-    _plane: *const c_char,
-    _options: u32,
+    entry: IoObject,
+    plane: *const c_char,
+    options: u32,
     iterator: *mut IoObject,
 ) -> KernReturn {
-    if !iterator.is_null() {
-        // SAFETY: the caller's out-parameter.
-        unsafe { iterator.write(0) };
+    if iterator.is_null() {
+        return BAD_ARGUMENT;
     }
+    unsafe { iterator.write(0) };
+    if options & !1 != 0 {
+        return UNSUPPORTED;
+    }
+    if !unsafe { service_plane(plane) } {
+        return NO_DEVICE;
+    }
+    let services = if is_root(entry) {
+        crate::api::services()
+    } else if crate::api::device_for_service(entry).is_some() {
+        Vec::new()
+    } else {
+        return NO_DEVICE;
+    };
+    let Some(handle) = new_handle() else {
+        return NO_RESOURCES;
+    };
+    ITERATORS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(handle, Listing { services, next: 0 });
+    unsafe { iterator.write(handle) };
     SUCCESS
 }
 
@@ -591,6 +774,11 @@ pub unsafe extern "C" fn IORegistryEntryCreateIterator(
 /// reports HID classes for live controller services.
 pub unsafe extern "C" fn IOObjectConformsTo(object: IoObject, class: *const c_char) -> u32 {
     let class = unsafe { corefoundation::string::cstr_bytes(class) };
+    if is_root(object) {
+        return u32::from(
+            class == Some(b"IORegistryEntry".as_slice()) || class == Some(b"OSObject".as_slice()),
+        );
+    }
     (class.is_some_and(|c| c == b"IOHIDDevice" || c == b"IOHIDDevice2")
         && crate::api::device_for_service(object).is_some()) as u32
 }
@@ -742,6 +930,8 @@ exports::exports! {
         "IOObjectRelease" => IOObjectRelease,
         "IOObjectRetain" => IOObjectRetain,
         "IOObjectIsEqualTo" => IOObjectIsEqualTo,
+        "IORegistryGetRootEntry" => IORegistryGetRootEntry,
+        "IORegistryEntryGetPath" => IORegistryEntryGetPath,
         "IORegistryEntryFromPath" => IORegistryEntryFromPath,
         "IORegistryEntryGetParentEntry" => IORegistryEntryGetParentEntry,
         "IORegistryEntryGetRegistryEntryID" => IORegistryEntryGetRegistryEntryID,

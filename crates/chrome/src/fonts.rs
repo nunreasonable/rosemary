@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use owned_ttf_parser::{AsFaceRef, FaceMut, OwnedFace};
@@ -383,30 +383,77 @@ impl LoadedFace {
     }
 }
 
-/// The parsed face at `path` and `index`, from the cache.
-pub fn load(path: &str, index: u32) -> Option<Arc<LoadedFace>> {
-    type Cache = HashMap<(String, u32), Option<Arc<LoadedFace>>>;
-    static CACHE: Mutex<Option<Cache>> = Mutex::new(None);
-    let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
-    cache
-        .get_or_insert_with(HashMap::new)
-        .entry((path.to_string(), index))
-        .or_insert_with(|| {
-            let bytes = std::fs::read(path).ok()?;
-            // The high half picks a variable font's named instance, which
-            // ttf-parser only knows as a set of axis coordinates.
-            let mut face = OwnedFace::from_vec(bytes, index & 0xffff).ok()?;
-            if let Some(instance) = (index >> 16).checked_sub(1) {
-                let instance = fvar_instances(face.as_face_ref())
-                    .into_iter()
-                    .nth(usize::try_from(instance).ok()?)?;
-                for (axis, value) in instance.coordinates {
-                    face.set_variation(axis, value);
-                }
+// Enumeration asks for every installed face, including every named instance
+// of large collections. Keep only a working set, not a file copy per face for
+// the lifetime of each guest process. Callers' Arcs survive cache eviction.
+const FACE_CACHE_BYTES: usize = 64 * 1024 * 1024;
+const FACE_CACHE_ENTRIES: usize = 128;
+
+type FaceKey = (String, u32);
+struct FaceCache<T> {
+    entries: VecDeque<(FaceKey, Arc<T>, usize)>,
+    bytes: usize,
+    budget: usize,
+}
+
+impl<T> FaceCache<T> {
+    fn new(budget: usize) -> Self {
+        Self {
+            entries: VecDeque::new(),
+            bytes: 0,
+            budget,
+        }
+    }
+
+    fn get(&mut self, path: &str, index: u32) -> Option<Arc<T>> {
+        let position = self
+            .entries
+            .iter()
+            .position(|(key, _, _)| key.0 == path && key.1 == index)?;
+        let entry = self.entries.remove(position)?;
+        let face = Arc::clone(&entry.1);
+        self.entries.push_back(entry);
+        Some(face)
+    }
+
+    fn insert(&mut self, key: FaceKey, face: Arc<T>, bytes: usize) {
+        if bytes > self.budget {
+            return;
+        }
+        while self.bytes > self.budget - bytes || self.entries.len() >= FACE_CACHE_ENTRIES {
+            if let Some((_, _, size)) = self.entries.pop_front() {
+                self.bytes -= size;
             }
-            Some(Arc::new(LoadedFace { face }))
-        })
-        .clone()
+        }
+        self.bytes += bytes;
+        self.entries.push_back((key, face, bytes));
+    }
+}
+
+/// The parsed face at `path` and `index`, from a bounded working-set cache.
+pub fn load(path: &str, index: u32) -> Option<Arc<LoadedFace>> {
+    static CACHE: Mutex<Option<FaceCache<LoadedFace>>> = Mutex::new(None);
+    let mut guard = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    let cache = guard.get_or_insert_with(|| FaceCache::new(FACE_CACHE_BYTES));
+    if let Some(face) = cache.get(path, index) {
+        return Some(face);
+    }
+    let bytes = std::fs::read(path).ok()?;
+    let size = bytes.len();
+    // The high half picks a variable font's named instance, which
+    // ttf-parser only knows as a set of axis coordinates.
+    let mut face = OwnedFace::from_vec(bytes, index & 0xffff).ok()?;
+    if let Some(instance) = (index >> 16).checked_sub(1) {
+        let instance = fvar_instances(face.as_face_ref())
+            .into_iter()
+            .nth(usize::try_from(instance).ok()?)?;
+        for (axis, value) in instance.coordinates {
+            face.set_variation(axis, value);
+        }
+    }
+    let face = Arc::new(LoadedFace { face });
+    cache.insert((path.to_string(), index), Arc::clone(&face), size);
+    Some(face)
 }
 
 /// A glyph's outline as line and curve segments, in font units, y up.
@@ -533,6 +580,40 @@ pub fn rasterize(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn enumeration_releases_old_faces_but_keeps_borrowed_faces_alive() {
+        let mut cache = FaceCache::new(8);
+        let first = Arc::new(vec![1u8; 4]);
+        let weak = Arc::downgrade(&first);
+        cache.insert(("collection".into(), 0), first.clone(), 4);
+        for index in 1..100 {
+            let face = Arc::new(vec![index as u8; 4]);
+            cache.insert(("collection".into(), index), face, 4);
+            assert!(cache.bytes <= 8);
+        }
+        assert!(cache.get("collection", 0).is_none());
+        assert_eq!(&*first, &[1; 4]);
+        drop(first);
+        assert!(weak.upgrade().is_none());
+    }
+
+    #[test]
+    fn recently_used_faces_survive_eviction_and_oversized_faces_are_not_retained() {
+        let mut cache = FaceCache::new(8);
+        for index in 0..2 {
+            cache.insert(("font".into(), index), Arc::new(index), 4);
+        }
+        let first = cache.get("font", 0).unwrap();
+        cache.insert(("font".into(), 2), Arc::new(2), 4);
+        assert!(Arc::ptr_eq(&first, &cache.get("font", 0).unwrap()));
+        assert!(cache.get("font", 1).is_none());
+        let large = Arc::new(3);
+        let weak = Arc::downgrade(&large);
+        cache.insert(("large".into(), 0), large, 9);
+        assert!(weak.upgrade().is_none());
+        assert_eq!(cache.bytes, 8);
+    }
 
     #[test]
     fn names_faces_by_typographic_family() {

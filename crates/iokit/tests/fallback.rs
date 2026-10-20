@@ -147,6 +147,42 @@ fn no_raw_hid_input_works_without_a_scheduled_manager_and_from_a_worker() {
     assert_eq!(generic_d.elements[0].usage, iokit::hid::usage::JOYSTICK);
     assert_eq!(generic_d.max_input_report_size(), 20);
     unsafe {
+        let root = registry::IORegistryGetRootEntry(0);
+        let mut iterator = 0;
+        assert_eq!(
+            registry::IORegistryEntryCreateIterator(root, c"IOService".as_ptr(), 1, &mut iterator),
+            0
+        );
+        let mut found = Vec::new();
+        loop {
+            let entry = registry::IOIteratorNext(iterator);
+            if entry == 0 {
+                break;
+            }
+            found.push(entry);
+            let mut parent = 0;
+            assert_eq!(
+                registry::IORegistryEntryGetParentEntry(entry, c"IOService".as_ptr(), &mut parent),
+                0
+            );
+            assert_eq!(registry::IOObjectIsEqualTo(root, parent), 1);
+            let mut path = [0i8; 512];
+            assert_eq!(
+                registry::IORegistryEntryGetPath(entry, c"IOService".as_ptr(), path.as_mut_ptr()),
+                0
+            );
+            let reopened = registry::IORegistryEntryFromPath(0, path.as_ptr());
+            assert_eq!(registry::IOObjectIsEqualTo(entry, reopened), 1);
+            registry::IOObjectRelease(reopened);
+            registry::IOObjectRelease(parent);
+            registry::IOObjectRelease(entry);
+        }
+        assert!([sony, microsoft, stick].iter().all(|id| found.contains(id)));
+        registry::IOObjectRelease(iterator);
+        registry::IOObjectRelease(root);
+    }
+
+    unsafe {
         assert_eq!(
             registry::IOServiceGetMatchingService(
                 0,

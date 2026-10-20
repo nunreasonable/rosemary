@@ -88,6 +88,7 @@ static EXECUTABLE: Mutex<Option<(String, u64)>> = Mutex::new(None);
 
 /// One image this runtime mapped, as much of it as [`guest_image_at`] needs.
 struct MappedImage {
+    path: String,
     /// The mapped `mach_header`, which is what dyld calls an image's base.
     header: u64,
     slide: u64,
@@ -308,6 +309,7 @@ pub fn register_mapped_images(report: &LinkReport) {
         .images
         .iter()
         .map(|i| MappedImage {
+            path: i.path.clone(),
             header: i.base,
             slide: i.slide,
             segments: i
@@ -833,6 +835,27 @@ pub fn loaded() -> usize {
     IMAGE_COUNT.load(Ordering::Acquire)
 }
 
+// Startup dependencies stay mapped for the process lifetime. Opening one
+// again must preserve its globals and must not rerun its initializers.
+fn same_image_path(first: &str, second: &str) -> bool {
+    first == second
+        || std::fs::canonicalize(first)
+            .ok()
+            .zip(std::fs::canonicalize(second).ok())
+            .is_some_and(|(a, b)| a == b)
+}
+
+fn startup_image_for_path(path: &str) -> Option<&'static MappedImage> {
+    MAPPED
+        .get()?
+        .iter()
+        .find(|image| same_image_path(&image.path, path))
+}
+
+fn startup_image_for_handle(handle: u64) -> Option<&'static MappedImage> {
+    MAPPED.get()?.iter().find(|image| image.header == handle)
+}
+
 /// Load `path` as a guest image, or return the handle it already has.
 pub fn open(path: &str) -> std::result::Result<u64, String> {
     // A library this runtime *is* has no file, so this has to come before
@@ -841,6 +864,27 @@ pub fn open(path: &str) -> std::result::Result<u64, String> {
         return Ok(library.handle);
     }
     let resolved = resolve_path(path).ok_or_else(|| format!("no such file: {path}"))?;
+
+    // dlopen of the running executable must reuse it. Mapping it again runs
+    // its initializers twice and gives its globals a second, incompatible identity.
+    let executable = EXECUTABLE.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    if let Some((executable, _)) = executable {
+        let main = std::path::Path::new(&executable);
+        let requested = std::path::Path::new(&resolved);
+        if main == requested
+            || main
+                .canonicalize()
+                .ok()
+                .zip(requested.canonicalize().ok())
+                .is_some_and(|(a, b)| a == b)
+        {
+            return Ok(global_handle());
+        }
+    }
+
+    if let Some(image) = startup_image_for_path(&resolved) {
+        return Ok(image.header);
+    }
 
     if let Some(image) =
         find(|i| (i.path == resolved && !i.unloading.load(Ordering::Acquire)).then_some(i))
@@ -874,6 +918,21 @@ pub fn install_image_hooks() {
         },
         symbol: lookup,
         image_path,
+        image_paths: || {
+            let mut paths: Vec<String> = MAPPED
+                .get()
+                .into_iter()
+                .flatten()
+                .map(|image| image.path.clone())
+                .collect();
+            for image in snapshot() {
+                paths.push(image.path.clone());
+                paths.extend(image.linked.iter().map(|linked| linked.path.clone()));
+            }
+            paths.sort();
+            paths.dedup();
+            paths
+        },
     });
 }
 
@@ -884,6 +943,9 @@ fn image_path(addr: u64) -> Option<String> {
     }
     if let Some(path) = find(|i| region_of(i, addr).map(|_| i.path.clone())) {
         return Some(path);
+    }
+    if let Some(image) = mapped_image_at(addr) {
+        return Some(image.path.clone());
     }
     let vm = crate::thunk::current()?;
     if !vm.program.is_guest_address(addr) {
@@ -1149,6 +1211,7 @@ fn unloads() -> bool {
 fn close(handle: u64) -> std::result::Result<(), String> {
     if !unloads()
         || handle == global_handle()
+        || startup_image_for_handle(handle).is_some()
         || synthetic::by_handle(handle).is_some()
         || native_handle(handle).is_some()
     {
@@ -1506,6 +1569,16 @@ fn lookup(handle: u64, name: &str) -> Option<u64> {
 
     // `dlsym` takes the C identifier; a Mach-O export carries the underscore.
     let mangled = format!("_{name}");
+    if let Some(mapped) = startup_image_for_handle(handle)
+        && handle != MAIN_HEADER.load(Ordering::Acquire)
+    {
+        let program = PROGRAM_IMAGES.get().map(Vec::as_slice).unwrap_or_default();
+        return program
+            .iter()
+            .find(|image| same_image_path(&image.path, &mapped.path))
+            .and_then(|image| image.resolve(program, &mangled, 0))
+            .map(|symbol| symbol.addr);
+    }
     let scoped: Vec<&'static Image> = match snapshot().into_iter().find(|i| i.handle == handle) {
         Some(image) => vec![image],
         // Every pseudo-handle - `RTLD_DEFAULT`, `RTLD_SELF`, `RTLD_NEXT`, and
@@ -1518,6 +1591,13 @@ fn lookup(handle: u64, name: &str) -> Option<u64> {
         {
             return Some(addr);
         }
+        if let Some(found) = image
+            .linked
+            .iter()
+            .find_map(|linked| linked.resolve(&image.linked, &mangled, 0))
+        {
+            return Some(found.addr);
+        }
     }
     // The **main executable's** own exports, which a global search must include
     // and which nothing above covers.
@@ -1526,6 +1606,16 @@ fn lookup(handle: u64, name: &str) -> Option<u64> {
         && let Some(addr) = export.address(main.slide)
     {
         return Some(addr);
+    }
+
+    // Startup dependencies are not in the dlopen registry. Their exports,
+    // including re-exports, must also participate in a global lookup.
+    let program = PROGRAM_IMAGES.get().map(Vec::as_slice).unwrap_or_default();
+    if let Some(found) = program
+        .iter()
+        .find_map(|image| image.resolve(program, &mangled, 0))
+    {
+        return Some(found.addr);
     }
 
     // Then the libraries this runtime is, for a global search.
@@ -1552,7 +1642,11 @@ pub fn system_symbol(name: &str) -> Option<u64> {
     // `name` is a C identifier, and `darwin::symbol` takes the Mach-O spelling:
     // handed `_availability_version_check` bare, it strips the identifier's own
     // underscore and finds nothing, which turns every `@available` false.
-    crate::shims::runtime::host_substitute(name)
+    entries()
+        .into_iter()
+        .find(|(export, _)| export.strip_prefix('_') == Some(name))
+        .map(|(_, function)| function as usize as u64)
+        .or_else(|| crate::shims::runtime::host_substitute(name))
         .or_else(|| crate::shims::openat::host_substitute(name))
         .or_else(|| darwin::symbol(&format!("_{name}")))
 }
@@ -1788,7 +1882,13 @@ fn loaded_handle(path: &str) -> Option<u64> {
     {
         return Some(main);
     }
-    find(|i| (i.path == resolved && !i.unloading.load(Ordering::Acquire)).then_some(i.handle))
+    startup_image_for_path(&resolved)
+        .map(|image| image.header)
+        .or_else(|| {
+            find(|i| {
+                (i.path == resolved && !i.unloading.load(Ordering::Acquire)).then_some(i.handle)
+            })
+        })
 }
 
 /// The address the Mach-O symbol `mangled` has in the image at `header`.
@@ -2039,6 +2139,15 @@ struct Described {
     saddr: u64,
 }
 
+fn mapped_image_at(addr: u64) -> Option<&'static MappedImage> {
+    MAPPED.get()?.iter().find(|image| {
+        image
+            .segments
+            .iter()
+            .any(|&(start, end)| addr >= start && addr < end)
+    })
+}
+
 /// `addr` as an image and a symbol, if this runtime is the one that mapped it.
 ///
 /// Covers both kinds of guest image - the program itself and anything [`open`] loaded -
@@ -2059,6 +2168,26 @@ fn describe(addr: u64) -> Option<Described> {
         })
     }) {
         return Some(found);
+    }
+    // A native guest has no VM thunk. Startup dylibs, including their data
+    // segments, must be identified from the loader's mapping records.
+    if let Some(image) = mapped_image_at(addr) {
+        let (sname, saddr) = ProgramImages::matching(None)
+            .find(|linked| linked.path == image.path && linked.slide == image.slide)
+            .and_then(|linked| linked.exports())
+            .map(|exports| nearest_export(exports, image.slide, addr))
+            .or_else(|| {
+                main_exports()
+                    .filter(|m| m.path == image.path)
+                    .map(|m| nearest_export(&m.exports, m.slide, addr))
+            })
+            .unwrap_or((0, 0));
+        return Some(Described {
+            fname: path_cstr(&image.path),
+            fbase: image.header,
+            sname,
+            saddr,
+        });
     }
     // The main executable, which is a guest image with no `Image` record.
     let vm = crate::thunk::current()?;
@@ -2486,6 +2615,9 @@ pub(crate) mod entry {
     pub unsafe extern "C" fn dladdr(addr: *const c_void, info: *mut u64) -> i32 {
         let addr = addr as usize as u64;
         let Some(found) = super::describe(addr) else {
+            if crate::shims::vmmap::tracing() {
+                eprintln!("rosemary: dladdr({addr:#x}): no guest image");
+            }
             // Darwin apps have no business meddling around with non-guest shared objects
             if !darwin::libc_backend::using_builtin() {
                 // Not ours; the host knows its own images.
@@ -2501,6 +2633,14 @@ pub(crate) mod entry {
         };
         if info.is_null() {
             return 0;
+        }
+        if crate::shims::vmmap::tracing() {
+            // SAFETY: describe returns an interned, NUL-terminated path.
+            let path = unsafe { CStr::from_ptr(found.fname as *const c_char) };
+            eprintln!(
+                "rosemary: dladdr({addr:#x}): {path:?}, base {:#x}",
+                found.fbase
+            );
         }
         // SAFETY: the caller states `info` is four writable words.
         unsafe {
@@ -2768,6 +2908,92 @@ pub fn provider() -> SyntheticDylib {
 mod tests {
     use super::*;
     use crate::abi::{Classification, Lookup};
+
+    #[test]
+    fn dladdr_identifies_startup_library_data_without_a_vm() {
+        let fixture = std::env::temp_dir().join(format!(
+            "rosemary-startup-reopen-{}.dylib",
+            std::process::id()
+        ));
+        std::fs::write(&fixture, b"already mapped; not a new Mach-O").unwrap();
+        MAPPED
+            .set(vec![
+                MappedImage {
+                    path: "/usr/lib/lookup-data-probe.dylib".into(),
+                    header: 0x45000,
+                    slide: 0x45000,
+                    segments: vec![(0x45000, 0x46000), (0x48000, 0x49000)],
+                },
+                MappedImage {
+                    path: fixture.to_string_lossy().into_owned(),
+                    header: 0x51000,
+                    slide: 0x51000,
+                    segments: vec![(0x51000, 0x52000)],
+                },
+            ])
+            .unwrap_or_else(|_| panic!("mapped images already registered"));
+        let found = describe(0x48120).expect("data belongs to its startup dylib");
+        assert_eq!(found.fbase, 0x45000);
+        let path = unsafe { std::ffi::CStr::from_ptr(found.fname as *const std::ffi::c_char) };
+        assert_eq!(path.to_bytes(), b"/usr/lib/lookup-data-probe.dylib");
+        assert_eq!(
+            image_path(0x48120).as_deref(),
+            Some("/usr/lib/lookup-data-probe.dylib")
+        );
+        assert!(mapped_image_at(0x47000).is_none());
+        assert!(mapped_image_at(0x49000).is_none());
+        let before = loaded();
+        assert_eq!(open(fixture.to_str().unwrap()).unwrap(), 0x51000);
+        assert_eq!(loaded_handle(fixture.to_str().unwrap()), Some(0x51000));
+        assert_eq!(loaded(), before);
+        assert!(close(0x51000).is_ok());
+        std::fs::remove_file(fixture).unwrap();
+    }
+
+    #[test]
+    fn image_identity_accepts_canonical_aliases_but_not_equal_leaf_names() {
+        let directory =
+            std::env::temp_dir().join(format!("rosemary-dyld-identity-{}", std::process::id()));
+        std::fs::create_dir_all(directory.join("nested")).unwrap();
+        let file = directory.join("probe.dylib");
+        std::fs::write(&file, b"fixture").unwrap();
+        let alias = directory.join("nested/../probe.dylib");
+        assert!(same_image_path(
+            file.to_str().unwrap(),
+            alias.to_str().unwrap()
+        ));
+        assert!(!same_image_path(
+            file.to_str().unwrap(),
+            "/another/probe.dylib"
+        ));
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn dynamic_lookup_finds_startup_dependencies_and_dyld() {
+        PROGRAM_IMAGES
+            .set(vec![linked(
+                "/usr/lib/lookup-probe.dylib",
+                0x12000,
+                vec![export("_startup_probe", 0x80, ExportValue::Direct)],
+            )])
+            .unwrap_or_else(|_| panic!("startup images already registered"));
+        assert_eq!(lookup(global_handle(), "startup_probe"), Some(0x12080));
+        assert!(lookup(global_handle(), "missing_startup_probe").is_none());
+        for (export, _) in entries() {
+            let name = export.strip_prefix('_').unwrap();
+            assert!(system_symbol(name).is_some(), "{name}");
+            assert_eq!(
+                lookup(global_handle(), name),
+                Some(remember_native_symbol(
+                    system_symbol(name).unwrap(),
+                    name,
+                    None
+                )),
+                "{name}"
+            );
+        }
+    }
 
     #[test]
     fn native_library_handles_cannot_bypass_builtin_gl() {

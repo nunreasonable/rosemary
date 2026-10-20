@@ -250,6 +250,7 @@ pub(crate) fn install() {
     let element = object::register::<VertexElement>(c"RosemaryMTLVertexElement");
     methods!(vertex, {
         "init" => vertex_descriptor_init, c"@16@0:8";
+        "reset" => vertex_descriptor_reset, c"v16@0:8";
         "layouts" => vertex_layouts, c"@16@0:8";
         "attributes" => vertex_attributes, c"@16@0:8";
         "dealloc" => vertex_descriptor_dealloc, c"v16@0:8";
@@ -263,7 +264,7 @@ pub(crate) fn install() {
     let stage_input = object::register::<VertexDescriptor>(c"MTLStageInputOutputDescriptor");
     methods!(stage_input, {
         "init" => vertex_descriptor_init, c"@16@0:8";
-        "reset" => vertex_descriptor_init, c"@16@0:8";
+        "reset" => vertex_descriptor_reset, c"v16@0:8";
         "layouts" => vertex_layouts, c"@16@0:8";
         "attributes" => vertex_attributes, c"@16@0:8";
         "dealloc" => vertex_descriptor_dealloc, c"v16@0:8";

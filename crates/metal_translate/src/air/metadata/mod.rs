@@ -1,4 +1,5 @@
 mod fields;
+mod reflection;
 #[cfg(test)]
 mod tests;
 
@@ -254,6 +255,7 @@ fn record_ascii(record: &llvm_bitcode::bitcode::Record) -> Option<String> {
 pub(super) enum Item<'a> {
     Text(&'a str),
     Number(u64),
+    Node(usize),
 }
 
 impl Metadata {
@@ -271,13 +273,14 @@ impl Metadata {
         let mut items = Vec::new();
         for operand in operands {
             match operand {
-                // A nested node, such as `air.struct_type_info`, carries
-                // reflection this translator does not need.
+                // Preserve nested type descriptors for shader reflection.
                 Some(MetadataOperand::Metadata(index)) => {
                     if let Some(text) = self.string(*index) {
                         items.push(Item::Text(text));
                     } else if let Some(MetadataValue::Value(id)) = self.values.get(*index) {
                         items.push(Item::Number(values.integer(*id, types)?));
+                    } else if self.node(*index).is_some() {
+                        items.push(Item::Node(*index));
                     }
                 }
                 Some(MetadataOperand::Value(id)) => {
@@ -294,6 +297,7 @@ impl Metadata {
 /// known. The type comes from the entry function's parameter list.
 #[derive(Clone, Debug)]
 pub(super) struct MetadataResource {
+    pub reflection: Option<crate::reflection::ShaderType>,
     pub argument: u32,
     pub kind: ResourceKind,
     pub index: u32,
@@ -421,6 +425,7 @@ impl Metadata {
                 Some(kind) => {
                     let access = access(rest);
                     interface.resources.push(MetadataResource {
+                        reflection: self.buffer_reflection(rest, values, types),
                         argument,
                         kind,
                         index: location_index(rest)?,

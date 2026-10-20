@@ -14,6 +14,7 @@ mod overlay;
 mod pipeline;
 mod present;
 mod profile;
+mod reflection;
 mod resource;
 pub mod stats;
 mod submission;
@@ -216,6 +217,8 @@ pub fn bootstrap() {
                 c"@32@0:8@16^@24";
             "newRenderPipelineStateWithDescriptor:error:" => new_render_pipeline,
                 c"@32@0:8@16^@24";
+            "newRenderPipelineStateWithDescriptor:options:reflection:error:"
+                => new_render_pipeline_with_reflection, c"@48@0:8@16Q24^@32^@40";
             "currentAllocatedSize" => current_allocated_size, c"Q16@0:8";
             "newFence" => new_fence, c"@16@0:8";
             "newHeapWithDescriptor:" => new_heap, c"@24@0:8@16";
@@ -275,6 +278,7 @@ pub fn bootstrap() {
         resource::install();
         encoder::install();
         pipeline::install();
+        reflection::install();
         present::install();
         install_labels();
     });

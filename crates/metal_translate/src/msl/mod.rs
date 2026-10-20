@@ -181,6 +181,7 @@ fn parse_kernel(
         });
         if let Some((kind, index, access)) = parse_resource_attribute(attribute, declaration, &ty) {
             resources.push(Resource {
+                reflection: None,
                 argument,
                 kind,
                 index,

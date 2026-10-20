@@ -133,7 +133,7 @@ pub(super) fn signed_integer_argument(items: &[Item<'_>]) -> bool {
 }
 
 /// The items following a string key, up to the end of the descriptor.
-fn keyed<'a, 'b>(items: &'a [Item<'b>], key: &str) -> &'a [Item<'b>] {
+pub(super) fn keyed<'a, 'b>(items: &'a [Item<'b>], key: &str) -> &'a [Item<'b>] {
     items
         .iter()
         .position(|item| matches!(item, Item::Text(text) if *text == key))
@@ -148,7 +148,7 @@ pub(super) fn user_location(items: &[Item<'_>]) -> Option<u32> {
             .strip_prefix("user(locn")
             .and_then(|rest| rest.strip_suffix(')'))
             .and_then(|digits| digits.parse().ok()),
-        Item::Number(_) => None,
+        Item::Number(_) | Item::Node(_) => None,
     })
 }
 

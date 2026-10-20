@@ -308,6 +308,10 @@ extern "C" fn lenient_called(index: u64) -> u64 {
     {
         *said = true;
         eprintln!("rosemary: lenient: {name} called; answered 0");
+        if crate::shims::vmmap::tracing() {
+            eprintln!("rosemary: unimplemented API call stack:\n{}",
+                std::backtrace::Backtrace::force_capture());
+        }
     }
     0
 }

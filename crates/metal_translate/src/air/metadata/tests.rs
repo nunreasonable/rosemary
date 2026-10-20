@@ -322,3 +322,99 @@ fn numbers_generated_varyings_after_explicit_locations() {
         }
     );
 }
+
+#[test]
+fn preserves_nested_struct_array_and_packed_vector_reflection() {
+    let module = bitcode_block(block(
+        8,
+        vec![
+            record(1, &[0]),
+            record(8, &[3, 0, 0, 0]),
+            block(
+                11,
+                vec![
+                    record(1, &[1]),
+                    record(4, &[0]),
+                    record(4, &[8]),
+                    record(4, &[24]),
+                    record(4, &[32]),
+                    record(4, &[64]),
+                    record(4, &[96]),
+                    record(4, &[4]),
+                ],
+            ),
+        ],
+    ));
+    let types = types();
+    let values = ValueTable::module_values(&module, &types).unwrap();
+    let mut metadata = Metadata {
+        values: Vec::new(),
+        named: HashMap::new(),
+    };
+    let mut text = |s: &str| {
+        let index = metadata.values.len();
+        metadata.values.push(MetadataValue::String(s.into()));
+        Some(MetadataOperand::Metadata(index))
+    };
+    let float = text("float");
+    let gain = text("gain");
+    let nested_key = text("air.struct_type_info");
+    let inner_type = text("Inner");
+    let inner_name = text("inner");
+    let packed = text("packed_float3");
+    let direction = text("direction");
+    let float4 = text("float4");
+    let colors = text("colors");
+    let n = |id| Some(MetadataOperand::Value(id));
+    let child = metadata.values.len();
+    metadata
+        .values
+        .push(MetadataValue::Node(vec![n(1), n(2), n(1), float, gain]));
+    let root = metadata.values.len();
+    metadata.values.push(MetadataValue::Node(vec![
+        nested_key,
+        Some(MetadataOperand::Metadata(child)),
+        n(1),
+        n(2),
+        n(1),
+        inner_type,
+        inner_name,
+        n(2),
+        n(3),
+        n(1),
+        packed,
+        direction,
+        n(4),
+        n(4),
+        n(7),
+        float4,
+        colors,
+    ]));
+    let items = [
+        Item::Text("air.arg_type_size"),
+        Item::Number(48),
+        Item::Text("air.arg_type_align_size"),
+        Item::Number(16),
+        Item::Text("air.struct_type_info"),
+        Item::Node(root),
+    ];
+    let reflected = metadata.buffer_reflection(&items, &values, &types).unwrap();
+    assert_eq!((reflected.size, reflected.alignment), (48, 16));
+    assert_eq!(reflected.members[0].ty.members[0].name, "gain");
+    assert_eq!(
+        (
+            reflected.members[1].ty.data_type,
+            reflected.members[1].ty.size,
+            reflected.members[1].ty.alignment
+        ),
+        (5, 12, 4)
+    );
+    assert_eq!(
+        (
+            reflected.members[2].offset,
+            reflected.members[2].ty.length,
+            reflected.members[2].ty.stride
+        ),
+        (16, 2, 16)
+    );
+}

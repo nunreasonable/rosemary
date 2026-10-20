@@ -14,6 +14,7 @@ pub struct Color {
     green: CGFloat,
     blue: CGFloat,
     alpha: CGFloat,
+    pattern: Id,
 }
 
 pub const INSTANCE_SIZE: usize = size_of::<Color>();
@@ -32,6 +33,9 @@ pub unsafe fn components(color: Id) -> (f64, f64, f64, f64) {
     }
     // SAFETY: the check above says it is one of this crate's colours.
     let c = unsafe { &*(color as *const Color) };
+    if !c.pattern.is_null() {
+        objc::fail!("NSColor: a pattern has no RGB components");
+    }
     (c.red, c.green, c.blue, c.alpha)
 }
 
@@ -52,6 +56,7 @@ fn allocate(red: f64, green: f64, blue: f64, alpha: f64) -> Id {
         (*color).green = green;
         (*color).blue = blue;
         (*color).alpha = alpha;
+        (*color).pattern = std::ptr::null_mut();
     }
     color as Id
 }
@@ -283,6 +288,59 @@ unsafe extern "C" fn color_with_rgba(
     make(red, green, blue, alpha)
 }
 
+unsafe extern "C" fn color_with_pattern(_class: Id, _sel: Sel, image: Id) -> Id {
+    if image.is_null() {
+        return std::ptr::null_mut();
+    }
+    let color = allocate(0.0, 0.0, 0.0, 1.0);
+    // SAFETY: a freshly allocated Color; it owns the image until deallocation.
+    unsafe {
+        (*(color as *mut Color)).pattern = objc::arc::retain(image);
+    }
+    objc::arc::autorelease(color)
+}
+
+pub(crate) fn pattern_image(color: Id) -> Id {
+    if color.is_null() {
+        return std::ptr::null_mut();
+    }
+    // SAFETY: callers pass an NSColor retained by their owner.
+    unsafe { (*(color as *const Color)).pattern }
+}
+
+pub(crate) struct Pattern {
+    pub width: usize,
+    pub height: usize,
+    pub pixels: Vec<u8>,
+    pub size: NSSize,
+}
+
+impl Pattern {
+    /// Sample in window points, with the pattern anchored at the lower left.
+    pub fn sample(&self, x: f64, y: f64) -> [u8; 4] {
+        if self.width == 0 || self.height == 0 || self.size.width <= 0.0 || self.size.height <= 0.0
+        {
+            return [0; 4];
+        }
+        let px = ((x.rem_euclid(self.size.width) / self.size.width) * self.width as f64) as usize;
+        let py =
+            ((y.rem_euclid(self.size.height) / self.size.height) * self.height as f64) as usize;
+        let at = (((self.height - 1 - py.min(self.height - 1)) * self.width
+            + px.min(self.width - 1))
+            * 4) as usize;
+        self.pixels[at..at + 4].try_into().unwrap()
+    }
+}
+
+unsafe extern "C" fn get_pattern_image(receiver: Id, _sel: Sel) -> Id {
+    pattern_image(receiver)
+}
+
+unsafe extern "C" fn dealloc(receiver: Id, _sel: Sel) {
+    objc::arc::release(pattern_image(receiver));
+    objc::arc::finalize(receiver);
+}
+
 unsafe extern "C" fn color_with_white(_class: Id, _sel: Sel, white: CGFloat, alpha: CGFloat) -> Id {
     make(white, white, white, alpha)
 }
@@ -305,11 +363,15 @@ unsafe extern "C" fn component(receiver: Id, sel: Sel) -> CGFloat {
 /// space the module note describes. A caller compares the result against
 /// `NSDeviceCMYKColorSpace` before reaching for the CMYK accessors, and this sends
 /// it down the RGB branch - which is the one that can be answered.
-unsafe extern "C" fn color_space_name(_receiver: Id, _sel: Sel) -> Id {
+unsafe extern "C" fn color_space_name(receiver: Id, _sel: Sel) -> Id {
     // The same interned object the `_NSCalibratedRGBColorSpace` global holds, so a
     // caller comparing the two with `==` - which is what a space-name check is
     // written as - finds them identical as well as equal.
-    foundation::notification::name_object("NSCalibratedRGBColorSpace") as Id
+    foundation::notification::name_object(if pattern_image(receiver).is_null() {
+        "NSCalibratedRGBColorSpace"
+    } else {
+        "NSPatternColorSpace"
+    }) as Id
 }
 
 /// `-colorUsingColorSpaceName:`
@@ -332,6 +394,13 @@ unsafe extern "C" fn color_using_color_space_name(receiver: Id, _sel: Sel, name:
     if name.is_empty() {
         return receiver;
     }
+    if !pattern_image(receiver).is_null() {
+        return if name == b"NSPatternColorSpace" {
+            receiver
+        } else {
+            std::ptr::null_mut()
+        };
+    }
     const RGB: [&str; 4] = [
         "NSCalibratedRGBColorSpace",
         "NSDeviceRGBColorSpace",
@@ -351,6 +420,9 @@ unsafe extern "C" fn color_using_color_space_name(receiver: Id, _sel: Sel, name:
 /// to ask for another is a class this tree does not have, so the argument is
 /// always the space the receiver is in or nil.
 unsafe extern "C" fn color_using_color_space(receiver: Id, _sel: Sel, _space: Id) -> Id {
+    if !pattern_image(receiver).is_null() {
+        return std::ptr::null_mut();
+    }
     receiver
 }
 
@@ -531,6 +603,7 @@ pub(crate) fn install() {
         meta.replace_method(objc::sel::get(name), named as *const c_void, c"@16@0:8");
     }
     class_methods!(class, {
+        "colorWithPatternImage:" => color_with_pattern, c"@24@0:8@16";
         "currentControlTint" => current_control_tint, c"Q16@0:8";
         "colorWithCatalogName:colorName:" => color_with_catalog_name, c"@32@0:8@16@24";
         "controlAlternatingRowBackgroundColors" => alternating_row_colors, c"@16@0:8";
@@ -544,6 +617,8 @@ pub(crate) fn install() {
         "colorWithWhite:alpha:" => color_with_white, c"@32@0:8d16d24";
     });
     methods!(class, {
+        "patternImage" => get_pattern_image, c"@16@0:8";
+        "dealloc" => dealloc, c"v16@0:8";
         "highlightWithLevel:" => highlight_with_level, c"@24@0:8d16";
         "setFill" => set_fill, c"v16@0:8";
         "setStroke" => set_stroke, c"v16@0:8";
@@ -571,6 +646,58 @@ pub(crate) fn install() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pattern_color_retains_its_image_and_refuses_rgb_conversion() {
+        crate::bootstrap();
+        let pool = objc::arc::pool_push();
+        let size = NSSize {
+            width: 2.0,
+            height: 3.0,
+        };
+        let image = crate::image::empty(size);
+        // SAFETY: a live image, then a live pattern colour.
+        let color = unsafe {
+            color_with_pattern(
+                std::ptr::null_mut(),
+                objc::sel::get("colorWithPatternImage:"),
+                image,
+            )
+        };
+        objc::arc::release(image);
+        assert_eq!(pattern_image(color), image);
+        assert_eq!(crate::image::declared_size(pattern_image(color)), size);
+        let rgb = foundation::string::from_str("NSCalibratedRGBColorSpace");
+        assert!(
+            unsafe {
+                color_using_color_space_name(
+                    color,
+                    objc::sel::get("colorUsingColorSpaceName:"),
+                    rgb,
+                )
+            }
+            .is_null()
+        );
+        objc::arc::release(rgb);
+        objc::arc::pool_pop(pool);
+    }
+
+    #[test]
+    fn pattern_tiles_in_points_with_bottom_left_origin() {
+        let pattern = Pattern {
+            width: 2,
+            height: 2,
+            pixels: vec![1, 0, 0, 255, 2, 0, 0, 255, 3, 0, 0, 255, 4, 0, 0, 255],
+            size: NSSize {
+                width: 4.0,
+                height: 4.0,
+            },
+        };
+        assert_eq!(pattern.sample(0.0, 0.0), [3, 0, 0, 255]);
+        assert_eq!(pattern.sample(2.0, 2.0), [2, 0, 0, 255]);
+        assert_eq!(pattern.sample(4.0, 4.0), [3, 0, 0, 255]);
+        assert_eq!(pattern.sample(-1.0, -1.0), [2, 0, 0, 255]);
+    }
 
     /// Every named colour answers, and answers with its own components - which
     /// is the claim one shared implementation has to earn.

@@ -1247,13 +1247,24 @@ fn compose_window(window: Id) {
     // With none set it is `windowBackgroundColor`, AppKit's default; a layer
     // view's hole is the layer's either way.
     let background = crate::window::background_pixel(window).unwrap_or(DEFAULT_BACKGROUND);
+    let pattern = crate::window::background_pattern(window);
+    let density = sdl3::video::window_size(sdl)
+        .filter(|(w, _)| *w > 0)
+        .map_or(1.0, |(w, _)| width as f64 / w as f64);
     for row in region.y..region.y + region.height {
         let base = (row as usize * width as usize + region.x as usize) * 4;
-        for pixel in store.pixels[base..base + region.width as usize * 4]
+        for (column, pixel) in store.pixels[base..base + region.width as usize * 4]
             .as_chunks_mut::<4>()
             .0
+            .iter_mut()
+            .enumerate()
         {
-            *pixel = background;
+            *pixel = pattern.as_ref().map_or(background, |pattern| {
+                pattern.sample(
+                    (region.x as f64 + column as f64) / density,
+                    (height as f64 - 1.0 - row as f64) / density,
+                )
+            });
         }
     }
     let views = VIEW_STORES.lock().unwrap_or_else(|e| e.into_inner());

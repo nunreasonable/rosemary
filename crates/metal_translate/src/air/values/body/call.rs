@@ -127,7 +127,9 @@ impl BodyLowering<'_> {
             }
             let mut actual = Vec::new();
             for (&arg, &expected) in args.iter().zip(parameters) {
-                let (ty, value) = self.operand(arg, None, record, fields)?;
+                // Fixed call arguments get their type from the signature,
+                // including values defined in later blocks of the bitcode.
+                let (ty, value) = self.operand(arg, Some(&(expected as u64)), record, fields)?;
                 if ty != expected {
                     return Err(semantic("LLVM call argument type mismatch"));
                 }

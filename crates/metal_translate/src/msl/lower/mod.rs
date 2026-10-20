@@ -1102,6 +1102,7 @@ impl<'c, 'p> Lowerer<'c, 'p> {
                 };
                 let (argument, root) = self.add_parameter(parameters, &param.name, ty.clone());
                 entry.resources.push(Resource {
+                    reflection: None,
                     argument,
                     kind: ResourceKind::Buffer,
                     index,
@@ -1145,6 +1146,7 @@ impl<'c, 'p> Lowerer<'c, 'p> {
                 let ty = self.context.ir(&param.ty);
                 let (argument, op) = self.add_parameter(parameters, &param.name, ty.clone());
                 entry.resources.push(Resource {
+                    reflection: None,
                     argument,
                     kind: ResourceKind::Sampler,
                     index,
@@ -1178,6 +1180,7 @@ impl<'c, 'p> Lowerer<'c, 'p> {
                 let ty = self.context.ir(&param.ty);
                 let (argument, op) = self.add_parameter(parameters, &param.name, ty.clone());
                 entry.resources.push(Resource {
+                    reflection: None,
                     argument,
                     kind,
                     index,

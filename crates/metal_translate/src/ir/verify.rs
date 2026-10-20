@@ -309,12 +309,29 @@ fn verify_instruction_types(
 /// Report an instruction whose operands do not have the required shape and
 /// stop checking it.
 fn invalid(function: &Function, instruction: &Instruction, diagnostics: &mut Vec<Diagnostic>) {
+    let detail = match &instruction.kind {
+        InstructionKind::CompositeInsert {
+            composite,
+            object,
+            index,
+        } => format!(
+            " (composite {:?}, object {:?}, index {}, result {:?})",
+            operand_type(function, composite),
+            operand_type(function, object),
+            index,
+            instruction
+                .result
+                .and_then(|id| function.values.get(id.0 as usize)),
+        ),
+        _ => String::new(),
+    };
     diagnostics.push(Diagnostic::new(
         Phase::IrVerification,
         format!(
-            "{} has an ill-typed {}",
+            "{} has an ill-typed {}{}",
             function.name,
-            instruction_name(&instruction.kind)
+            instruction_name(&instruction.kind),
+            detail,
         ),
     ));
 }
@@ -662,6 +679,9 @@ fn composite_is_well_typed(
                 Some(Type::Vector { element, lanes }) => {
                     *index < u32::from(lanes) && result.as_ref() == Some(element.as_ref())
                 }
+                Some(Type::Array { element, count }) => {
+                    *index < count && result.as_ref() == Some(element.as_ref())
+                }
                 _ => false,
             }
         }
@@ -681,6 +701,11 @@ fn composite_is_well_typed(
                     .get(*index as usize)
                     .map(|field| field.ty.clone())
                     == operand_type(function, object)
+                    && result == operand_type(function, composite)
+            }
+            Some(Type::Array { element, count }) => {
+                *index < count
+                    && operand_type(function, object) == Some(*element)
                     && result == operand_type(function, composite)
             }
             _ => false,
@@ -888,5 +913,75 @@ fn sync_is_well_typed(function: &Function, kind: &InstructionKind, result: Optio
             result == Some(Type::Bool) && matches!(constant, Operand::Global { .. })
         }
         _ => unreachable!("not a sync instruction"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn array_composites_require_matching_elements_results_and_in_bounds_indices() {
+        let element = Type::Vector {
+            element: Box::new(Type::Float { bits: 32 }),
+            lanes: 4,
+        };
+        let array = Type::Array {
+            element: Box::new(element.clone()),
+            count: 4,
+        };
+        let function = Function {
+            name: "array".into(),
+            result: Type::Void,
+            parameters: vec![],
+            values: vec![array.clone(), element.clone(), Type::u32()],
+            blocks: vec![],
+        };
+        let insert = |index, object| InstructionKind::CompositeInsert {
+            composite: Operand::Value(ValueId(0)),
+            object: Operand::Value(ValueId(object)),
+            index,
+        };
+        let extract = |index| InstructionKind::CompositeExtract {
+            composite: Operand::Value(ValueId(0)),
+            index,
+        };
+        for index in 0..4 {
+            assert!(composite_is_well_typed(
+                &function,
+                &insert(index, 1),
+                Some(array.clone())
+            ));
+            assert!(composite_is_well_typed(
+                &function,
+                &extract(index),
+                Some(element.clone())
+            ));
+        }
+        assert!(!composite_is_well_typed(
+            &function,
+            &insert(4, 1),
+            Some(array.clone())
+        ));
+        assert!(!composite_is_well_typed(
+            &function,
+            &insert(0, 2),
+            Some(array.clone())
+        ));
+        assert!(!composite_is_well_typed(
+            &function,
+            &insert(0, 1),
+            Some(element.clone())
+        ));
+        assert!(!composite_is_well_typed(
+            &function,
+            &extract(4),
+            Some(element)
+        ));
+        assert!(!composite_is_well_typed(
+            &function,
+            &extract(0),
+            Some(array)
+        ));
     }
 }

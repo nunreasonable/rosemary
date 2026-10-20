@@ -195,6 +195,7 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("rosemary_steamclient_dispatch", I32, U32, P),
     sig!("getsegbyname", P, P),
     sig!("getsectbyname", P, P, P),
+    sig!("getsectdatafromheader_64", P, P, P, P, P),
     sig!("get_etext", U64),
     sig!("get_end", U64),
     // OpenAL 1.1. Its scalar typedefs are fixed-width even on Darwin.
@@ -1236,6 +1237,8 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     // An iterator over the registry, and the two ways of naming a starting
     // point.
     sig!("IORegistryEntryCreateIterator", I32, U32, P, U32, P),
+    sig!("IORegistryGetRootEntry", U32, U32),
+    sig!("IORegistryEntryGetPath", I32, U32, P, P),
     sig!("IORegistryEntryFromPath", U32, U32, P),
     sig!("IORegistryEntrySearchCFProperty", P, U32, P, P, P, U32),
     sig!("IORegistryEntryGetParentEntry", I32, U32, P, P),

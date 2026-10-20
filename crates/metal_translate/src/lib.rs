@@ -3,6 +3,7 @@ pub mod cache;
 pub mod ir;
 pub mod msl;
 pub mod passes;
+pub mod reflection;
 mod sha256;
 pub mod specialize;
 pub mod spirv;

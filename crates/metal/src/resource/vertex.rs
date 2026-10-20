@@ -221,14 +221,18 @@ fn autoreleased_vertex_descriptor(class: &std::ffi::CStr) -> Id {
 }
 
 pub(super) unsafe extern "C" fn vertex_descriptor_init(receiver: Id, _sel: Sel) -> Id {
-    // SAFETY: a freshly allocated vertex descriptor.
+    // SAFETY: a vertex descriptor allocated by this runtime.
+    unsafe { vertex_descriptor_reset(receiver, _sel) };
+    receiver
+}
+
+pub(super) unsafe extern "C" fn vertex_descriptor_reset(receiver: Id, _sel: Sel) {
+    // SAFETY: a live vertex descriptor.
     let descriptor = unsafe { object::body::<VertexDescriptor>(receiver) };
     descriptor.layouts = [VertexLayout::default(); VERTEX_SLOTS];
     descriptor.attributes = [VertexAttribute::default(); VERTEX_SLOTS];
-    // `-init` is `-reset` here, and a reset descriptor still owns whatever a
-    // previous one vended.
-    release_collections(descriptor, false);
-    receiver
+    // Keep the vended collections: existing element references still address
+    // these slots, and must be orphaned when the descriptor is destroyed.
 }
 
 /// Give up the collections a vertex descriptor vended.

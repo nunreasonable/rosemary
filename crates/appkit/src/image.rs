@@ -312,7 +312,7 @@ unsafe extern "C" fn init_with_data(receiver: Id, _sel: Sel, data: Id) -> Id {
 /// The image's pixels as a `CGImage` it holds, decoding them on first use.
 ///
 /// `None` only for a container [`crate::raster`] has no decoder for.
-fn cg_image_of(receiver: Id) -> Option<*const c_void> {
+pub(crate) fn cg_image_of(receiver: Id) -> Option<*const c_void> {
     let image = image_of(receiver);
     if image.cg_image.is_null() {
         let pixels = match image.handler.is_null() {

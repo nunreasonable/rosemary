@@ -729,3 +729,143 @@ fn integer_constants_preserve_signed_bits() {
     );
     assert!(decode_constant(4, &[2, 4], &DecodedType::Integer(32)).is_err());
 }
+
+#[test]
+fn call_arguments_can_reference_a_dominating_block_stored_later() {
+    let types = vec![
+        DecodedType::Integer(32),
+        DecodedType::Function {
+            result: 0,
+            parameters: vec![0, 0],
+        },
+    ];
+    let table = ValueTable {
+        globals: Vec::new(),
+        relative: true,
+        argument_start: 0,
+        values: vec![
+            Value {
+                ty: 1,
+                constant: None,
+            },
+            Value {
+                ty: 0,
+                constant: Some(Constant::Integer(7)),
+            },
+        ],
+    };
+    // entry -> definition -> call -> return. The definition's block is
+    // stored after the call, whose parameter types come from its signature.
+    let body = records_block(
+        12,
+        &[
+            (1, &[4]),
+            (11, &[2]),
+            (34, &[0, 0, 2, 4294967295, 4294967295]),
+            (11, &[3]),
+            (2, &[2, 2, 0]),
+            (11, &[1]),
+            (10, &[2]),
+        ],
+    );
+    let function = table
+        .lower_body(
+            &body,
+            &types,
+            &Signature {
+                names: &HashMap::from([(0, "air.min.u.i32".into())]),
+                name: "forward_call".into(),
+                parameter_types: &[],
+                result_type: 0,
+                opaque_types: &HashMap::new(),
+            },
+        )
+        .unwrap();
+    let defined = Operand::Value(function.blocks[2].instructions[0].result.unwrap());
+    assert_eq!(
+        function.blocks[1].instructions[0].kind,
+        InstructionKind::IntegerBinary {
+            op: IntegerBinaryOp::MinimumUnsigned,
+            lhs: defined.clone(),
+            rhs: defined,
+        }
+    );
+    Module {
+        static_initializers: Vec::new(),
+        globals: Vec::new(),
+        functions: vec![function],
+        entries: Vec::new(),
+    }
+    .verify()
+    .unwrap();
+}
+
+#[test]
+fn integer_conversions_preserve_source_signedness_and_vector_shape() {
+    let value = Operand::Value(ValueId(0));
+    for (name, expected) in [
+        ("air.convert.s.i32.u.i1", ConvertOp::ZeroExtend),
+        ("air.convert.u.i32.s.i8", ConvertOp::SignExtend),
+        ("air.convert.s.v4i16.u.v4i32", ConvertOp::IntegerTruncate),
+        ("air.convert.u.i32.s.i32", ConvertOp::Bitcast),
+    ] {
+        assert_eq!(
+            air_intrinsic(name, std::slice::from_ref(&value)).unwrap(),
+            InstructionKind::Convert {
+                op: expected,
+                value: value.clone()
+            }
+        );
+    }
+    for name in ["air.convert.s.v4i32.u.v2i8", "air.convert.s.i32.u.i0"] {
+        assert!(air_intrinsic(name, std::slice::from_ref(&value)).is_err());
+    }
+}
+
+#[test]
+fn depth_comparison_samples_keep_reference_offset_and_level() {
+    let texture = Operand::Value(ValueId(0));
+    let sampler = Operand::Value(ValueId(1));
+    let coordinate = Operand::Value(ValueId(2));
+    let reference = Operand::f32(0.75);
+    let offset = Operand::Value(ValueId(3));
+    for shape in ["2d", "2d_array", "cube", "cube_array"] {
+        let mut args = vec![
+            texture.clone(),
+            sampler.clone(),
+            Operand::u32(1),
+            coordinate.clone(),
+        ];
+        let array = shape.ends_with("_array").then(|| Operand::u32(2));
+        if let Some(index) = &array {
+            args.push(index.clone());
+        }
+        args.push(reference.clone());
+        let expected_offset = shape.starts_with("2d").then(|| offset.clone());
+        if expected_offset.is_some() {
+            args.extend([Operand::Bool(true), offset.clone()]);
+        }
+        args.extend([Operand::Bool(true), Operand::f32(0.0)]);
+        let name = format!("air.sample_compare_depth_{shape}.f32");
+        assert_eq!(
+            air_intrinsic(&name, &args).unwrap(),
+            InstructionKind::TextureSample {
+                texture: texture.clone(),
+                sampler: sampler.clone(),
+                coordinate: coordinate.clone(),
+                array_index: array,
+                offset: expected_offset,
+                lod: Some(Operand::f32(0.0)),
+                gradient: None,
+                bias: None,
+                gather: None,
+                compare: Some(reference.clone()),
+            }
+        );
+        args[2] = Operand::u32(2);
+        assert!(air_intrinsic(&name, &args).is_err());
+        args[2] = Operand::u32(1);
+        args.pop();
+        assert!(air_intrinsic(&name, &args).is_err());
+    }
+}

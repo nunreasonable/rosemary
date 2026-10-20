@@ -100,7 +100,10 @@ fn bracketed(bytes: &[u8], open: u8, close: u8) -> Option<usize> {
 }
 
 /// The size of one x86-64/arm64 type, or `None` where it cannot be known.
-fn size_of_type(bytes: &[u8]) -> Option<usize> {
+pub(crate) fn size_of_type(bytes: &[u8]) -> Option<usize> {
+    if type_length(bytes)? != bytes.len() {
+        return None;
+    }
     let bytes = &bytes[bytes.iter().take_while(|b| b"rnNoORVA".contains(b)).count()..];
     Some(match *bytes.first()? {
         b'c' | b'C' | b'B' => 1,

@@ -137,7 +137,7 @@ fn emulated(
 /// guest's: `/bin/sh` exists on nearly every Linux host, so a guest spawning
 /// `/bin/sh` would be handed the host's ELF shell instead of the prefix's.
 fn program_path(path: &str) -> String {
-    let host = prefix::ns::host_path(path);
+    let host = prefix::ns::existing_host_path(path);
     match host.exists() {
         true => host.to_string_lossy().into_owned(),
         false => path.to_string(),

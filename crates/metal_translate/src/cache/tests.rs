@@ -36,6 +36,7 @@ fn library() -> TranslatedLibrary {
         }],
         entries: vec![
             EntryArtifact {
+                arguments: None,
                 name: "kernel_store_const".to_owned(),
                 stage: Stage::Kernel,
                 words: vec![0x0723_0203, 1, 2, 3, u32::MAX],
@@ -75,6 +76,7 @@ fn library() -> TranslatedLibrary {
                 varyings: Vec::new(),
             },
             EntryArtifact {
+                arguments: None,
                 name: String::new(),
                 stage: Stage::Vertex,
                 words: vec![],
@@ -433,4 +435,16 @@ fn pruning_removes_other_builds_and_nothing_else() {
 fn the_cache_version_is_a_digest() {
     assert_eq!(CACHE_VERSION.len(), 64);
     assert!(CACHE_VERSION.bytes().all(|byte| byte.is_ascii_hexdigit()));
+}
+
+#[test]
+fn reflection_survives_cache_roundtrip() {
+    let module=crate::parse_msl("struct Params { float4 colors[2]; }; kernel void shade(constant Params& params [[buffer(4)]], device float4* output [[buffer(1)]]) { output[0] = params.colors[0]; }").unwrap();
+    let library = crate::emit_spirv(&module, &crate::TargetProfile::vulkan_1_3()).unwrap();
+    assert!(library.entries[0].arguments.is_some());
+    let key = [37; 32];
+    assert_eq!(
+        codec::decode(&codec::encode(&key, &library), &key),
+        Some(library)
+    );
 }

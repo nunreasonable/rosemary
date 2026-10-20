@@ -601,12 +601,15 @@ pub(crate) fn check_last_window_closed() {
     }
 }
 
-/// `-activateIgnoringOtherApps:`, which has nothing to activate yet.
-///
-/// Present rather than absent because every Cocoa `main` calls it, and a refusal
-/// there would stop a program on a line that does not matter until there is a
-/// window to bring forward.
-unsafe extern "C" fn activate(_receiver: Id, _sel: Sel, _flag: u8) {}
+/// Ask the compositor to bring this application's visible window forward.
+unsafe extern "C" fn activate(_receiver: Id, _sel: Sel) {
+    crate::window::activate_application();
+}
+
+unsafe extern "C" fn activate_ignoring_other_apps(receiver: Id, sel: Sel, _flag: u8) {
+    // The compositor decides whether a focus-stealing request may be honored.
+    unsafe { activate(receiver, sel) };
+}
 
 /// `-setActivationPolicy:`, which answers that it succeeded.
 unsafe extern "C" fn set_activation_policy(_receiver: Id, _sel: Sel, _policy: isize) -> u8 {
@@ -1074,7 +1077,8 @@ pub(crate) fn install() {
         "run" => run, c"v16@0:8";
         "stop:" => stop, c"v24@0:8@16";
         "terminate:" => terminate, c"v24@0:8@16";
-        "activateIgnoringOtherApps:" => activate, c"v20@0:8c16";
+        "activate" => activate, c"v16@0:8";
+        "activateIgnoringOtherApps:" => activate_ignoring_other_apps, c"v20@0:8c16";
         "setActivationPolicy:" => set_activation_policy, c"c24@0:8q16";
         "currentSystemPresentationOptions" => presentation_options, c"Q16@0:8";
         "presentationOptions" => presentation_options, c"Q16@0:8";

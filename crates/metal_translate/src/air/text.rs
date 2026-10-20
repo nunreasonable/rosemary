@@ -550,6 +550,7 @@ impl MetadataResource {
             .get(self.argument as usize)
             .ok_or_else(|| semantic("resource metadata refers to a missing parameter"))?;
         Ok(Resource {
+            reflection: None,
             argument: self.argument,
             kind: ResourceKind::Buffer,
             index: self.index,

@@ -879,6 +879,7 @@ fn emits_a_writable_3d_texture_descriptor_in_its_metal_namespace() {
             function: 0,
             stage: Stage::Kernel,
             resources: vec![Resource {
+                reflection: None,
                 argument: 0,
                 kind: ResourceKind::Texture,
                 index: 7,
@@ -1226,6 +1227,7 @@ fn a_module_constant_table_becomes_a_private_variable() {
             function: 0,
             stage: Stage::Kernel,
             resources: vec![Resource {
+                reflection: None,
                 argument: 0,
                 kind: ResourceKind::Buffer,
                 index: 0,
@@ -1351,6 +1353,7 @@ fn a_local_variable_is_declared_in_the_entry_block() {
             function: 0,
             stage: Stage::Kernel,
             resources: vec![Resource {
+                reflection: None,
                 argument: 0,
                 kind: ResourceKind::Buffer,
                 index: 0,
@@ -1421,6 +1424,7 @@ fn buffer_kernel(values: Vec<Type>, instructions: Vec<Instruction>) -> Module {
             function: 0,
             stage: Stage::Kernel,
             resources: vec![Resource {
+                reflection: None,
                 argument: 0,
                 kind: ResourceKind::Buffer,
                 index: 0,
@@ -1466,6 +1470,7 @@ fn typed_buffer_kernel(element: Type, values: Vec<Type>, instructions: Vec<Instr
             function: 0,
             stage: Stage::Kernel,
             resources: vec![Resource {
+                reflection: None,
                 argument: 0,
                 kind: ResourceKind::Buffer,
                 index: 0,
@@ -1843,6 +1848,7 @@ fn a_constant_address_space_pointer_phi_keeps_its_buffer_storage_class() {
             function: 0,
             stage: Stage::Kernel,
             resources: vec![Resource {
+                reflection: None,
                 argument: 0,
                 kind: ResourceKind::Buffer,
                 index: 0,
@@ -2020,6 +2026,7 @@ fn a_signed_texture_is_read_through_a_signed_image_type() {
             function: 0,
             stage: Stage::Kernel,
             resources: vec![Resource {
+                reflection: None,
                 argument: 0,
                 kind: ResourceKind::Texture,
                 index: 0,
@@ -2237,6 +2244,7 @@ fn sample_with_offset(offset: Operand) -> (rspirv::dr::Module, Vec<rspirv::dr::O
             stage: Stage::Kernel,
             resources: vec![
                 Resource {
+                    reflection: None,
                     argument: 0,
                     kind: ResourceKind::Texture,
                     index: 0,
@@ -2247,6 +2255,7 @@ fn sample_with_offset(offset: Operand) -> (rspirv::dr::Module, Vec<rspirv::dr::O
                     inline_sampler: None,
                 },
                 Resource {
+                    reflection: None,
                     argument: 1,
                     kind: ResourceKind::Sampler,
                     index: 0,
@@ -2366,5 +2375,70 @@ fn omits_a_zero_sampling_offset() {
             panic!("unexpected sample operands: {operands:?}");
         };
         assert_eq!(*mask, ImageOperands::LOD);
+    }
+}
+
+#[test]
+fn emits_array_of_vectors_insertions_and_extractions() {
+    let vector = Type::Vector {
+        element: Box::new(Type::Float { bits: 32 }),
+        lanes: 4,
+    };
+    let array = Type::Array {
+        element: Box::new(vector.clone()),
+        count: 4,
+    };
+    let module = Module {
+        static_initializers: vec![],
+        globals: vec![],
+        functions: vec![Function {
+            name: "array_round_trip".into(),
+            result: Type::Void,
+            parameters: vec![],
+            values: vec![array.clone(), vector.clone()],
+            blocks: vec![Block {
+                id: BlockId(0),
+                name: "entry".into(),
+                instructions: vec![
+                    Instruction {
+                        result: Some(ValueId(0)),
+                        kind: InstructionKind::CompositeInsert {
+                            composite: Operand::Undef(array),
+                            object: Operand::Composite {
+                                ty: vector,
+                                elements: vec![Operand::f32(1.0); 4],
+                            },
+                            index: 3,
+                        },
+                    },
+                    Instruction {
+                        result: Some(ValueId(1)),
+                        kind: InstructionKind::CompositeExtract {
+                            composite: Operand::Value(ValueId(0)),
+                            index: 3,
+                        },
+                    },
+                ],
+                terminator: Terminator::Return(None),
+            }],
+        }],
+        entries: vec![EntryPoint {
+            function: 0,
+            stage: Stage::Kernel,
+            resources: vec![],
+            inputs: vec![],
+            outputs: vec![],
+        }],
+    };
+    module.verify().unwrap();
+    let library = emit_spirv(&module, &TargetProfile::vulkan_1_3()).unwrap();
+    let parsed = rspirv::dr::load_words(&library.entries[0].words).unwrap();
+    let instructions = &parsed.functions[0].blocks[0].instructions;
+    for opcode in [Op::CompositeInsert, Op::CompositeExtract] {
+        assert!(
+            instructions
+                .iter()
+                .any(|instruction| instruction.class.opcode == opcode)
+        );
     }
 }

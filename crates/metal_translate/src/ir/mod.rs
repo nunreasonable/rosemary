@@ -221,6 +221,8 @@ impl Type {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Resource {
+    /// Original Metal type metadata, independent of the LLVM storage layout.
+    pub reflection: Option<crate::reflection::ShaderType>,
     pub argument: u32,
     pub kind: ResourceKind,
     pub index: u32,

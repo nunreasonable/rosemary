@@ -78,6 +78,8 @@ pub struct Window {
     title_visibility: isize,
     /// `-windowController`, not retained: the controller owns the window.
     window_controller: Id,
+    /// Weak, as required by NSWindow's parentWindow property.
+    parent_window: Id,
     /// `-setHidesOnDeactivate:`, kept so a program reads back what it set.
     hides_on_deactivate: usize,
     /// When this window was last ordered front, from [`ORDERED`]: the stacking
@@ -1271,7 +1273,8 @@ unsafe extern "C" fn content_view(receiver: Id, sel: Sel) -> Id {
     };
     let view = objc::object::create_instance(class, 0);
     // SAFETY: `msg::entry` with `-initWithFrame:`, `id (id, SEL, NSRect)`.
-    let init: unsafe extern "C" fn(Id, Sel, NSRect) -> Id = unsafe { std::mem::transmute(objc::msg::entry()) };
+    let init: unsafe extern "C" fn(Id, Sel, NSRect) -> Id =
+        unsafe { std::mem::transmute(objc::msg::entry()) };
     let view = unsafe { init(view, objc::sel::get("initWithFrame:"), bounds) };
     // SAFETY: a live window and view; the window takes its own reference.
     unsafe { set_content_view(receiver, objc::sel::get("setContentView:"), view) };
@@ -1527,6 +1530,7 @@ pub(crate) unsafe extern "C" fn dealloc(receiver: Id, sel: Sel) {
     unsafe { order_out(receiver, sel, std::ptr::null_mut()) };
     objc::arc::destroy_weak(&mut window.first_responder);
     objc::arc::destroy_weak(&mut window.initial_first_responder);
+    objc::arc::destroy_weak(&mut window.parent_window);
     WINDOWS
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -1580,6 +1584,23 @@ static KEY: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new
 
 pub fn key_window() -> Id {
     KEY.load(std::sync::atomic::Ordering::Acquire) as Id
+}
+
+/// Raise the application's frontmost visible toplevel without unhiding windows.
+pub(crate) fn activate_application() {
+    let key = key_window();
+    let candidate = all()
+        .into_iter()
+        .filter(|id| {
+            let window = window_of(*id);
+            window.shown != 0
+                && !window.sdl.is_null()
+                && presentation_of_sdl(window.sdl) == Presentation::Toplevel
+        })
+        .max_by_key(|id| (*id == key, window_of(*id).ordered));
+    if let Some(window) = candidate {
+        sdl3::video::raise_window(window_of(window).sdl);
+    }
 }
 
 /// Say which window is key, from the event pump when focus moves.
@@ -1850,12 +1871,16 @@ unsafe extern "C" fn set_background_color(receiver: Id, _sel: Sel, color: Id) {
 fn background_rgba(window: Id) -> Option<(f64, f64, f64, f64)> {
     let color = window_of(window).background;
     // SAFETY: an object the window retained.
-    (!color.is_null()).then(|| unsafe { crate::color::components(color) })
+    (!color.is_null() && crate::color::pattern_image(color).is_null())
+        .then(|| unsafe { crate::color::components(color) })
 }
 
 /// The window's `backgroundColor` as one premultiplied BGRA pixel, or `None`
 /// when the program never set one.
 pub(crate) fn background_pixel(window: Id) -> Option<[u8; 4]> {
+    if !crate::color::pattern_image(window_of(window).background).is_null() {
+        return None;
+    }
     let (red, green, blue, alpha) = background_rgba(window)?;
     let alpha = alpha.clamp(0.0, 1.0);
     let channel = |value: f64| (value.clamp(0.0, 1.0) * alpha * 255.0).round() as u8;
@@ -1865,6 +1890,21 @@ pub(crate) fn background_pixel(window: Id) -> Option<[u8; 4]> {
         channel(red),
         (alpha * 255.0).round() as u8,
     ])
+}
+
+pub(crate) fn background_pattern(window: Id) -> Option<crate::color::Pattern> {
+    let image = crate::color::pattern_image(window_of(window).background);
+    if image.is_null() {
+        return None;
+    }
+    let cg = crate::image::cg_image_of(image)?;
+    let (width, height, pixels) = crate::graphics::image_bgra(cg)?;
+    Some(crate::color::Pattern {
+        width,
+        height,
+        pixels,
+        size: crate::image::declared_size(image),
+    })
 }
 
 unsafe extern "C" fn background_color(receiver: Id, _sel: Sel) -> Id {
@@ -2013,6 +2053,14 @@ unsafe extern "C" fn set_next_responder(receiver: Id, _sel: Sel, responder: Id) 
 
 unsafe extern "C" fn set_initial_first_responder(receiver: Id, _sel: Sel, responder: Id) {
     objc::arc::store_weak(&mut window_of(receiver).initial_first_responder, responder);
+}
+
+unsafe extern "C" fn parent_window(receiver: Id, _sel: Sel) -> Id {
+    window_of(receiver).parent_window
+}
+
+unsafe extern "C" fn set_parent_window(receiver: Id, _sel: Sel, parent: Id) {
+    objc::arc::store_weak(&mut window_of(receiver).parent_window, parent);
 }
 
 unsafe extern "C" fn initial_first_responder(receiver: Id, _sel: Sel) -> Id {
@@ -2491,6 +2539,8 @@ pub(crate) fn install() {
         "setAllowsAutomaticWindowTabbing:" => ignored_flag, c"v20@0:8c16";
     });
     methods!(class, {
+        "parentWindow" => parent_window, c"@16@0:8";
+        "setParentWindow:" => set_parent_window, c"v24@0:8@16";
         "appearance" => appearance, c"@16@0:8";
         "setAppearance:" => set_appearance, c"v24@0:8@16";
         "effectiveAppearance" => effective_appearance, c"@16@0:8";
@@ -2682,6 +2732,24 @@ pub(crate) fn install() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parent_window_is_weak() {
+        crate::bootstrap();
+        let class = objc::class::lookup(c"NSWindow").unwrap();
+        let child = objc::object::create_instance(class, 0);
+        let parent = objc::object::create_instance(class, 0);
+        let sel = objc::sel::get("x");
+        // SAFETY: both objects have the registered NSWindow layout.
+        unsafe {
+            assert!(parent_window(child, sel).is_null());
+            set_parent_window(child, sel, parent);
+            assert_eq!(parent_window(child, sel), parent);
+            objc::arc::release(parent);
+            assert!(parent_window(child, sel).is_null());
+        }
+        objc::arc::release(child);
+    }
 
     /// What a window is, is read off its style mask and its level together -
     /// and is read again at every ordering, because a toolkit reuses one window

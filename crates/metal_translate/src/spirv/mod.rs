@@ -214,6 +214,7 @@ pub struct ResourceBinding {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EntryArtifact {
+    pub arguments: Option<Vec<crate::reflection::Argument>>,
     pub name: String,
     pub stage: Stage,
     pub words: Vec<u32>,
@@ -266,6 +267,11 @@ pub fn emit_spirv(
             "the module's static initializers have not been run; specialize it first",
         ));
     }
+    let reflected: Vec<_> = module
+        .entries
+        .iter()
+        .map(|e| crate::reflection::arguments(&e.resources, &module.functions[e.function]))
+        .collect();
     let widened;
     let module = match target.shader_float16 {
         false => match half::widen(module) {
@@ -281,7 +287,12 @@ pub fn emit_spirv(
     let entries = module
         .entries
         .iter()
-        .map(|entry| emit_entry(module, entry, target))
+        .zip(reflected)
+        .map(|(entry, arguments)| {
+            let mut artifact = emit_entry(module, entry, target)?;
+            artifact.arguments = arguments;
+            Ok(artifact)
+        })
         .collect::<Result<Vec<_>, _>>()?;
     let function_constants = module
         .globals
@@ -435,6 +446,7 @@ fn emit_entry(
         .map_err(|error| emission(format!("emitted SPIR-V could not be parsed: {error}")))?;
     let (vertex_inputs, varyings) = interface_reflection(entry, function);
     Ok(EntryArtifact {
+        arguments: None,
         name: function.name.clone(),
         stage: entry.stage,
         words,

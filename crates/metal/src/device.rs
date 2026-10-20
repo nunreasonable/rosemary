@@ -143,6 +143,60 @@ pub(super) unsafe extern "C" fn new_compute_pipeline(
     }
 }
 
+pub(super) unsafe extern "C" fn new_render_pipeline_with_reflection(
+    receiver: Id,
+    sel: Sel,
+    descriptor: Id,
+    options: u64,
+    reflection: *mut Id,
+    error: *mut Id,
+) -> Id {
+    if !reflection.is_null() {
+        // SAFETY: the caller supplies writable reflection storage.
+        unsafe { *reflection = std::ptr::null_mut() };
+    }
+    let fail = |message: &str| {
+        if !error.is_null() {
+            unsafe { *error = foundation::error::make("MTLRenderPipelineErrorDomain", 3, message) };
+        }
+        gpu::trace(message);
+        std::ptr::null_mut()
+    };
+    if options & !3 != 0 {
+        return fail("unsupported render pipeline options");
+    }
+    let reflected = if options != 0 && !reflection.is_null() {
+        if !object::is_kind(descriptor, c"MTLRenderPipelineDescriptor") {
+            return fail("render pipeline reflection requires a descriptor");
+        }
+        let described = unsafe { object::body::<pipeline::RenderPipelineDescriptor>(descriptor) };
+        let Some(vertex) = (unsafe { artifact_of(described.vertex_function) }) else {
+            return fail("render pipeline has no vertex function");
+        };
+        let Some(fragment) = (unsafe { artifact_of(described.fragment_function) }) else {
+            return fail("render pipeline has no fragment function");
+        };
+        let (Some(vertex), Some(fragment)) = (&vertex.arguments, &fragment.arguments) else {
+            return fail(
+                "shader argument type metadata is incomplete; reflection cannot be generated",
+            );
+        };
+        Some((vertex, fragment))
+    } else {
+        None
+    };
+    let state = unsafe { new_render_pipeline(receiver, sel, descriptor, error) };
+    if !state.is_null() {
+        if let Some((vertex, fragment)) = reflected {
+            unsafe {
+                *reflection =
+                    objc::arc::autorelease(crate::reflection::render(vertex, fragment, options))
+            };
+        }
+    }
+    state
+}
+
 pub(super) unsafe extern "C" fn new_render_pipeline(
     receiver: Id,
     _sel: Sel,

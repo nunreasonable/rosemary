@@ -41,6 +41,7 @@ mod selector {
     pub const DEFAULT_OUTPUT_DEVICE: u32 = fourcc(b"dOut");
     pub const DEFAULT_SYSTEM_OUTPUT_DEVICE: u32 = fourcc(b"sOut");
     pub const DEFAULT_INPUT_DEVICE: u32 = fourcc(b"dIn ");
+    pub const DEVICE_FOR_UID: u32 = fourcc(b"duid");
 
     // On a device.
     pub const NAME: u32 = fourcc(b"lnam");
@@ -99,6 +100,15 @@ const _: () = assert!(size_of::<Address>() == 12);
 struct ValueRange {
     minimum: f64,
     maximum: f64,
+}
+
+/// The legacy UID lookup takes this structure as its in/out property data.
+#[repr(C)]
+struct ValueTranslation {
+    input: *const c_void,
+    input_size: u32,
+    output: *mut c_void,
+    output_size: u32,
 }
 
 /// What a device is, as SDL reports it.
@@ -480,6 +490,7 @@ fn system_property(selector: u32) -> Option<Vec<u8>> {
         // `kAudioObjectUnknown` when there is nothing to record from: a caller
         // checks for it before opening an input.
         selector::DEFAULT_INPUT_DEVICE => as_bytes(&input().map_or(0, |d| d.id)).to_vec(),
+        selector::DEVICE_FOR_UID => vec![0; size_of::<ValueTranslation>()],
         _ => return None,
     })
 }
@@ -581,6 +592,41 @@ pub unsafe extern "C" fn AudioObjectGetPropertyData(
     let address = unsafe { *address };
     if !known(object) {
         return BAD_OBJECT;
+    }
+    if object == SYSTEM_OBJECT && address.selector == selector::DEVICE_FOR_UID {
+        if size.is_null() {
+            return crate::status::PARAM_ERROR;
+        }
+        let wanted = size_of::<ValueTranslation>() as u32;
+        // SAFETY: the caller provides the property size and buffer.
+        unsafe {
+            let capacity = *size;
+            *size = wanted;
+            if data.is_null() {
+                return SUCCESS;
+            }
+            if capacity < wanted {
+                return i32::from_be_bytes(*b"!siz");
+            }
+            let translation = &*data.cast::<ValueTranslation>();
+            if translation.input.is_null() || translation.output.is_null()
+                || translation.input_size != size_of::<usize>() as u32
+                || translation.output_size != size_of::<ObjectId>() as u32
+            {
+                return crate::status::PARAM_ERROR;
+            }
+            let uid = translation.input.cast::<corefoundation::base::CFTypeRef>().read_unaligned();
+            let Some(uid) = corefoundation::string::as_string(uid) else {
+                return crate::status::PARAM_ERROR;
+            };
+            let uid = uid.utf8();
+            let id = [Some(output()), input()].into_iter().flatten()
+                .find(|device| device.uid.as_bytes() == uid.as_slice())
+                .map_or(0, |device| device.id);
+            translation.output.cast::<ObjectId>().write_unaligned(id);
+            crate::trace::say(format_args!("device UID lookup -> {id}"), SUCCESS);
+            return SUCCESS;
+        }
     }
     match property(object, &address) {
         Some(bytes) => unsafe { answer(&bytes, data, size) },
@@ -1240,6 +1286,34 @@ unsafe extern "C" fn capture(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn device_uid_translation_resolves_known_and_unknown_uids() {
+        corefoundation::bootstrap();
+        let address = Address { selector: selector::DEVICE_FOR_UID, scope: scope::GLOBAL, element: 0 };
+        for (name, expected) in [("rosemary:default-output", OUTPUT_DEVICE), ("absent-device", 0)] {
+            let uid = corefoundation::string::from_bytes(name.as_bytes(), false);
+            let mut id = u32::MAX;
+            let mut translation = ValueTranslation {
+                input: (&uid as *const corefoundation::base::CFTypeRef).cast(),
+                input_size: size_of::<usize>() as u32,
+                output: (&mut id as *mut u32).cast(),
+                output_size: 4,
+            };
+            let mut size = size_of::<ValueTranslation>() as u32;
+            // SAFETY: all property buffers match their declared sizes.
+            unsafe {
+                assert_eq!(AudioObjectHasProperty(SYSTEM_OBJECT, &address), 1);
+                assert_eq!(AudioObjectGetPropertyData(SYSTEM_OBJECT, &address, 0,
+                    std::ptr::null(), &mut size, (&mut translation as *mut ValueTranslation).cast()), SUCCESS);
+                assert_eq!(id, expected);
+                size = 1;
+                assert_ne!(AudioObjectGetPropertyData(SYSTEM_OBJECT, &address, 0,
+                    std::ptr::null(), &mut size, (&mut translation as *mut ValueTranslation).cast()), SUCCESS);
+                corefoundation::api::CFRelease(uid);
+            }
+        }
+    }
 
     fn ask(object: ObjectId, selector: u32, scope: u32) -> Option<Vec<u8>> {
         let address = Address {

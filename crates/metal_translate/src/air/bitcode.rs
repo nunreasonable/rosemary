@@ -175,6 +175,7 @@ pub(super) fn parse_minimal_store_bitcode(bitcode: &Bitcode) -> Result<Module, T
             function: 0,
             stage: Stage::Kernel,
             resources: vec![Resource {
+                reflection: None,
                 argument: 0,
                 kind: ResourceKind::Buffer,
                 index: 0,
@@ -292,6 +293,7 @@ fn parse_packed_air(
                 .get(resource.argument as usize)
                 .ok_or_else(|| semantic("AIR resource names a missing argument"))?;
             Ok(Resource {
+                reflection: resource.reflection.clone(),
                 argument: resource.argument,
                 kind: resource.kind,
                 index: resource.index,
