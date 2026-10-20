@@ -154,6 +154,8 @@ exports::exports! {
         "mach_vm_remap" => memory::mach_vm_remap,
         "mach_vm_protect" | "vm_protect" => memory::mach_vm_protect,
         "mach_vm_read" | "vm_read" => memory::mach_vm_read,
+        "mach_vm_read_overwrite" => memory::mach_vm_read_overwrite,
+        "mach_vm_write" | "vm_write" => memory::mach_vm_write,
         "mach_port_deallocate" => space::mach_port_deallocate,
         "mach_port_destroy" => space::mach_port_destroy,
         "mach_port_mod_refs" => space::mach_port_mod_refs,

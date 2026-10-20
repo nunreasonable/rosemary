@@ -14,8 +14,11 @@
 //! the surface - its size and layout - so the process that maps it can rebuild
 //! the same surface; the pixels follow.
 //!
-//! Planar surfaces (`kIOSurfacePlaneInfo`) are refused rather than laid out as
-//! one plane.
+//! A planar surface (`kIOSurfacePlaneInfo`, such as NV12) is several planes in
+//! the one allocation, each with its own size, row and offset. The surface-wide
+//! element size and row mean nothing for it and read zero; the plane accessors
+//! answer instead. A plane list that cannot be laid out is refused, never
+//! reshaped into something the program did not ask for.
 
 #![allow(non_snake_case, clippy::missing_safety_doc)]
 
@@ -51,6 +54,9 @@ const PAGE: usize = 4096;
 /// The largest width or height `IOSurfaceGetPropertyMaximum` admits.
 const MAX_EXTENT: usize = 16384;
 const MAX_BYTES_PER_ELEMENT: usize = 16;
+/// More than any planar format needs (YUV has three); the header page holds
+/// this many.
+const MAX_PLANES: usize = 4;
 
 /// The property keys, as `(Mach-O name, text)`. The texts are Apple's: a
 /// program may build a key with `CFSTR` instead of importing it, and the two
@@ -66,12 +72,12 @@ const KEYS: &[(&str, &str)] = &[
     ("_kIOSurfaceOffset", OFFSET),
     ("_kIOSurfacePixelFormat", PIXEL_FORMAT),
     ("_kIOSurfacePlaneInfo", PLANE_INFO),
-    ("_kIOSurfacePlaneWidth", "IOSurfacePlaneWidth"),
-    ("_kIOSurfacePlaneHeight", "IOSurfacePlaneHeight"),
-    ("_kIOSurfacePlaneBytesPerRow", "IOSurfacePlaneBytesPerRow"),
-    ("_kIOSurfacePlaneBytesPerElement", "IOSurfacePlaneBytesPerElement"),
-    ("_kIOSurfacePlaneOffset", "IOSurfacePlaneOffset"),
-    ("_kIOSurfacePlaneSize", "IOSurfacePlaneSize"),
+    ("_kIOSurfacePlaneWidth", PLANE_WIDTH),
+    ("_kIOSurfacePlaneHeight", PLANE_HEIGHT),
+    ("_kIOSurfacePlaneBytesPerRow", PLANE_BYTES_PER_ROW),
+    ("_kIOSurfacePlaneBytesPerElement", PLANE_BYTES_PER_ELEMENT),
+    ("_kIOSurfacePlaneOffset", PLANE_OFFSET),
+    ("_kIOSurfacePlaneSize", PLANE_SIZE),
     ("_kIOSurfaceCacheMode", "IOSurfaceCacheMode"),
     ("_kIOSurfaceIsGlobal", "IOSurfaceIsGlobal"),
     (
@@ -90,6 +96,12 @@ const ELEMENT_HEIGHT: &str = "IOSurfaceElementHeight";
 const OFFSET: &str = "IOSurfaceOffset";
 const PIXEL_FORMAT: &str = "IOSurfacePixelFormat";
 const PLANE_INFO: &str = "IOSurfacePlaneInfo";
+const PLANE_WIDTH: &str = "IOSurfacePlaneWidth";
+const PLANE_HEIGHT: &str = "IOSurfacePlaneHeight";
+const PLANE_BYTES_PER_ROW: &str = "IOSurfacePlaneBytesPerRow";
+const PLANE_BYTES_PER_ELEMENT: &str = "IOSurfacePlaneBytesPerElement";
+const PLANE_OFFSET: &str = "IOSurfacePlaneOffset";
+const PLANE_SIZE: &str = "IOSurfacePlaneSize";
 
 /// The data symbols this crate publishes.
 pub fn data_symbols() -> Vec<(String, u64)> {
@@ -103,10 +115,25 @@ struct Surface {
     state: State,
 }
 
+/// One plane of a surface. `offset` is from the surface's base address, and
+/// `size` is the room the plane has: at least a full row for each of its rows.
+/// The elements of a plane are one by one.
+#[repr(C)]
+#[derive(Clone, Copy, Default, PartialEq, Debug)]
+struct Plane {
+    width: u64,
+    height: u64,
+    bytes_per_element: u64,
+    bytes_per_row: u64,
+    offset: u64,
+    size: u64,
+}
+
 struct State {
     id: u32,
     width: usize,
     height: usize,
+    /// These four are zero on a planar surface, whose planes have their own.
     bytes_per_element: usize,
     bytes_per_row: usize,
     element_width: usize,
@@ -114,6 +141,9 @@ struct State {
     pixel_format: u32,
     offset: usize,
     alloc_size: usize,
+    /// Empty for a surface that is one plane, which is every one but a planar
+    /// format's.
+    planes: Vec<Plane>,
     /// The pixels: one page past the start of `mapping`.
     memory: *mut u8,
     /// The whole memory file, mapped: the description page and the pixels.
@@ -125,6 +155,31 @@ struct State {
     locks: AtomicI32,
     /// `IOSurfaceSetValue`'s pairs, both retained.
     values: Mutex<Vec<(usize, usize)>>,
+}
+
+impl State {
+    /// Plane `index`: a planar surface's own, or - for a surface with no
+    /// planes - plane 0 as the surface itself, which is Apple's rule.
+    fn plane(&self, index: usize) -> Option<Plane> {
+        if !self.planes.is_empty() {
+            return self.planes.get(index).copied();
+        }
+        let rows = self.height.div_ceil(self.element_height.max(1));
+        (index == 0).then_some(Plane {
+            width: self.width as u64,
+            height: self.height as u64,
+            bytes_per_element: self.bytes_per_element as u64,
+            bytes_per_row: self.bytes_per_row as u64,
+            offset: 0,
+            size: self.bytes_per_row.saturating_mul(rows) as u64,
+        })
+    }
+
+    /// Where `plane` starts in memory.
+    fn base_of(&self, plane: &Plane) -> *mut u8 {
+        // SAFETY: a plane lies inside the allocation, which the offset is in.
+        unsafe { self.memory.add(self.offset + plane.offset as usize) }
+    }
 }
 
 impl Drop for State {
@@ -223,8 +278,8 @@ fn align_up(value: usize, alignment: usize) -> Option<usize> {
 
 fn alignment_of(name: &str) -> usize {
     match name {
-        BYTES_PER_ROW => ROW_ALIGNMENT,
-        ALLOC_SIZE => PAGE,
+        BYTES_PER_ROW | PLANE_BYTES_PER_ROW => ROW_ALIGNMENT,
+        ALLOC_SIZE | PLANE_SIZE => PAGE,
         _ => 1,
     }
 }
@@ -242,13 +297,131 @@ fn refuse(what: &str) -> CFTypeRef {
     std::ptr::null()
 }
 
+/// Why `planes` cannot be the layout of a surface with `room` bytes past its
+/// base address, if they cannot. A surface from another process is held to
+/// this too: a plane that strays outside the allocation would be read.
+fn plane_problem(planes: &[Plane], room: u64) -> Option<String> {
+    if planes.is_empty() || planes.len() > MAX_PLANES {
+        return Some(format!(
+            "{} planes, where one to {MAX_PLANES} are supported",
+            planes.len()
+        ));
+    }
+    for (index, plane) in planes.iter().enumerate() {
+        let Plane {
+            width,
+            height,
+            bytes_per_element,
+            bytes_per_row,
+            offset,
+            size,
+        } = *plane;
+        if width == 0 || height == 0 || bytes_per_element == 0 {
+            return Some(format!("plane {index} is empty"));
+        }
+        if width > MAX_EXTENT as u64
+            || height > MAX_EXTENT as u64
+            || bytes_per_element > MAX_BYTES_PER_ELEMENT as u64
+        {
+            return Some(format!(
+                "plane {index}, {width}x{height} at {bytes_per_element} bytes per element, is past the maximum"
+            ));
+        }
+        // Bounded by the maxima above, so this cannot overflow.
+        if bytes_per_row < width * bytes_per_element {
+            return Some(format!("plane {index} has rows too short for its width"));
+        }
+        // A row length from another process is not bounded.
+        if bytes_per_row
+            .checked_mul(height)
+            .is_none_or(|rows| size < rows)
+        {
+            return Some(format!("plane {index} is smaller than its rows"));
+        }
+        if offset.checked_add(size).is_none_or(|end| end > room) {
+            return Some(format!("plane {index} is not inside the allocation"));
+        }
+        for (before, other) in planes[..index].iter().enumerate() {
+            if offset < other.offset + other.size && other.offset < offset + size {
+                return Some(format!("planes {before} and {index} overlap"));
+            }
+        }
+    }
+    None
+}
+
+/// An integer property of the plane dictionary `plane`, if it is there.
+fn plane_number(plane: CFTypeRef, name: &str, index: usize) -> Result<Option<u64>, String> {
+    number(plane, name)
+        .map(|v| u64::try_from(v).map_err(|_| format!("plane {index} has a negative {name}")))
+        .transpose()
+}
+
+/// The planes `kIOSurfacePlaneInfo` lists, with what it leaves out filled in:
+/// rows and sizes aligned as `IOSurfaceAlignProperty` says, and each plane
+/// after the end of the one before.
+fn planes_of(properties: CFTypeRef) -> Result<Vec<Plane>, String> {
+    // SAFETY: a dictionary the caller passed, and a key this crate made.
+    let list = unsafe { corefoundation::api::CFDictionaryGetValue(properties, key(PLANE_INFO)) };
+    // SAFETY: null or a CF object from the dictionary.
+    let Some(list) = (unsafe { corefoundation::collections::array(list) }) else {
+        return Err("not an array".to_owned());
+    };
+    if list.values.len() > MAX_PLANES {
+        return Err(format!(
+            "{} planes, where one to {MAX_PLANES} are supported",
+            list.values.len()
+        ));
+    }
+    let mut planes: Vec<Plane> = Vec::new();
+    for (index, &entry) in list.values.iter().enumerate() {
+        // SAFETY: a member of a live array.
+        if unsafe { corefoundation::collections::dictionary(entry) }.is_none() {
+            return Err(format!("plane {index} is not a dictionary"));
+        }
+        let required = |name| {
+            plane_number(entry, name, index)?
+                .filter(|v| *v > 0)
+                .ok_or_else(|| format!("plane {index} has no {name}"))
+        };
+        let (width, height) = (required(PLANE_WIDTH)?, required(PLANE_HEIGHT)?);
+        // As for a surface without planes, an element is a byte unless said.
+        let bytes_per_element = plane_number(entry, PLANE_BYTES_PER_ELEMENT, index)?.unwrap_or(1);
+        let too_large = || format!("plane {index} is too large");
+        let minimum_row = width.checked_mul(bytes_per_element).ok_or_else(too_large)?;
+        let requested_row = plane_number(entry, PLANE_BYTES_PER_ROW, index)?.unwrap_or(0);
+        let bytes_per_row = align_up(requested_row.max(minimum_row) as usize, ROW_ALIGNMENT)
+            .ok_or_else(too_large)? as u64;
+        let minimum_size = bytes_per_row.checked_mul(height).ok_or_else(too_large)?;
+        let requested_size = plane_number(entry, PLANE_SIZE, index)?.unwrap_or(0);
+        let size =
+            align_up(requested_size.max(minimum_size) as usize, PAGE).ok_or_else(too_large)? as u64;
+        let offset = match plane_number(entry, PLANE_OFFSET, index)? {
+            Some(offset) => offset,
+            None => planes
+                .last()
+                .map_or(Some(0), |last| last.offset.checked_add(last.size))
+                .ok_or_else(too_large)?,
+        };
+        planes.push(Plane {
+            width,
+            height,
+            bytes_per_element,
+            bytes_per_row,
+            offset,
+            size,
+        });
+    }
+    match plane_problem(&planes, u64::MAX) {
+        Some(problem) => Err(problem),
+        None => Ok(planes),
+    }
+}
+
 /// `IOSurfaceRef IOSurfaceCreate(CFDictionaryRef properties)`.
 pub unsafe extern "C" fn IOSurfaceCreate(properties: CFTypeRef) -> CFTypeRef {
     if properties.is_null() {
         return std::ptr::null();
-    }
-    if has(properties, PLANE_INFO) {
-        return refuse("planar surfaces (kIOSurfacePlaneInfo) are not supported");
     }
     let positive = |name, default: i64| {
         let value = number(properties, name).unwrap_or(default);
@@ -270,6 +443,13 @@ pub unsafe extern "C" fn IOSurfaceCreate(properties: CFTypeRef) -> CFTypeRef {
             "{width}x{height} at {bytes_per_element} bytes per element is past the maximum"
         ));
     }
+    let planes = match has(properties, PLANE_INFO) {
+        true => match planes_of(properties) {
+            Ok(planes) => planes,
+            Err(problem) => return refuse(&format!("kIOSurfacePlaneInfo: {problem}")),
+        },
+        false => Vec::new(),
+    };
     let Some(minimum_row) = width.div_ceil(element_width).checked_mul(bytes_per_element) else {
         return std::ptr::null();
     };
@@ -283,10 +463,16 @@ pub unsafe extern "C" fn IOSurfaceCreate(properties: CFTypeRef) -> CFTypeRef {
         .and_then(|v| usize::try_from(v).ok())
         .unwrap_or(0);
     let rows = height.div_ceil(element_height);
-    let Some(needed) = bytes_per_row
-        .checked_mul(rows)
-        .and_then(|bytes| bytes.checked_add(offset))
-    else {
+    let extent = match planes.is_empty() {
+        true => bytes_per_row.checked_mul(rows),
+        // `planes_of` has seen that no plane's end overflows.
+        false => planes.iter().try_fold(0usize, |end, plane| {
+            usize::try_from(plane.offset + plane.size)
+                .ok()
+                .map(|plane_end| end.max(plane_end))
+        }),
+    };
+    let Some(needed) = extent.and_then(|bytes| bytes.checked_add(offset)) else {
         return std::ptr::null();
     };
     let requested_size = number(properties, ALLOC_SIZE)
@@ -312,18 +498,24 @@ pub unsafe extern "C" fn IOSurfaceCreate(properties: CFTypeRef) -> CFTypeRef {
     // Unique across processes as well as within one: the process id in the
     // high bits, as a surface that crosses keeps the id it was made with.
     let id = (std::process::id() << 12) ^ NEXT_ID.fetch_add(1, Ordering::Relaxed);
+    let surface_wide = |value: usize| if planes.is_empty() { value as u64 } else { 0 };
+    let mut records = [Plane::default(); MAX_PLANES];
+    records[..planes.len()].copy_from_slice(&planes);
     let header = Header {
         magic: HEADER_MAGIC,
         id,
         width: width as u64,
         height: height as u64,
-        bytes_per_element: bytes_per_element as u64,
-        bytes_per_row: bytes_per_row as u64,
-        element_width: element_width as u64,
-        element_height: element_height as u64,
+        // A planar surface has no surface-wide element or row.
+        bytes_per_element: surface_wide(bytes_per_element),
+        bytes_per_row: surface_wide(bytes_per_row),
+        element_width: surface_wide(element_width),
+        element_height: surface_wide(element_height),
         pixel_format,
         offset: offset as u64,
         alloc_size: alloc_size as u64,
+        plane_count: planes.len() as u32,
+        planes: records,
     };
     match make(std::sync::Arc::new(file), mapped, Some(header)) {
         Some(surface) => surface,
@@ -346,9 +538,27 @@ struct Header {
     pixel_format: u32,
     offset: u64,
     alloc_size: u64,
+    /// Zero for a surface that is one plane.
+    plane_count: u32,
+    planes: [Plane; MAX_PLANES],
 }
 
 const HEADER_MAGIC: u32 = u32::from_be_bytes(*b"IOSf");
+
+const _: () = assert!(size_of::<Header>() <= PAGE);
+
+/// The planes `header` describes, or `None` where they do not fit the
+/// allocation it describes.
+fn header_planes(header: &Header) -> Option<Vec<Plane>> {
+    let planes = header.planes.get(..header.plane_count as usize)?;
+    if planes.is_empty() {
+        return Some(Vec::new());
+    }
+    let room = header.alloc_size.checked_sub(header.offset)?;
+    plane_problem(planes, room)
+        .is_none()
+        .then(|| planes.to_vec())
+}
 
 /// A surface over the memory file `file`, `mapped` bytes long: written with
 /// `header` when it is new, read from its own first page when it arrived from
@@ -378,11 +588,13 @@ fn make(file: std::sync::Arc<OwnedFd>, mapped: usize, header: Option<Header>) ->
         // SAFETY: the first page of a mapping of a surface's file.
         None => unsafe { (mapping as *const Header).read() },
     };
-    if header.magic != HEADER_MAGIC || PAGE + header.alloc_size as usize > mapped {
+    let planes = header_planes(&header)
+        .filter(|_| header.magic == HEADER_MAGIC && PAGE + header.alloc_size as usize <= mapped);
+    let Some(planes) = planes else {
         // SAFETY: the mapping made above.
         unsafe { libc::munmap(mapping.cast(), mapped) };
         return None;
-    }
+    };
     // SAFETY: `Surface` is the registered layout.
     let surface = unsafe { corefoundation::base::allocate::<Surface>(class()) };
     // SAFETY: a fresh, zeroed allocation whose state is written once here.
@@ -400,6 +612,7 @@ fn make(file: std::sync::Arc<OwnedFd>, mapped: usize, header: Option<Header>) ->
                 pixel_format: header.pixel_format,
                 offset: header.offset as usize,
                 alloc_size: header.alloc_size as usize,
+                planes,
                 memory: mapping.add(PAGE),
                 mapping,
                 mapped,
@@ -425,9 +638,13 @@ pub unsafe extern "C" fn IOSurfaceCreateMachPort(surface: CFTypeRef) -> u32 {
         return 0;
     };
     if trace() {
-        // SAFETY: the surface's pixels, `bytes_per_row` bytes a row.
+        // SAFETY: everything the allocation holds past the surface's offset,
+        // which all of its planes lie in.
         let pixels = unsafe {
-            std::slice::from_raw_parts(state.memory.add(state.offset), state.bytes_per_row * state.height)
+            std::slice::from_raw_parts(
+                state.memory.add(state.offset),
+                state.alloc_size.saturating_sub(state.offset),
+            )
         };
         let painted = pixels.iter().any(|&b| b != 0);
         eprintln!(
@@ -474,48 +691,48 @@ fn trace() -> bool {
     *ON.get_or_init(|| std::env::var_os("ROSEMARY_TRACE_IOSURFACE").is_some())
 }
 
-/// `size_t IOSurfaceGetPlaneCount(IOSurfaceRef)`: zero, which is what a
-/// surface with no planes - every one here - reports.
-pub unsafe extern "C" fn IOSurfaceGetPlaneCount(_surface: CFTypeRef) -> usize {
-    0
+/// `size_t IOSurfaceGetPlaneCount(IOSurfaceRef)`: zero for a surface that is
+/// one plane, which is how a program tells a planar surface from any other.
+pub unsafe extern "C" fn IOSurfaceGetPlaneCount(surface: CFTypeRef) -> usize {
+    state(surface).map_or(0, |s| s.planes.len())
 }
 
-/// The plane accessors, answered for plane 0 of a non-planar surface as the
-/// surface itself, which is Apple's rule.
+/// The plane accessors answer zero for a plane the surface does not have. For
+/// plane 0 of a surface that is one plane they answer the surface itself,
+/// which is Apple's rule.
+fn plane_of(surface: CFTypeRef, index: usize) -> Option<Plane> {
+    state(surface)?.plane(index)
+}
+
 pub unsafe extern "C" fn IOSurfaceGetWidthOfPlane(surface: CFTypeRef, plane: usize) -> usize {
-    if plane != 0 {
-        return 0;
-    }
-    state(surface).map_or(0, |s| s.width)
+    plane_of(surface, plane).map_or(0, |p| p.width as usize)
 }
 
 pub unsafe extern "C" fn IOSurfaceGetHeightOfPlane(surface: CFTypeRef, plane: usize) -> usize {
-    if plane != 0 {
-        return 0;
-    }
-    state(surface).map_or(0, |s| s.height)
+    plane_of(surface, plane).map_or(0, |p| p.height as usize)
 }
 
 pub unsafe extern "C" fn IOSurfaceGetBytesPerRowOfPlane(surface: CFTypeRef, plane: usize) -> usize {
-    if plane != 0 {
-        return 0;
-    }
-    state(surface).map_or(0, |s| s.bytes_per_row)
+    plane_of(surface, plane).map_or(0, |p| p.bytes_per_row as usize)
 }
 
-pub unsafe extern "C" fn IOSurfaceGetBytesPerElementOfPlane(surface: CFTypeRef, plane: usize) -> usize {
-    if plane != 0 {
-        return 0;
-    }
-    state(surface).map_or(0, |s| s.bytes_per_element)
+pub unsafe extern "C" fn IOSurfaceGetBytesPerElementOfPlane(
+    surface: CFTypeRef,
+    plane: usize,
+) -> usize {
+    plane_of(surface, plane).map_or(0, |p| p.bytes_per_element as usize)
 }
 
-pub unsafe extern "C" fn IOSurfaceGetBaseAddressOfPlane(surface: CFTypeRef, plane: usize) -> *mut c_void {
-    if plane != 0 {
+pub unsafe extern "C" fn IOSurfaceGetBaseAddressOfPlane(
+    surface: CFTypeRef,
+    plane: usize,
+) -> *mut c_void {
+    let Some(state) = state(surface) else {
         return std::ptr::null_mut();
-    }
-    // SAFETY: forwarded.
-    unsafe { IOSurfaceGetBaseAddress(surface) }
+    };
+    state
+        .plane(plane)
+        .map_or(std::ptr::null_mut(), |p| state.base_of(&p).cast())
 }
 
 /// `IOSurfaceRef IOSurfaceLookup(IOSurfaceID)`: retained, as the name's
@@ -760,15 +977,19 @@ pub unsafe extern "C" fn IOSurfaceGetPropertyAlignment(property: CFTypeRef) -> u
 pub unsafe extern "C" fn IOSurfaceGetPropertyMaximum(property: CFTypeRef) -> usize {
     let row = MAX_EXTENT * MAX_BYTES_PER_ELEMENT;
     match key_name(property) {
-        Some(WIDTH | HEIGHT | ELEMENT_WIDTH | ELEMENT_HEIGHT) => MAX_EXTENT,
-        Some(BYTES_PER_ELEMENT) => MAX_BYTES_PER_ELEMENT,
-        Some(BYTES_PER_ROW) => row,
-        Some(ALLOC_SIZE) => row * MAX_EXTENT,
+        Some(WIDTH | HEIGHT | ELEMENT_WIDTH | ELEMENT_HEIGHT | PLANE_WIDTH | PLANE_HEIGHT) => {
+            MAX_EXTENT
+        }
+        Some(BYTES_PER_ELEMENT | PLANE_BYTES_PER_ELEMENT) => MAX_BYTES_PER_ELEMENT,
+        Some(BYTES_PER_ROW | PLANE_BYTES_PER_ROW) => row,
+        Some(ALLOC_SIZE | PLANE_SIZE) => row * MAX_EXTENT,
         _ => 0,
     }
 }
 
-/// A surface's pixels as a compositor reads them.
+/// A surface's pixels as a compositor reads them: one plane of them.
+/// `pixel_format` is the whole surface's, which a plane of a planar format is
+/// not itself in.
 #[derive(Clone, Copy, Debug)]
 pub struct Pixels {
     pub width: usize,
@@ -779,20 +1000,27 @@ pub struct Pixels {
     pub data: *const u8,
 }
 
-/// `object`'s pixels, or `None` for something that is not a surface.
+/// `object`'s pixels: plane 0, which for a surface that is one plane is the
+/// surface. `None` for something that is not a surface.
 ///
 /// The pointer is valid for `bytes_per_row * height` bytes for as long as the
 /// caller holds a reference to `object`.
 pub fn pixels(object: CFTypeRef) -> Option<Pixels> {
+    pixels_of_plane(object, 0)
+}
+
+/// The pixels of plane `index`, or `None` for something that is not a surface
+/// or a plane it does not have. Valid as [`pixels`] is.
+pub fn pixels_of_plane(object: CFTypeRef, index: usize) -> Option<Pixels> {
     let state = state(object)?;
+    let plane = state.plane(index)?;
     Some(Pixels {
-        width: state.width,
-        height: state.height,
-        bytes_per_row: state.bytes_per_row,
-        bytes_per_element: state.bytes_per_element,
+        width: plane.width as usize,
+        height: plane.height as usize,
+        bytes_per_row: plane.bytes_per_row as usize,
+        bytes_per_element: plane.bytes_per_element as usize,
         pixel_format: state.pixel_format,
-        // SAFETY: the offset lies inside the allocation.
-        data: unsafe { state.memory.add(state.offset) },
+        data: state.base_of(&plane),
     })
 }
 

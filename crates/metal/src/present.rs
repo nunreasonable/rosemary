@@ -538,6 +538,13 @@ fn present_inner(drawable: Id) {
 
     let width = texture.image.width;
     let height = texture.image.height;
+    if std::env::var_os("ROSEMARY_FRAME_OUT").is_some() {
+        gpu::trace_once(format!(
+            "readback placement pid={} window={window:?} image={width}x{height} \
+             placement={placement:?}",
+            std::process::id()
+        ));
+    }
     let bytes = u64::from(width) * u64::from(height) * 4;
 
     if described.readback.is_none() {
@@ -664,6 +671,31 @@ fn dump_frame(pixels: &[u8], width: u32, height: u32, format: vk::Format) {
     if !frame.is_multiple_of(interval) {
         return;
     }
+    // Bound diagnostic disk use even when a guest keeps rendering overnight.
+    let limit = std::env::var("ROSEMARY_FRAME_LIMIT")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(8);
+    if frame / interval >= limit {
+        return;
+    }
+    let nonzero_rgb = pixels
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .filter(|pixel| pixel[..3].iter().any(|&channel| channel != 0))
+        .count();
+    let nonzero_alpha = pixels
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .filter(|pixel| pixel[3] != 0)
+        .count();
+    gpu::trace(format!(
+        "frame capture pid={} frame={frame} size={width}x{height} format={format:?} \
+         nonzero_rgb_pixels={nonzero_rgb} nonzero_alpha_pixels={nonzero_alpha}",
+        std::process::id()
+    ));
     let directory = std::path::PathBuf::from(directory);
     if std::fs::create_dir_all(&directory).is_err() {
         return;
@@ -678,7 +710,10 @@ fn dump_frame(pixels: &[u8], width: u32, height: u32, format: vk::Format) {
             false => out.extend_from_slice(&[texel[0], texel[1], texel[2]]),
         }
     }
-    let _ = std::fs::write(directory.join(format!("frame-{frame:06}.ppm")), out);
+    let _ = std::fs::write(
+        directory.join(format!("frame-{}-{frame:06}.ppm", std::process::id())),
+        out,
+    );
 }
 
 /// SDL's window surface is `SDL_PIXELFORMAT_XRGB8888` on every backend this

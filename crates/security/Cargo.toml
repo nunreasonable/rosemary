@@ -7,6 +7,7 @@ license.workspace = true
 
 [dependencies]
 exports.workspace = true
+prefix.workspace = true
 objc.workspace = true
 corefoundation.workspace = true
 foundation.workspace = true
@@ -15,3 +16,11 @@ ring = "0.17"
 rustls-pki-types.workspace = true
 webpki.workspace = true
 webpki-roots.workspace = true
+
+cms = "0.2.3"
+der = { version = "0.7", features = ["alloc", "derive", "oid"] }
+x509-cert = "0.2"
+regex = "1"
+openssl = "0.10"
+darwin.workspace = true
+starnix.workspace = true

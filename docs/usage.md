@@ -212,3 +212,11 @@ sharing, remain unsupported. The built-in GLU surface provides `gluOrtho2D`
 through SDL-resolved `glOrtho`; other GLU functions remain unsupported. No host
 GLU library is required. Driver capabilities still determine available profiles
 and extensions.
+
+## Bounded Metal frame captures
+
+`ROSEMARY_FRAME_OUT` selects a directory for diagnostic PPM frame captures.
+`ROSEMARY_FRAME_INTERVAL` selects the sampling interval in frames (default 30).
+`ROSEMARY_FRAME_LIMIT` caps captures per process (default 8; 0 disables capture).
+Filenames include the process ID to avoid collisions between guests. PPM files
+contain RGB only; trace output separately reports nonzero RGB and alpha pixels.

@@ -425,6 +425,126 @@ pub fn sdl_windows() -> Vec<sdl3::Window> {
         .collect()
 }
 
+/// Window information for the windows managed by this process's AppKit backend.
+/// Host windows and windows in other processes require a shared WindowServer
+/// catalogue, which this backend does not yet have.
+#[allow(non_snake_case)]
+pub unsafe extern "C" fn CGWindowListCopyWindowInfo(
+    options: u32,
+    relative: u32,
+) -> corefoundation::base::CFTypeRef {
+    use corefoundation::{
+        api::{CFRelease, CFRetain},
+        base::CFTypeRef,
+        callbacks::Policy,
+        collections::{self, Number},
+    };
+    if options & !31 != 0 {
+        return std::ptr::null();
+    }
+    let mut windows = all();
+    windows.sort_by_key(|w| std::cmp::Reverse(window_of(*w).ordered));
+    let reference = windows
+        .iter()
+        .position(|w| sdl3::video::window_id(window_of(*w).sdl) == relative);
+    if options & 14 != 0 && reference.is_none() {
+        return std::ptr::null();
+    }
+    let mut records = Vec::new();
+    for (index, window) in windows.into_iter().enumerate() {
+        if options & 1 != 0 && !is_shown(window) {
+            continue;
+        }
+        if options & 14 != 0 {
+            let anchor = reference.unwrap();
+            if !((options & 2 != 0 && index < anchor)
+                || (options & 4 != 0 && index > anchor)
+                || (options & 8 != 0 && index == anchor))
+            {
+                continue;
+            }
+        }
+        let mut rect = unsafe { frame(window, objc::sel::get("frame")) };
+        // CoreGraphics uses the host screen's top-left coordinates.
+        if let Some((x, y)) = sdl3::video::window_position(window_of(window).sdl) {
+            rect.origin = NSPoint {
+                x: x as f64,
+                y: y as f64,
+            };
+        }
+        let number = |n: i64| collections::new_number(Number::Integer(n));
+        let real = |n: f64| collections::new_number(Number::Float(n));
+        let bounds = owned_dictionary(vec![
+            ("X", real(rect.origin.x)),
+            ("Y", real(rect.origin.y)),
+            ("Width", real(rect.size.width)),
+            ("Height", real(rect.size.height)),
+        ]);
+        let title = unsafe { title(window, objc::sel::get("title")) } as CFTypeRef;
+        let mut fields = vec![
+            (
+                "kCGWindowNumber",
+                number(sdl3::video::window_id(window_of(window).sdl) as i64),
+            ),
+            (
+                "kCGWindowOwnerPID",
+                number(darwin::process::guest_pid(std::process::id() as i32) as i64),
+            ),
+            (
+                "kCGWindowLayer",
+                number(unsafe { level(window, objc::sel::get("level")) } as i64),
+            ),
+            ("kCGWindowBounds", bounds),
+            (
+                "kCGWindowAlpha",
+                real(unsafe { alpha_value(window, objc::sel::get("alphaValue")) }),
+            ),
+            ("kCGWindowIsOnscreen", unsafe {
+                CFRetain(collections::boolean(is_shown(window)))
+            }),
+            ("kCGWindowSharingState", number(0)),
+            ("kCGWindowStoreType", number(2)),
+        ];
+        if !title.is_null() {
+            fields.push(("kCGWindowName", unsafe { CFRetain(title) }));
+        }
+        records.push(owned_dictionary(fields));
+    }
+    let result = collections::new_array(&records, Policy::from_type_callbacks(), false);
+    for record in records {
+        unsafe { CFRelease(record) };
+    }
+    result
+}
+
+fn owned_dictionary(
+    fields: Vec<(&str, corefoundation::base::CFTypeRef)>,
+) -> corefoundation::base::CFTypeRef {
+    use corefoundation::{api::CFRelease, callbacks::Policy, collections};
+    let pairs: Vec<_> = fields
+        .iter()
+        .map(|(key, value)| {
+            (
+                foundation::string::from_str(key) as corefoundation::base::CFTypeRef,
+                *value,
+            )
+        })
+        .collect();
+    let result = collections::new_dictionary(
+        &pairs,
+        Policy::from_key_callbacks(),
+        Policy::from_type_callbacks(),
+        false,
+    );
+    for (key, value) in pairs {
+        unsafe {
+            CFRelease(key);
+            CFRelease(value);
+        }
+    }
+    result
+}
+
 /// The last value handed to [`Window::ordered`].
 static ORDERED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -644,6 +764,7 @@ unsafe extern "C" fn init_with_content_rect(
     // rectangle does: the SDL window is the whole frame.
     let inset = inset_of(receiver, style_mask, false);
     window.inset = inset;
+    let content_size = rect.size;
     let rect = frame_for_content(rect, inset);
     window.requested = rect;
 
@@ -682,6 +803,9 @@ unsafe extern "C" fn init_with_content_rect(
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .push((sdl as usize, receiver as usize));
+    if window.content_view.is_null() {
+        install_default_content_view(receiver, content_size);
+    }
     receiver
 }
 
@@ -1250,36 +1374,40 @@ unsafe extern "C" fn set_content_size(receiver: Id, _sel: Sel, size: NSSize) {
     }
 }
 
-/// `-contentView`, which on a Mac is never nil for a window that was
-/// initialised: `-initWithContentRect:...` gives it a plain `NSView` the size
-/// of its content, and a program builds its interface by adding subviews to
-/// that. Made here, the first time it is asked for, rather than at init - so a
-/// program that sets its own content view first never has one made for it.
-/// Without it `[[window contentView] addSubview:]` is a message to nil, and
-/// the window stays empty and is never drawn, with nothing to say why.
+/// A plain content view is installed during initialization, before layout runs.
+/// Keep lazy creation for windows constructed through alternate initialization paths.
 unsafe extern "C" fn content_view(receiver: Id, sel: Sel) -> Id {
-    let existing = window_of(receiver).content_view;
-    if !existing.is_null() || window_of(receiver).sdl.is_null() {
-        return existing;
+    if window_of(receiver).content_view.is_null() {
+        let content = unsafe { content_rect_for_frame(receiver, sel, frame(receiver, sel)) };
+        install_default_content_view(receiver, content.size);
     }
-    // SAFETY: an initialised window of this crate's.
-    let content = unsafe { content_rect_for_frame(receiver, sel, frame(receiver, sel)) };
-    let bounds = NSRect {
-        origin: NSPoint { x: 0.0, y: 0.0 },
-        size: content.size,
-    };
-    let Some(class) = objc::class::lookup(c"NSView") else {
-        return existing;
-    };
-    let view = objc::object::create_instance(class, 0);
-    // SAFETY: `msg::entry` with `-initWithFrame:`, `id (id, SEL, NSRect)`.
-    let init: unsafe extern "C" fn(Id, Sel, NSRect) -> Id =
-        unsafe { std::mem::transmute(objc::msg::entry()) };
-    let view = unsafe { init(view, objc::sel::get("initWithFrame:"), bounds) };
-    // SAFETY: a live window and view; the window takes its own reference.
-    unsafe { set_content_view(receiver, objc::sel::get("setContentView:"), view) };
-    objc::arc::release(view);
     window_of(receiver).content_view
+}
+
+// Adapted from upstream 565e7340: a window owns a correctly sized root view
+// before a toolkit attaches children or performs its first layout pass.
+fn install_default_content_view(window: Id, size: NSSize) {
+    let Some(class) = objc::class::lookup(c"NSView") else {
+        return;
+    };
+    let frame = NSRect {
+        origin: NSPoint::default(),
+        size,
+    };
+    unsafe {
+        let init: unsafe extern "C" fn(Id, Sel, NSRect) -> Id =
+            std::mem::transmute(objc::msg::entry());
+        let view = init(
+            objc::object::create_instance(class, 0),
+            objc::sel::get("initWithFrame:"),
+            frame,
+        );
+        if view.is_null() {
+            return;
+        }
+        set_content_view(window, objc::sel::get("setContentView:"), view);
+        objc::arc::release(view);
+    }
 }
 
 /// `-setContentView:`, which **resizes the view to the window**.
@@ -2732,6 +2860,52 @@ pub(crate) fn install() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn window_information_rejects_invalid_requests_and_returns_owned_array() {
+        crate::bootstrap();
+        unsafe {
+            assert!(CGWindowListCopyWindowInfo(32, 0).is_null());
+            assert!(CGWindowListCopyWindowInfo(8, u32::MAX).is_null());
+            let list = CGWindowListCopyWindowInfo(0, 0);
+            assert!(!list.is_null());
+            assert!(corefoundation::collections::array(list).is_some());
+            corefoundation::api::CFRelease(list);
+        }
+    }
+
+    #[test]
+    fn default_content_view_has_requested_geometry_before_layout() {
+        crate::bootstrap();
+        let window = objc::object::create_instance(objc::class::lookup(c"NSWindow").unwrap(), 0);
+        let size = NSSize {
+            width: 1920.0,
+            height: 1080.0,
+        };
+        install_default_content_view(window, size);
+        let view = window_of(window).content_view;
+        assert!(!view.is_null());
+        unsafe {
+            assert_eq!(crate::view::window_of(view), window);
+        }
+        assert_eq!(
+            crate::view::rect_in_window(view),
+            NSRect {
+                origin: NSPoint::default(),
+                size
+            }
+        );
+        // Resizing the window must also resize the existing content view.
+        fit_content_view_to(window, 1280, 720);
+        assert_eq!(
+            crate::view::rect_in_window(view).size,
+            NSSize {
+                width: 1280.0,
+                height: 720.0
+            }
+        );
+        objc::arc::release(window);
+    }
 
     #[test]
     fn parent_window_is_weak() {

@@ -359,6 +359,148 @@ pub unsafe extern "C" fn mach_vm_protect(
 /// `KERN_PROTECTION_FAILURE`.
 const KERN_PROTECTION_FAILURE: i32 = 2;
 
+/// Ask the kernel to copy rather than dereferencing untrusted guest addresses.
+#[cfg(target_os = "linux")]
+fn copy_memory(source: u64, target: u64, size: u64, write: bool) -> i32 {
+    if size == 0 {
+        return KERN_SUCCESS;
+    }
+    if size > isize::MAX as u64
+        || source.checked_add(size).is_none()
+        || target.checked_add(size).is_none()
+    {
+        return KERN_INVALID_ARGUMENT;
+    }
+    let local = libc::iovec {
+        iov_base: if write { source } else { target } as *mut libc::c_void,
+        iov_len: size as usize,
+    };
+    let remote = libc::iovec {
+        iov_base: if write { target } else { source } as *mut libc::c_void,
+        iov_len: size as usize,
+    };
+    // SAFETY: both descriptors are local; the kernel validates their ranges.
+    let copied = unsafe {
+        if write {
+            libc::process_vm_writev(libc::getpid(), &local, 1, &remote, 1, 0)
+        } else {
+            libc::process_vm_readv(libc::getpid(), &local, 1, &remote, 1, 0)
+        }
+    };
+    if copied == size as isize {
+        KERN_SUCCESS
+    } else {
+        KERN_INVALID_ADDRESS
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn copy_memory(_source: u64, _target: u64, _size: u64, _write: bool) -> i32 {
+    46 // KERN_NOT_SUPPORTED
+}
+
+/// Copy this task's memory into caller-owned storage.
+///
+/// # Safety
+///
+/// `out_size` must be writable; source and destination are kernel-validated.
+pub unsafe extern "C" fn mach_vm_read_overwrite(
+    task: Name,
+    address: u64,
+    size: u64,
+    destination: u64,
+    out_size: *mut u64,
+) -> i32 {
+    if task != TASK_SELF {
+        return KERN_INVALID_TASK;
+    }
+    if out_size.is_null() {
+        return KERN_INVALID_ARGUMENT;
+    }
+    let result = copy_memory(address, destination, size, false);
+    if result == KERN_SUCCESS {
+        unsafe { out_size.write_unaligned(size) };
+    }
+    result
+}
+
+/// Write bytes into this task without bypassing page write protection.
+pub unsafe extern "C" fn mach_vm_write(task: Name, address: u64, data: u64, count: u32) -> i32 {
+    if task != TASK_SELF {
+        return KERN_INVALID_TASK;
+    }
+    copy_memory(data, address, u64::from(count), true)
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod transfer_tests {
+    use super::*;
+
+    #[test]
+    fn memory_transfers_copy_and_report_bytes() {
+        let source = [1u8, 2, 3, 4];
+        let mut target = [0u8; 4];
+        let mut count = 0;
+        unsafe {
+            assert_eq!(
+                mach_vm_read_overwrite(
+                    TASK_SELF,
+                    source.as_ptr() as u64,
+                    4,
+                    target.as_mut_ptr() as u64,
+                    &mut count,
+                ),
+                KERN_SUCCESS
+            );
+            assert_eq!(count, 4);
+            assert_eq!(source, target);
+            target.fill(0);
+            assert_eq!(
+                mach_vm_write(
+                    TASK_SELF,
+                    target.as_mut_ptr() as u64,
+                    source.as_ptr() as u64,
+                    4,
+                ),
+                KERN_SUCCESS
+            );
+            assert_eq!(source, target);
+        }
+    }
+
+    #[test]
+    fn inaccessible_memory_returns_an_error_without_faulting() {
+        unsafe {
+            let page = libc::mmap(
+                std::ptr::null_mut(),
+                4096,
+                libc::PROT_READ,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            );
+            assert_ne!(page, libc::MAP_FAILED);
+            let byte = 1u8;
+            assert_ne!(
+                mach_vm_write(TASK_SELF, page as u64, &byte as *const u8 as u64, 1),
+                KERN_SUCCESS
+            );
+            let mut target = 0u8;
+            let mut count = 99;
+            assert_ne!(
+                mach_vm_read_overwrite(TASK_SELF, 0, 1, &mut target as *mut u8 as u64, &mut count),
+                KERN_SUCCESS
+            );
+            assert_eq!(count, 99);
+            assert_eq!(
+                mach_vm_read_overwrite(0, 0, 0, 0, &mut count),
+                KERN_INVALID_TASK
+            );
+            libc::munmap(page, 4096);
+        }
+    }
+}
+
 /// `kern_return_t mach_vm_read(vm_map_t, mach_vm_address_t, mach_vm_size_t,
 /// vm_offset_t *data, mach_msg_type_number_t *count)`: a copy of this task's
 /// own memory, in pages the caller frees with `vm_deallocate`.

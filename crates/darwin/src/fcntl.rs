@@ -279,7 +279,7 @@ unsafe fn getpath(fd: libc::c_int, out: *mut libc::c_char) -> libc::c_int {
         crate::errno::set(libc::EFAULT);
         return -1;
     }
-    let Some(host) = starnix::fd::path(fd) else {
+    let Some(host) = starnix::fd::resolved(fd) else {
         crate::errno::set(libc::EBADF);
         return -1;
     };

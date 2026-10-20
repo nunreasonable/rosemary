@@ -798,17 +798,12 @@ fn rect_between(rect: NSRect, map: impl Fn(NSPoint) -> NSPoint) -> NSRect {
 
 /// A view's bounds in its window's base coordinates.
 pub fn rect_in_window(view: Id) -> NSRect {
-    let size = match is_view(view) {
-        true => view_of(view).frame.size,
-        false => NSSize::default(),
+    let bounds = match is_view(view) {
+        true => bounds_of(view),
+        false => NSRect::default(),
     };
-    rect_between(
-        NSRect {
-            origin: NSPoint::default(),
-            size,
-        },
-        |point| point_to_window(view, point),
-    )
+    // The conversion consumes local coordinates, not the superview's frame.
+    rect_between(bounds, |point| point_to_window(view, point))
 }
 
 /// Whether a rectangle of a view's holds a point, for [`crate::cursor`].
@@ -2070,11 +2065,13 @@ mod tests {
             set_bounds_origin(view, sel, NSPoint { x: 5.0, y: 10.0 });
             assert_eq!(view_of(view).frame, rect(10.0, 20.0, 200.0, 100.0));
             assert_eq!(bounds_of(view), rect(5.0, 10.0, 100.0, 50.0));
+            assert_eq!(rect_in_window(view), rect(10.0, 20.0, 200.0, 100.0));
             let point = NSPoint { x: 30.0, y: 35.0 };
             assert_eq!(point_to_window(view, point), NSPoint { x: 60.0, y: 70.0 });
             assert_eq!(point_from_window(view, point_to_window(view, point)), point);
             set_frame_size(view, sel, NSSize { width: 400.0, height: 200.0 });
             assert_eq!(bounds_of(view), rect(5.0, 10.0, 100.0, 50.0));
+            assert_eq!(rect_in_window(view), rect(10.0, 20.0, 400.0, 200.0));
         }
         objc::arc::release(view);
     }

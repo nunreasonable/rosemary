@@ -9,6 +9,11 @@
 //! matched its surface is copied into the surface, and then every other
 //! texture of the flushing context on a surface that moved on is reloaded.
 //!
+//! A texture is bound to one plane of its surface: plane 0 of a surface that
+//! is one plane is all of it, and a planar surface's planes - the luma and
+//! the chroma of a video frame - each have textures of their own, which are
+//! in step with their plane and no other.
+//!
 //! FIXME (ACCURACY): a texture in another context catches up only at that
 //! context's next flush, and a texture given new storage with `glTexImage2D`
 //! after binding is still treated as the surface's.
@@ -76,7 +81,8 @@ struct Binding {
     kind: u32,
     /// Retained for as long as the binding lasts.
     surface: usize,
-    /// The surface's generation the texture last matched, and a hash of the
+    plane: usize,
+    /// The plane's generation the texture last matched, and a hash of the
     /// pixels both held then.
     generation: u64,
     hash: u64,
@@ -84,9 +90,13 @@ struct Binding {
 
 struct State {
     bindings: Vec<Binding>,
-    /// How many times each surface, by id, has been written from a texture.
-    generations: Vec<(u32, u64)>,
+    /// How many times each plane of each surface, by id, has been written from
+    /// a texture.
+    generations: Vec<(PlaneId, u64)>,
 }
+
+/// A surface's id and the index of one of its planes.
+type PlaneId = (u32, usize);
 
 thread_local! {
     /// Whether this thread's context drew since its last flush. A flush that
@@ -183,8 +193,8 @@ fn hash(bytes: &[u8], stride: usize, row: usize, height: usize) -> u64 {
     h
 }
 
-fn generation_of(generations: &[(u32, u64)], id: u32) -> u64 {
-    generations.iter().find(|(i, _)| *i == id).map_or(0, |(_, g)| *g)
+fn generation_of(generations: &[(PlaneId, u64)], plane: PlaneId) -> u64 {
+    generations.iter().find(|(p, _)| *p == plane).map_or(0, |(_, g)| *g)
 }
 
 fn surface_hash(pixels: &iosurface::Pixels) -> u64 {
@@ -259,20 +269,23 @@ pub unsafe extern "C" fn CGLTexImageIOSurface2D(
     let Some(object) = super::handle_in(ctx) else {
         return super::kCGLBadContext;
     };
-    let (Some(gl), Some(pixels), Some(query)) =
-        (gl(), iosurface::pixels(surface), binding_query(target))
-    else {
+    let plane = plane as usize;
+    let (Some(gl), Some(query)) = (gl(), binding_query(target)) else {
         return super::kCGLBadValue;
     };
-    // FIXME (ACCURACY): only the first plane; a planar YUV surface is refused.
-    if plane != 0
-        || pixels.bytes_per_element == 0
+    let Some(pixels) = iosurface::pixels_of_plane(surface, plane) else {
+        if iosurface::is_surface(surface) {
+            eprintln!("rosemary: appkit: CGLTexImageIOSurface2D: the surface has no plane {plane}");
+        }
+        return super::kCGLBadValue;
+    };
+    if pixels.bytes_per_element == 0
         || width as usize > pixels.width
         || height as usize > pixels.height
     {
         eprintln!(
-            "rosemary: appkit: CGLTexImageIOSurface2D: plane {plane} of a \
-             {}x{} surface as {width}x{height} is not supported",
+            "rosemary: appkit: CGLTexImageIOSurface2D: {width}x{height} does not \
+             fit plane {plane}, which is {}x{}",
             pixels.width, pixels.height
         );
         return super::kCGLBadValue;
@@ -307,7 +320,7 @@ pub unsafe extern "C" fn CGLTexImageIOSurface2D(
     // SAFETY: an IOSurface, per the caller.
     let id = unsafe { iosurface::IOSurfaceGetID(surface) };
     let mut state = state();
-    let generation = generation_of(&state.generations, id);
+    let generation = generation_of(&state.generations, (id, plane));
     let context = object as usize;
     if let Some(at) = state
         .bindings
@@ -330,6 +343,7 @@ pub unsafe extern "C" fn CGLTexImageIOSurface2D(
         format,
         kind,
         surface: surface as usize,
+        plane,
         generation,
         hash: surface_hash(&pixels),
     });
@@ -383,7 +397,7 @@ pub fn write_back() {
         .filter(|b| b.context == context && written.contains(&b.texture))
     {
         let (Some(pixels), Some(query)) = (
-            iosurface::pixels(binding.surface as CFTypeRef),
+            iosurface::pixels_of_plane(binding.surface as CFTypeRef, binding.plane),
             binding_query(binding.target),
         ) else {
             continue;
@@ -422,10 +436,11 @@ pub fn write_back() {
         };
         // SAFETY: a surface this module holds.
         let id = unsafe { iosurface::IOSurfaceGetID(binding.surface as CFTypeRef) };
-        let generation = match generations.iter_mut().find(|(i, _)| *i == id) {
+        let plane_id = (id, binding.plane);
+        let generation = match generations.iter_mut().find(|(p, _)| *p == plane_id) {
             Some((_, g)) => g,
             None => {
-                generations.push((id, 0));
+                generations.push((plane_id, 0));
                 &mut generations.last_mut().expect("just pushed").1
             }
         };
@@ -433,16 +448,16 @@ pub fn write_back() {
         binding.generation = *generation;
         binding.hash = now;
     }
-    // Textures on a surface something else has written since: reload them.
+    // Textures on a plane something else has written since: reload them.
     for binding in bindings.iter_mut().filter(|b| b.context == context) {
         // SAFETY: a surface this module holds.
         let id = unsafe { iosurface::IOSurfaceGetID(binding.surface as CFTypeRef) };
-        let current = generation_of(generations, id);
+        let current = generation_of(generations, (id, binding.plane));
         if binding.generation == current {
             continue;
         }
         let (Some(pixels), Some(query)) = (
-            iosurface::pixels(binding.surface as CFTypeRef),
+            iosurface::pixels_of_plane(binding.surface as CFTypeRef, binding.plane),
             binding_query(binding.target),
         ) else {
             continue;

@@ -1027,6 +1027,12 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("IOSurfaceGetElementHeight", U64, P),
     sig!("IOSurfaceGetPixelFormat", U32, P),
     sig!("IOSurfaceGetBaseAddress", P, P),
+    sig!("IOSurfaceGetPlaneCount", U64, P),
+    sig!("IOSurfaceGetWidthOfPlane", U64, P, U64),
+    sig!("IOSurfaceGetHeightOfPlane", U64, P, U64),
+    sig!("IOSurfaceGetBytesPerRowOfPlane", U64, P, U64),
+    sig!("IOSurfaceGetBytesPerElementOfPlane", U64, P, U64),
+    sig!("IOSurfaceGetBaseAddressOfPlane", P, P, U64),
     sig!("IOSurfaceIncrementUseCount", V, P),
     sig!("IOSurfaceDecrementUseCount", V, P),
     sig!("IOSurfaceGetUseCount", I32, P),
@@ -1475,12 +1481,16 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("SecKeychainSearchCopyNext", I32, P, P),
     sig!("SecKeychainSearchCreateFromAttributes", I32, P, U32, P, P),
     sig!("SecTrustCopyAnchorCertificates", I32, P),
-    sig!("SecStaticCodeCreateWithPath", I32, P, U64, P),
+    sig!("SecStaticCodeCreateWithPath", I32, P, U32, P),
+    sig!("SecStaticCodeCreateWithPathAndAttributes", I32, P, U32, P, P),
+    sig!("SecStaticCodeCheckValidity", I32, P, U32, P),
+    sig!("SecCertificateCopyCommonName", I32, P, P),
     sig!("SecRequirementCreateWithString", I32, P, U64, P),
     sig!("SecRequirementCreateWithData", I32, P, U32, P),
+    sig!("SecCodeCopySigningInformation", I32, P, U32, P),
     sig!("SecCodeCopySelf", I32, U32, P),
     sig!("SecCodeCheckValidity", I32, P, U32, P),
-    sig!("SecStaticCodeCheckValidityWithErrors", I32, P, U64, P, P),
+    sig!("SecStaticCodeCheckValidityWithErrors", I32, P, U32, P, P),
     //
     // SDL3 asks the current layout for its Unicode key-layout data so it can
     // translate a virtual key code into characters.
@@ -2771,6 +2781,8 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("mach_vm_copy", I32, U32, U64, U64, U64),
     sig!("mach_vm_region", I32, U32, P, P, I32, P, P, P),
     sig!("mach_vm_read_overwrite", I32, U32, U64, U64, U64, P),
+    sig!("mach_vm_write", I32, U32, U64, U64, U32),
+    sig!("vm_write", I32, U32, U64, U64, U32),
     sig!("vm_allocate", I32, U32, P, U64, I32),
     sig!("vm_copy", I32, U32, U64, U64, U64),
     sig!("vm_deallocate", I32, U32, U64, U64),
@@ -2892,7 +2904,9 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     // `int proc_pidinfo(int pid, int flavour, uint64_t arg, void *buffer, int
     // buffersize)` - the general form of `proc_pidpath` above, and how a
     // program asks the kernel about its own task.
+    sig!("CGWindowListCopyWindowInfo", P, U32, U32),
     sig!("proc_pidinfo", I32, I32, I32, U64, P, I32),
+    sig!("__proc_info", I32, I32, I32, I32, U64, P, I32),
     sig!("proc_pid_rusage", I32, I32, I32, P),
     sig!("kpersona_pidinfo", I32, I32, P),
     sig!("proc_listpids", I32, U32, U32, P, I32),

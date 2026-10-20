@@ -1,3 +1,9 @@
+mod code_xattr;
+mod code_ber;
+mod code_requirement;
+mod code_resources;
+mod code_cms;
+mod code_directory;
 pub mod codesign;
 pub mod key;
 pub mod keychain;
@@ -16,6 +22,7 @@ pub fn data_symbols() -> Vec<(String, u64)> {
     let mut symbols: Vec<_> = keychain::KEYS
         .iter()
         .chain(key::KEYS)
+        .chain(codesign::KEYS)
         .map(|(symbol, text)| {
             (
                 (*symbol).to_string(),

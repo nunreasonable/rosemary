@@ -61,6 +61,54 @@ fn open_descriptors() -> std::io::Result<Vec<ProcFdInfo>> {
         .collect())
 }
 
+/// Raw libproc syscall entry. Public wrappers turn syscall errors into zero;
+/// this entry must preserve the underlying -1/errno convention.
+///
+/// # Safety
+/// `buffer` must satisfy the selected operation's buffer contract.
+pub unsafe extern "C" fn __proc_info(
+    call: c_int,
+    pid: c_int,
+    flavor: c_int,
+    arg: u64,
+    buffer: *mut c_void,
+    size: c_int,
+) -> c_int {
+    match call {
+        1 => unsafe { proc_listpids(pid as u32, flavor as u32, buffer, size) },
+        2 | 3 => {
+            crate::errno::set(0);
+            let result = if call == 2 {
+                if flavor == 11 {
+                    if size < 0 {
+                        crate::errno::set(libc::EINVAL);
+                        return -1;
+                    }
+                    unsafe { proc_pidpath(pid, buffer, size as u32) }
+                } else {
+                    unsafe { proc_pidinfo(pid, flavor, arg, buffer, size) }
+                }
+            } else {
+                if arg > i32::MAX as u64 {
+                    crate::errno::set(libc::EBADF);
+                    return -1;
+                }
+                unsafe { proc_pidfdinfo(pid, arg as i32, flavor, buffer, size) }
+            };
+            if result == 0 && crate::errno::get() != 0 {
+                -1
+            } else {
+                result
+            }
+        }
+        9 => unsafe { proc_pid_rusage(pid, flavor, buffer) },
+        _ => {
+            crate::errno::set(libc::ENOTSUP);
+            -1
+        }
+    }
+}
+
 pub unsafe extern "C" fn proc_pidinfo(
     pid: c_int,
     flavor: c_int,
@@ -600,18 +648,116 @@ pub unsafe extern "C" fn proc_listpidspath(
 /// `int proc_pidfdinfo(int pid, int fd, int flavor, void *buffer, int
 /// buffersize)`.
 ///
-/// FIXME (ACCURACY): no flavour is answered yet - the structures are Darwin's
-/// vnode and socket descriptions, filled from `/proc/<pid>/fdinfo` - so every
-/// call reports the descriptor as unknown, as for a process that went away.
-pub extern "C" fn proc_pidfdinfo(
-    _pid: c_int,
-    _fd: c_int,
-    _flavor: c_int,
-    _buffer: *mut c_void,
-    _size: c_int,
+/// Supports vnode information for descriptors owned by the calling process.
+///
+/// # Safety
+/// `buffer` must be writable for `size` bytes.
+pub unsafe extern "C" fn proc_pidfdinfo(
+    pid: c_int,
+    fd: c_int,
+    flavor: c_int,
+    buffer: *mut c_void,
+    size: c_int,
 ) -> c_int {
-    crate::errno::set(libc::ESRCH);
-    0
+    let me = starnix::process::me();
+    if pid != 0 && crate::process::host_pid(pid) != me {
+        crate::errno::set(libc::ENOTSUP);
+        return 0;
+    }
+    let wanted = match flavor {
+        1 => 176,
+        2 => 1200,
+        _ => {
+            crate::errno::set(libc::EINVAL);
+            return 0;
+        }
+    };
+    if buffer.is_null() || size < wanted {
+        crate::errno::set(libc::EINVAL);
+        return 0;
+    }
+    let mut stat = crate::stat::Stat::default();
+    if unsafe { crate::stat::fstat(fd, &mut stat) } != 0 {
+        return 0;
+    }
+    let kind: i32 = match stat.mode & 0o170000 {
+        0o100000 => 1,
+        0o040000 => 2,
+        0o060000 => 3,
+        0o020000 => 4,
+        0o120000 => 5,
+        _ => {
+            crate::errno::set(libc::ENOTSUP);
+            return 0;
+        }
+    };
+    let flags = unsafe { crate::fcntl::entry::fcntl(fd, crate::fcntl::cmd::F_GETFL, 0) };
+    let descriptor_flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    let offset = unsafe { libc::lseek(fd, 0, libc::SEEK_CUR) };
+    if flags < 0 || descriptor_flags < 0 || offset < 0 {
+        return 0;
+    }
+    let mut fs = std::mem::MaybeUninit::<crate::stat::Statfs>::uninit();
+    if unsafe { crate::stat::fstatfs(fd, fs.as_mut_ptr()) } != 0 {
+        return 0;
+    }
+    let fs = unsafe { fs.assume_init() };
+    // Explicit byte offsets avoid exposing Rust padding in Darwin's ABI record.
+    let mut record = [0u8; 1200];
+    macro_rules! put {
+        ($at:expr, $value:expr) => {{
+            let bytes = ($value).to_ne_bytes();
+            record[$at..$at + bytes.len()].copy_from_slice(&bytes);
+        }};
+    }
+    // fi_openflags uses kernel FREAD/FWRITE, rather than O_RDONLY/O_WRONLY.
+    put!(0, ((flags & !3) | ((flags & 3) + 1)) as u32);
+    put!(
+        4,
+        if descriptor_flags & libc::FD_CLOEXEC != 0 {
+            2u32
+        } else {
+            0
+        }
+    );
+    put!(8, offset as i64);
+    put!(16, 1i32); // DTYPE_VNODE
+    put!(24, stat.dev as u32);
+    put!(28, stat.mode);
+    put!(30, stat.nlink);
+    put!(32, stat.ino);
+    put!(40, stat.uid);
+    put!(44, stat.gid);
+    put!(48, stat.atime.sec);
+    put!(56, stat.atime.nsec);
+    put!(64, stat.mtime.sec);
+    put!(72, stat.mtime.nsec);
+    put!(80, stat.ctime.sec);
+    put!(88, stat.ctime.nsec);
+    put!(96, stat.birthtime.sec);
+    put!(104, stat.birthtime.nsec);
+    put!(112, stat.size);
+    put!(120, stat.blocks);
+    put!(128, stat.blksize);
+    put!(132, stat.flags);
+    put!(136, stat.generation);
+    put!(140, stat.rdev);
+    put!(160, kind);
+    put!(168, fs.fsid[0]);
+    put!(172, fs.fsid[1]);
+    if flavor == 2
+        && unsafe {
+            crate::fcntl::entry::fcntl(
+                fd,
+                crate::fcntl::cmd::F_GETPATH,
+                record[176..].as_mut_ptr() as usize,
+            )
+        } != 0
+    {
+        return 0;
+    }
+    unsafe { std::ptr::copy_nonoverlapping(record.as_ptr(), buffer.cast(), wanted as usize) };
+    wanted
 }
 
 /// `WAKEMON_DISABLE`: no wakeups monitor is armed.
@@ -655,6 +801,7 @@ exports::exports! {
         "kpersona_pidinfo" => kpersona_pidinfo,
         "proc_get_wakemon_params" => proc_get_wakemon_params,
         "proc_pidinfo" => proc_pidinfo,
+        "__proc_info" => __proc_info,
         "proc_name" => proc_name,
         "proc_pidpath" => proc_pidpath,
         "proc_pid_rusage" => proc_pid_rusage,
@@ -679,6 +826,60 @@ mod tests {
     }
 
     use super::*;
+    #[test]
+    fn raw_proc_info_preserves_syscall_errors_and_dispatches_records() {
+        let mut task = [0u8; 96];
+        assert_eq!(
+            unsafe { __proc_info(2, 0, 4, 0, task.as_mut_ptr().cast(), 96) },
+            96
+        );
+        assert_eq!(
+            unsafe { __proc_info(2, 0, 999, 0, task.as_mut_ptr().cast(), 96) },
+            -1
+        );
+        assert_eq!(crate::errno::get(), libc::EINVAL);
+        assert_eq!(
+            unsafe { __proc_info(999, 0, 0, 0, std::ptr::null_mut(), 0) },
+            -1
+        );
+        assert_eq!(crate::errno::get(), libc::ENOTSUP);
+    }
+
+    #[test]
+    fn vnode_fd_path_reports_file_and_preserves_short_buffer() {
+        use std::os::fd::AsRawFd;
+        let path = std::env::temp_dir().join(format!("rosemary-vnode-{}", std::process::id()));
+        let mut file = std::fs::File::create(&path).unwrap();
+        use std::io::{Seek, Write};
+        file.write_all(b"vnode test").unwrap();
+        file.rewind().unwrap();
+        let fd = file.as_raw_fd();
+        let mut record = [0xa5u8; 1200];
+        assert_eq!(
+            unsafe { proc_pidfdinfo(0, fd, 2, record.as_mut_ptr().cast(), 1199) },
+            0
+        );
+        assert!(record.iter().all(|b| *b == 0xa5));
+        assert_eq!(
+            unsafe { proc_pidfdinfo(0, fd, 2, record.as_mut_ptr().cast(), 1200) },
+            1200
+        );
+        assert_eq!(i64::from_ne_bytes(record[112..120].try_into().unwrap()), 10);
+        assert_eq!(i32::from_ne_bytes(record[160..164].try_into().unwrap()), 1);
+        let reported = std::ffi::CStr::from_bytes_until_nul(&record[176..]).unwrap();
+        let guest = prefix::ns::to_guest(&path).unwrap_or(path.clone());
+        use std::os::unix::ffi::OsStrExt;
+        assert_eq!(reported.to_bytes(), guest.as_os_str().as_bytes());
+        assert_eq!(
+            unsafe { proc_pidfdinfo(0, fd, 1, record.as_mut_ptr().cast(), 176) },
+            176
+        );
+        assert_eq!(
+            unsafe { proc_pidfdinfo(0, -1, 2, record.as_mut_ptr().cast(), 1200) },
+            0
+        );
+        std::fs::remove_file(path).unwrap();
+    }
 
     #[test]
     fn the_descriptor_list_counts_what_this_process_has_open() {

@@ -142,6 +142,7 @@ exports::exports! {
         "CAFrameRateRangeMake" => displaylink::CAFrameRateRangeMake,
         "CGMainDisplayID" => screen::CGMainDisplayID,
         "CGSessionCopyCurrentDictionary" => screen::CGSessionCopyCurrentDictionary,
+        "CGWindowListCopyWindowInfo" => window::CGWindowListCopyWindowInfo,
         "CGWindowServerCreateServerPort" => screen::CGWindowServerCreateServerPort,
         "CGDisplayBounds" => screen::CGDisplayBounds,
         "CGGetDisplayTransferByTable" => screen::CGGetDisplayTransferByTable,
@@ -316,12 +317,24 @@ pub fn ns_app_cell() -> u64 {
 // them. A guest loads their addresses from its GOT and copies the fields.
 static CG_AFFINE_TRANSFORM_IDENTITY: [f64; 6] = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0];
 /// `{{-CGFLOAT_MAX / 2, -CGFLOAT_MAX / 2}, {CGFLOAT_MAX, CGFLOAT_MAX}}`.
+static CG_RECT_NULL: [f64; 4] = [f64::INFINITY, f64::INFINITY, 0.0, 0.0];
 static CG_RECT_INFINITE: [f64; 4] = [f64::MAX / -2.0, f64::MAX / -2.0, f64::MAX, f64::MAX];
 
 pub fn data_symbols() -> Vec<(String, u64)> {
     bootstrap();
     let mut out = classes::class_data();
     out.extend(coretext::data_symbols());
+    out.extend(corefoundation::base::string_globals(&[
+        ("_kCGWindowNumber", "kCGWindowNumber"),
+        ("_kCGWindowOwnerPID", "kCGWindowOwnerPID"),
+        ("_kCGWindowBounds", "kCGWindowBounds"),
+        ("_kCGWindowLayer", "kCGWindowLayer"),
+        ("_kCGWindowAlpha", "kCGWindowAlpha"),
+        ("_kCGWindowIsOnscreen", "kCGWindowIsOnscreen"),
+        ("_kCGWindowName", "kCGWindowName"),
+        ("_kCGWindowSharingState", "kCGWindowSharingState"),
+        ("_kCGWindowStoreType", "kCGWindowStoreType"),
+    ]));
     out.extend(cgcontext::data_symbols());
     out.push(("_NSApp".to_string(), ns_app_cell()));
     out.push((
@@ -331,6 +344,10 @@ pub fn data_symbols() -> Vec<(String, u64)> {
     out.push((
         "_CGRectInfinite".to_string(),
         CG_RECT_INFINITE.as_ptr() as usize as u64,
+    ));
+    out.push((
+        "_CGRectNull".to_string(),
+        CG_RECT_NULL.as_ptr() as usize as u64,
     ));
     let srgb = foundation::notification::name_object("kCGColorSpaceSRGB");
     out.push((

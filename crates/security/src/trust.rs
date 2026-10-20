@@ -198,6 +198,108 @@ pub unsafe extern "C" fn SecCertificateCreateWithData(
     new(Payload::Certificate(bytes))
 }
 
+/// Read one definite-length DER element without accepting truncated lengths.
+fn der_element<'a>(input: &mut &'a [u8]) -> Option<(u8, &'a [u8])> {
+    let (&tag, rest) = input.split_first()?;
+    let (&first, mut rest) = rest.split_first()?;
+    let length = if first < 128 {
+        usize::from(first)
+    } else {
+        let count = usize::from(first & 127);
+        if count == 0 || count > size_of::<usize>() {
+            return None;
+        }
+        let bytes = rest.get(..count)?;
+        if bytes.first() == Some(&0) {
+            return None;
+        }
+        let value = bytes.iter().try_fold(0usize, |n, &b| {
+            n.checked_mul(256)?.checked_add(usize::from(b))
+        })?;
+        if value < 128 {
+            return None;
+        }
+        rest = &rest[count..];
+        value
+    };
+    let value = rest.get(..length)?;
+    *input = &rest[length..];
+    Some((tag, value))
+}
+
+fn subject_common_name(der: &[u8]) -> Option<String> {
+    let mut outer = der;
+    let (0x30, mut certificate) = der_element(&mut outer)? else {
+        return None;
+    };
+    let (0x30, mut tbs) = der_element(&mut certificate)? else {
+        return None;
+    };
+    if tbs.first() == Some(&0xa0) {
+        der_element(&mut tbs)?;
+    }
+    // Serial, signature algorithm, issuer, validity; only the subject follows.
+    for tag in [0x02, 0x30, 0x30, 0x30] {
+        if der_element(&mut tbs)?.0 != tag {
+            return None;
+        }
+    }
+    let (0x30, mut subject) = der_element(&mut tbs)? else {
+        return None;
+    };
+    while !subject.is_empty() {
+        let (0x31, mut set) = der_element(&mut subject)? else {
+            return None;
+        };
+        while !set.is_empty() {
+            let (0x30, mut attribute) = der_element(&mut set)? else {
+                return None;
+            };
+            let (0x06, oid) = der_element(&mut attribute)? else {
+                return None;
+            };
+            let (tag, value) = der_element(&mut attribute)?;
+            if oid != [0x55, 0x04, 0x03] {
+                continue;
+            }
+            return match tag {
+                0x0c | 0x13 | 0x16 => std::str::from_utf8(value).ok().map(str::to_owned),
+                0x1e if value.len() % 2 == 0 => String::from_utf16(
+                    &value
+                        .chunks_exact(2)
+                        .map(|b| u16::from_be_bytes([b[0], b[1]]))
+                        .collect::<Vec<_>>(),
+                )
+                .ok(),
+                _ => None,
+            };
+        }
+    }
+    None
+}
+
+/// The subject's common name, owned by the caller; no issuer-name fallback.
+///
+/// # Safety
+///
+/// `certificate` is a live CF object and `out` is null or writable.
+pub unsafe extern "C" fn SecCertificateCopyCommonName(
+    certificate: CFTypeRef,
+    out: *mut CFTypeRef,
+) -> OSStatus {
+    if out.is_null() {
+        return PARAM;
+    }
+    let Some(der) = (unsafe { der_of(certificate) }) else {
+        return PARAM;
+    };
+    let Some(name) = subject_common_name(der) else {
+        return -25300; // errSecItemNotFound
+    };
+    unsafe { out.write(corefoundation::string::from_bytes(name.as_bytes(), false)) };
+    SUCCESS
+}
+
 /// The host's root certificates, DER-encoded, read once.
 ///
 /// From the bundle the host's own TLS libraries trust, so a program running
@@ -788,6 +890,7 @@ pub unsafe extern "C" fn SecRandomCopyBytes(_rnd: CFTypeRef, count: usize, bytes
 
 exports::exports! {
     functions {
+        "SecCertificateCopyCommonName" => SecCertificateCopyCommonName,
         "SecCertificateCreateWithData" => SecCertificateCreateWithData,
         "SecPolicyCreateBasicX509" => SecPolicyCreateBasicX509,
         "SecTrustCreateWithCertificates" => SecTrustCreateWithCertificates,
@@ -825,6 +928,29 @@ exports::exports! {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn common_name_is_copied_from_the_subject() {
+        corefoundation::bootstrap();
+        let cert = certificate(include_bytes!("testdata/self_signed.der"));
+        let mut name = std::ptr::null();
+        unsafe {
+            assert_eq!(SecCertificateCopyCommonName(cert, &mut name), SUCCESS);
+            assert_eq!(corefoundation::string::as_string(name).unwrap().utf8(), b"rosetta3 test");
+            assert_eq!(SecCertificateCopyCommonName(cert, std::ptr::null_mut()), PARAM);
+            corefoundation::api::CFRelease(name);
+            corefoundation::api::CFRelease(cert);
+        }
+    }
+
+    #[test]
+    fn truncated_certificate_names_are_rejected() {
+        let bytes = include_bytes!("testdata/self_signed.der");
+        for end in 0..bytes.len() {
+            assert!(subject_common_name(&bytes[..end]).is_none());
+        }
+        assert!(subject_common_name(&[0x30, 0x80, 0, 0]).is_none());
+    }
 
     /// Every anchor reads back as the bytes it was made from, through both
     /// spellings of the question.

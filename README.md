@@ -105,12 +105,15 @@ first:
 
 ```sh
 sudo apt-get install build-essential pkg-config libcurl4-openssl-dev \
-    zlib1g-dev libsdl3-dev
+    libssl-dev zlib1g-dev libsdl3-dev
 cargo build --release --bin rosemary
 ```
 
 Note that Rosemary may not run properly on Debian stable since we require
 SDL 3.4.0 minimum.
+
+Code-signing certificate verification also requires OpenSSL development headers
+and libraries discoverable by `pkg-config`.
 
 On FreeBSD, install the native build and runtime dependencies first:
 

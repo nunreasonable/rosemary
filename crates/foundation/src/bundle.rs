@@ -913,6 +913,12 @@ pub mod cf {
 
 /// The bundle the program is, once something has said which.
 static MAIN: RwLock<Option<&'static Layout>> = RwLock::new(None);
+static MAIN_EXECUTABLE: RwLock<Option<PathBuf>> = RwLock::new(None);
+
+/// The loaded guest executable, including programs outside a bundle.
+pub fn main_executable() -> Option<PathBuf> {
+    MAIN_EXECUTABLE.read().unwrap_or_else(|e| e.into_inner()).clone()
+}
 
 /// Say which `.app` the guest is.
 ///
@@ -924,6 +930,7 @@ static MAIN: RwLock<Option<&'static Layout>> = RwLock::new(None);
 /// Returns whether a bundle was found, so a caller can report a loose binary
 /// rather than leave `+mainBundle` quietly nil.
 pub fn set_main(executable: &Path) -> bool {
+    *MAIN_EXECUTABLE.write().unwrap_or_else(|e| e.into_inner()) = Some(executable.to_path_buf());
     let Some(layout) = Layout::enclosing(executable) else {
         return false;
     };
