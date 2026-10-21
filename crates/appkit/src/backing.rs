@@ -923,6 +923,10 @@ pub fn pump() {
         }
     }
     DRAWING.lock().unwrap_or_else(|e| e.into_inner()).pop();
+    // Before the windows are composed, so that a frame drawn now is in this
+    // pump's composite, and outside the compositor, whose locks a subclass's
+    // drawing must not run under.
+    crate::opengllayer::display_due();
     damage_animating();
     for window in crate::window::all() {
         if crate::window::is_shown(window) {

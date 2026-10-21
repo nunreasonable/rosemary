@@ -135,16 +135,43 @@ pub(crate) fn record(
             height: target.height,
             depth: 1,
         });
+    // Capture is inserted between encoders, before their normal end barrier.
+    // Make prior attachment writes visible to this transfer, and finish the
+    // transfer before a following pass can clear or overwrite the attachment.
+    let before = vk::MemoryBarrier::default()
+        .src_access_mask(vk::AccessFlags::MEMORY_WRITE)
+        .dst_access_mask(vk::AccessFlags::TRANSFER_READ);
+    let after = vk::MemoryBarrier::default()
+        .src_access_mask(vk::AccessFlags::TRANSFER_READ | vk::AccessFlags::TRANSFER_WRITE)
+        .dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE);
     // SAFETY: recording into this command buffer, outside a render pass; every
     // image this runtime makes stays in GENERAL.
     unsafe {
+        gpu.device.cmd_pipeline_barrier(
+            command_buffer,
+            vk::PipelineStageFlags::ALL_COMMANDS,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::DependencyFlags::empty(),
+            &[before],
+            &[],
+            &[],
+        );
         gpu.device.cmd_copy_image_to_buffer(
             command_buffer,
             target.image,
             vk::ImageLayout::GENERAL,
             buffer.buffer,
             &[copy],
-        )
+        );
+        gpu.device.cmd_pipeline_barrier(
+            command_buffer,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::PipelineStageFlags::ALL_COMMANDS | vk::PipelineStageFlags::HOST,
+            vk::DependencyFlags::empty(),
+            &[after],
+            &[],
+            &[],
+        );
     };
     Some(Capture {
         buffer,

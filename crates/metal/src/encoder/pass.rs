@@ -711,6 +711,11 @@ pub(crate) fn begin_render_pass(
     trace_pass(&key, width, height);
     encoder.capture_pass = crate::capture::claim();
     if let Some(pass) = encoder.capture_pass {
+        gpu::trace(format!(
+            "capture pass {pass} begin {width}x{height} {key:?}"
+        ));
+    }
+    if let Some(pass) = encoder.capture_pass {
         for target in &capture_targets {
             if let Some(capture) =
                 crate::capture::record(gpu, command.command_buffer, pass, "pre", target)

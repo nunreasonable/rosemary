@@ -348,7 +348,15 @@ noted! {
 }
 
 /// `glBindFramebuffer`, after which the texture now drawn into is known.
+///
+/// Framebuffer 0 is the window's - except while a `CAOpenGLLayer`'s subclass
+/// draws, when it is the layer's backing store, which is a framebuffer of the
+/// layer's own.
 unsafe extern "C" fn bind_framebuffer_noted(target: u32, framebuffer: u32) {
+    let framebuffer = match framebuffer {
+        0 => appkit::opengllayer::default_framebuffer(),
+        named => named,
+    };
     // SAFETY: the guest's call, passed on.
     unsafe { bind_framebuffer(target, framebuffer) };
     appkit::opengl::surface::framebuffer_bound(target);

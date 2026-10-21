@@ -236,6 +236,28 @@ fn root_of(layer: Id) -> Id {
     at
 }
 
+/// The view whose window shows `layer`, or null where nothing does: the tree is
+/// not under a view's layer, or the layer or one above it is hidden or clear.
+pub(crate) fn showing_view(layer: Id) -> Id {
+    let mut at = layer;
+    for _ in 0..256 {
+        let (up, hidden, opacity) = read_node(at, |node| {
+            node.map_or((0, false, 1.0), |node| {
+                (node.superlayer, node.hidden, node.opacity)
+            })
+        });
+        if hidden || opacity <= 0.0 {
+            return std::ptr::null_mut();
+        }
+        if up == 0 {
+            break;
+        }
+        at = up as Id;
+    }
+    // SAFETY: a layer of this crate's.
+    unsafe { crate::layer::view_of(at) }
+}
+
 /// Have the view showing `layer`'s tree recomposed.
 pub(crate) fn changed(layer: Id) {
     // SAFETY: a layer of this crate's.
@@ -457,6 +479,12 @@ fn trace_layers(count: &std::sync::atomic::AtomicU64) -> bool {
 }
 
 unsafe extern "C" fn set_contents(receiver: Id, _sel: Sel, contents: Id) {
+    publish_contents(receiver, contents);
+}
+
+/// `-setContents:`, for a layer that is drawn by something other than its
+/// delegate and so sets its own contents.
+pub(crate) fn publish_contents(receiver: Id, contents: Id) {
     static SEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     if trace_layers(&SEEN) {
         let size = iosurface::pixels(contents as CFTypeRef).map(|p| {

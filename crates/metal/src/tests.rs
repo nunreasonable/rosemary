@@ -1812,3 +1812,161 @@ fn vertex_reset_restores_defaults_and_preserves_live_elements() {
         }
     }
 }
+
+#[test]
+fn pass_capture_preserves_pixels_between_image_writes() {
+    let Some(device) = gpu_device() else { return };
+    let gpu = gpu_of(device).unwrap();
+    let image = gpu
+        .create_image(&gpu::ImageDescription {
+            image_type: ash::vk::ImageType::TYPE_2D,
+            view_type: ash::vk::ImageViewType::TYPE_2D,
+            format: ash::vk::Format::R8G8B8A8_UNORM,
+            width: 16,
+            height: 16,
+            depth: 1,
+            levels: 1,
+            layers: 1,
+            samples: 1,
+            usage: 4,
+            cube: false,
+            components: ash::vk::ComponentMapping::default(),
+        })
+        .expect("capture test image");
+    let target = capture::Target {
+        image: image.image,
+        aspect: ash::vk::ImageAspectFlags::COLOR,
+        level: 0,
+        slice: 0,
+        width: 16,
+        height: 16,
+        format: ash::vk::Format::R8G8B8A8_UNORM,
+        samples: ash::vk::SampleCountFlags::TYPE_1,
+        role: "c0".into(),
+    };
+    let captures = std::cell::RefCell::new(Vec::new());
+    gpu.one_shot(|vk, command| {
+        for (index, color) in [[1.0, 0.0, 0.0, 1.0], [0.0, 1.0, 0.0, 1.0]]
+            .into_iter()
+            .enumerate()
+        {
+            // SAFETY: this image is live, in GENERAL, and used by this queue.
+            unsafe {
+                vk.cmd_clear_color_image(
+                    command,
+                    image.image,
+                    ash::vk::ImageLayout::GENERAL,
+                    &ash::vk::ClearColorValue { float32: color },
+                    &[ash::vk::ImageSubresourceRange {
+                        aspect_mask: ash::vk::ImageAspectFlags::COLOR,
+                        base_mip_level: 0,
+                        level_count: 1,
+                        base_array_layer: 0,
+                        layer_count: 1,
+                    }],
+                );
+            }
+            captures.borrow_mut().push(
+                capture::record(gpu, command, index as u64, "test", &target)
+                    .expect("capture buffer"),
+            );
+        }
+    })
+    .expect("capture submission");
+    for (capture, expected) in captures
+        .into_inner()
+        .into_iter()
+        .zip([[255, 0, 0, 255], [0, 255, 0, 255]])
+    {
+        // SAFETY: one_shot waited for completion; the coherent buffer is mapped.
+        let bytes = unsafe { std::slice::from_raw_parts(capture.buffer.contents, 16 * 16 * 4) };
+        assert!(bytes.chunks_exact(4).all(|pixel| pixel == expected));
+        gpu.destroy_buffer(capture.buffer);
+    }
+    gpu.destroy_image(image);
+    objc::arc::release(device);
+}
+
+/// A single-sample resolve is a transfer after attachment writes, followed by
+/// another encoder reading the destination in the same submission.
+#[test]
+fn single_sample_resolve_preserves_attachment_writes() {
+    let Some(device) = gpu_device() else {
+        return;
+    };
+    let gpu = gpu_of(device).expect("a Vulkan device");
+    const SIZE: u64 = 16;
+    let texture = || {
+        resource::new_texture(
+            gpu,
+            resource::TextureDescriptor {
+                texture_type: 2,
+                pixel_format: 80,
+                width: SIZE,
+                height: SIZE,
+                depth: 1,
+                mipmap_level_count: 1,
+                sample_count: 1,
+                array_length: 1,
+                storage_mode: 2,
+                usage: gpu::USAGE_RENDER_TARGET,
+            },
+        )
+    };
+    let source = texture();
+    let destination = texture();
+    assert!(!source.is_null() && !destination.is_null());
+    let pass = object::make(
+        c"MTLRenderPassDescriptor",
+        encoder::RenderPassDescriptor::default(),
+    );
+    // SAFETY: objects made by this test and selectors with their declared ABI.
+    unsafe {
+        let attachment = element_at(send(pass, "colorAttachments"), 0);
+        send_with_object(attachment, "setTexture:", source);
+        send_with_object(attachment, "setResolveTexture:", destination);
+        send_number(attachment, "setLoadAction:", 2);
+        send_number(attachment, "setStoreAction:", 3);
+        let queue = new_command_queue(device, std::ptr::null());
+        let readback = new_buffer(device, std::ptr::null(), (SIZE * SIZE * 4) as usize, 0);
+        let selector = objc::sel::get("setClearColor:");
+        let method = objc::object::class_of(attachment)
+            .and_then(|class| class.method(selector))
+            .expect("clear color setter");
+        let set_color: unsafe extern "C" fn(Id, Sel, encoder::ClearColor) =
+            std::mem::transmute(method.implementation());
+        for (color, expected) in [
+            (
+                encoder::ClearColor {
+                    red: 1.0,
+                    green: 0.0,
+                    blue: 0.0,
+                    alpha: 1.0,
+                },
+                [0, 0, 255, 255],
+            ),
+            (
+                encoder::ClearColor {
+                    red: 0.0,
+                    green: 1.0,
+                    blue: 0.0,
+                    alpha: 1.0,
+                },
+                [0, 255, 0, 255],
+            ),
+        ] {
+            set_color(attachment, selector, color);
+            let command = send(queue, "commandBuffer");
+            let render = render_encoder(command, pass);
+            send_void(render, "endEncoding");
+            let blit = send(command, "blitCommandEncoder");
+            copy_texture_to_buffer(blit, destination, readback, SIZE);
+            send_void(blit, "endEncoding");
+            send_void(command, "commit");
+            send_void(command, "waitUntilCompleted");
+            let contents = object::body::<resource::Buffer>(readback).inner.contents;
+            let pixels = std::slice::from_raw_parts(contents, (SIZE * SIZE * 4) as usize);
+            assert!(pixels.chunks_exact(4).all(|pixel| pixel == expected));
+        }
+    }
+}

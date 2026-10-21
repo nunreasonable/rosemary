@@ -54,6 +54,7 @@ pub mod monitor;
 pub mod nib;
 pub mod nsevent;
 pub mod opengl;
+pub mod opengllayer;
 pub mod panel;
 mod paragraph;
 pub mod pasteboard;
@@ -120,6 +121,7 @@ pub fn bootstrap() {
         view_animation::install();
         bezier::install();
         layer::install();
+        opengllayer::install();
         coreanimation::install();
         text::install();
         label::install();
@@ -281,6 +283,8 @@ exports::exports! {
         "UCKeyTranslate" => textinput::UCKeyTranslate,
         "CGLChoosePixelFormat" => opengl::CGLChoosePixelFormat,
         "CGLDestroyPixelFormat" => opengl::CGLDestroyPixelFormat,
+        "CGLRetainPixelFormat" => opengl::CGLRetainPixelFormat,
+        "CGLReleasePixelFormat" => opengl::CGLReleasePixelFormat,
         "CGLCreateContext" => opengl::CGLCreateContext,
         "CGLDestroyContext" => opengl::CGLDestroyContext,
         "CGLReleaseContext" => opengl::CGLReleaseContext,

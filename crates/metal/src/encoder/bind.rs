@@ -29,6 +29,7 @@ pub(crate) fn new_encoder(command_buffer: Id, kind: Kind) -> Id {
             pending_copies: Vec::new(),
             capture_targets: Vec::new(),
             capture_pass: None,
+            capture_draws: 0,
             render_variant: None,
             compute_variant: None,
             bound: Default::default(),
@@ -93,6 +94,12 @@ pub(super) unsafe extern "C" fn end_encoding(receiver: Id, _sel: Sel) {
                 .cmd_end_render_pass(command.command_buffer)
         };
         encoder.in_render_pass = false;
+        // Ending a pass does not make attachment writes visible to transfer
+        // reads. Single-sample resolves copy those writes before endEncoding's
+        // final barrier, so they need their own dependency here.
+        if !encoder.pending_copies.is_empty() {
+            encoder.barrier();
+        }
         for copy in std::mem::take(&mut encoder.pending_copies) {
             let source = vk::ImageSubresourceLayers {
                 aspect_mask: copy.aspect,
@@ -767,6 +774,18 @@ impl Encoder {
                 }
             },
         };
+        if let Some(pass) = self.capture_pass {
+            if self.capture_draws < 16 {
+                gpu::trace(format!(
+                    "capture pass {pass} draw {} vertex {:?} fragment {:?} variant {key:?} streams {:?}",
+                    self.capture_draws,
+                    state.vertex_name,
+                    state.fragment_name,
+                    state.vertex_streams,
+                ));
+            }
+            self.capture_draws = self.capture_draws.saturating_add(1);
+        }
         self.bind_pipeline(vk::PipelineBindPoint::GRAPHICS, pipeline);
         let command = self.command();
         let device = &command.gpu.device;

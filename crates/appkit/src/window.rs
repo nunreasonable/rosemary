@@ -425,6 +425,11 @@ pub fn sdl_windows() -> Vec<sdl3::Window> {
         .collect()
 }
 
+fn window_visibility_matches(options: u32, shown: bool) -> bool {
+    // Above and below are on-screen queries even without OnScreenOnly.
+    options & 7 == 0 || shown
+}
+
 /// Window information for the windows managed by this process's AppKit backend.
 /// Host windows and windows in other processes require a shared WindowServer
 /// catalogue, which this backend does not yet have.
@@ -452,7 +457,7 @@ pub unsafe extern "C" fn CGWindowListCopyWindowInfo(
     }
     let mut records = Vec::new();
     for (index, window) in windows.into_iter().enumerate() {
-        if options & 1 != 0 && !is_shown(window) {
+        if !window_visibility_matches(options, is_shown(window)) {
             continue;
         }
         if options & 14 != 0 {
@@ -681,9 +686,21 @@ pub(crate) fn fit_content_view(object: Id) {
     if window.sdl.is_null() || window.content_view.is_null() {
         return;
     }
-    let Some((width, height)) = sdl3::video::window_size(window.sdl) else {
+    // Match -frame while the compositor has not acknowledged a resize.
+    // Replacing the content view must not restore the previous SDL size.
+    let size = if window.size_pending != 0 {
+        let (_, _, width, height) = crate::geometry::rect_to_sdl(window.requested);
+        Some((width.max(1), height.max(1)))
+    } else {
+        sdl3::video::window_size(window.sdl)
+    };
+    let Some((width, height)) = size else {
         return;
     };
+    trace!(
+        "{object:p} fit content to {width}x{height}, requested {:?}, pending {}",
+        window.requested.size, window.size_pending
+    );
     fit_content_view_to(object, width, height);
 }
 
@@ -2862,6 +2879,15 @@ mod tests {
     use super::*;
 
     #[test]
+    fn relative_window_queries_exclude_hidden_windows() {
+        for options in [1, 2, 4, 2 | 8, 4 | 8] {
+            assert!(!window_visibility_matches(options, false));
+            assert!(window_visibility_matches(options, true));
+        }
+        assert!(window_visibility_matches(0, false));
+    }
+
+    #[test]
     fn window_information_rejects_invalid_requests_and_returns_owned_array() {
         crate::bootstrap();
         unsafe {
@@ -3379,6 +3405,48 @@ mod tests {
         // SAFETY: `-setContentView:` is `void (id, SEL, id)`.
         unsafe { set_content_view(object, objc::sel::get("setContentView:"), view) };
         assert_eq!(crate::view::frame_of(view).size.height, 300.0);
+    }
+
+    #[test]
+    fn replacing_content_during_pending_resize_preserves_requested_size() {
+        crate::bootstrap();
+        let object =
+            objc::object::create_instance(objc::class::lookup(c"NSWindow").expect("NSWindow"), 0);
+        let content = NSRect {
+            origin: NSPoint::default(),
+            size: NSSize {
+                width: 100.0,
+                height: 80.0,
+            },
+        };
+        // SAFETY: a fresh window owned by this test.
+        if !unsafe { init_with_content_rect_for_tests(object, content) } {
+            return;
+        }
+        let inset = content_inset(object);
+        // Model the interval between a requested resize and SDL's notification.
+        window_of(object).requested.size = NSSize {
+            width: 640.0,
+            height: 480.0 + inset,
+        };
+        window_of(object).size_pending = 1;
+        let view =
+            objc::object::create_instance(objc::class::lookup(c"NSView").expect("NSView"), 0);
+        // SAFETY: both objects were created by this test.
+        unsafe { set_content_view(object, objc::sel::get("setContentView:"), view) };
+        assert_eq!(
+            crate::view::frame_of(view).size,
+            NSSize {
+                width: 640.0,
+                height: 480.0
+            }
+        );
+        // Once settled, actual compositor geometry becomes authoritative again.
+        size_settled(object);
+        fit_content_view(object);
+        assert_eq!(crate::view::frame_of(view).size, content.size);
+        objc::arc::release(view);
+        objc::arc::release(object);
     }
 
     #[test]

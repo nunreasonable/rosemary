@@ -174,7 +174,8 @@ pub(super) unsafe extern "C" fn set_raster_value(receiver: Id, sel: Sel, value: 
 
 pub(super) unsafe extern "C" fn set_viewport(receiver: Id, _sel: Sel, viewport: Viewport) {
     // SAFETY: an encoder of this crate's.
-    let command = unsafe { object::body::<Encoder>(receiver) }.command();
+    let encoder = unsafe { object::body::<Encoder>(receiver) };
+    let command = encoder.command();
     // Metal's clip space has Y up and its framebuffer origin is top left;
     // Vulkan's clip space has Y down. A negative viewport height, core since
     // Vulkan 1.1, is the exact correction.
@@ -186,6 +187,11 @@ pub(super) unsafe extern "C" fn set_viewport(receiver: Id, _sel: Sel, viewport: 
         min_depth: viewport.znear as f32,
         max_depth: viewport.zfar as f32,
     };
+    if let Some(pass) = encoder.capture_pass
+        && encoder.capture_draws < 16
+    {
+        gpu::trace(format!("capture pass {pass} viewport {flipped:?}"));
+    }
     // SAFETY: recording into this command buffer.
     unsafe {
         command
@@ -197,7 +203,8 @@ pub(super) unsafe extern "C" fn set_viewport(receiver: Id, _sel: Sel, viewport: 
 
 pub(super) unsafe extern "C" fn set_scissor(receiver: Id, _sel: Sel, rect: ScissorRect) {
     // SAFETY: an encoder of this crate's.
-    let command = unsafe { object::body::<Encoder>(receiver) }.command();
+    let encoder = unsafe { object::body::<Encoder>(receiver) };
+    let command = encoder.command();
     let scissor = vk::Rect2D {
         offset: vk::Offset2D {
             x: rect.x as i32,
@@ -208,6 +215,11 @@ pub(super) unsafe extern "C" fn set_scissor(receiver: Id, _sel: Sel, rect: Sciss
             height: rect.height as u32,
         },
     };
+    if let Some(pass) = encoder.capture_pass
+        && encoder.capture_draws < 16
+    {
+        gpu::trace(format!("capture pass {pass} scissor {scissor:?}"));
+    }
     // SAFETY: recording into this command buffer.
     unsafe {
         command

@@ -209,6 +209,7 @@ pub(crate) struct Encoder {
     /// and the ordinal the capture of this pass is named by.
     capture_targets: Vec<crate::capture::Target>,
     capture_pass: Option<u64>,
+    capture_draws: u32,
     /// The pipeline variant the last draw or dispatch used, with the state
     /// which chose it, so a run of draws with one state asks no cache.
     render_variant: Option<(Id, RenderVariantKey, vk::Pipeline)>,

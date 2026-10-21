@@ -28,6 +28,13 @@ static HIERARCHY: &[(&str, Option<&str>, usize)] = &[
         Some("CALayer"),
         crate::layer::METAL_INSTANCE_SIZE,
     ),
+    // QuartzCore's OpenGL layer: a subclass draws it through a CGL context, and
+    // `crate::opengllayer` runs the frames.
+    (
+        "CAOpenGLLayer",
+        Some("CALayer"),
+        crate::opengllayer::INSTANCE_SIZE,
+    ),
     // Basic animations; their state is `crate::coreanimation`'s side tables.
     ("CAAnimation", None, 0),
     ("CAPropertyAnimation", Some("CAAnimation"), 0),

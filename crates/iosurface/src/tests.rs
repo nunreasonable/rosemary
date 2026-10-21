@@ -63,6 +63,31 @@ fn a_surface_has_the_layout_it_was_aligned_for() {
 }
 
 #[test]
+fn a_surface_made_in_process_lays_out_as_one_a_guest_asked_for() {
+    corefoundation::bootstrap();
+    let made = create(600, 300, 4, PIXEL_FORMAT_BGRA).expect("a surface");
+    let asked = bgra(600, 300);
+    // SAFETY: surfaces this test made.
+    unsafe {
+        assert_eq!(IOSurfaceGetWidth(made), 600);
+        assert_eq!(IOSurfaceGetHeight(made), 300);
+        assert_eq!(IOSurfaceGetPlaneCount(made), IOSurfaceGetPlaneCount(asked));
+        assert_eq!(IOSurfaceGetPixelFormat(made), PIXEL_FORMAT_BGRA);
+        assert_eq!(
+            IOSurfaceGetBytesPerRow(made),
+            IOSurfaceGetBytesPerRow(asked)
+        );
+        assert_eq!(IOSurfaceGetAllocSize(made), IOSurfaceGetAllocSize(asked));
+    }
+    let pixels = pixels(made).expect("pixels");
+    assert_eq!((pixels.width, pixels.height), (600, 300));
+    assert_eq!(pixels.bytes_per_element, 4);
+    assert!(create(0, 300, 4, PIXEL_FORMAT_BGRA).is_none());
+    assert!(create(600, 300, 0, PIXEL_FORMAT_BGRA).is_none());
+    assert!(create(MAX_EXTENT + 1, 1, 4, PIXEL_FORMAT_BGRA).is_none());
+}
+
+#[test]
 fn a_surface_without_a_size_is_not_made() {
     // SAFETY: a dictionary of numbers.
     assert!(unsafe { IOSurfaceCreate(properties(&[(WIDTH, 4)])) }.is_null());
@@ -469,4 +494,24 @@ fn every_key_is_published_as_a_cell_holding_its_string() {
         unsafe { corefoundation::api::CFEqual(string, key(BYTES_PER_ROW)) },
         0
     );
+}
+
+#[test]
+fn imported_surface_rejects_short_files_and_invalid_single_plane_layouts() {
+    let surface = bgra(4, 4);
+    let state = state(surface).unwrap();
+    assert!(make(state.file.clone(), PAGE - 1, None).is_none());
+    assert!(make(state.file.clone(), state.mapped + PAGE, None).is_none());
+    // SAFETY: a live surface has an initialized, aligned header mapping.
+    let mut header = unsafe { (state.mapping as *const Header).read() };
+    assert!(header_planes(&header).is_some());
+    header.offset = header.alloc_size + 1;
+    assert!(header_planes(&header).is_none());
+    header.offset = 0;
+    header.bytes_per_row = u64::MAX;
+    assert!(header_planes(&header).is_none());
+    header.bytes_per_row = 1;
+    assert!(header_planes(&header).is_none());
+    // SAFETY: the test owns the surface reference.
+    unsafe { corefoundation::api::CFRelease(surface) };
 }

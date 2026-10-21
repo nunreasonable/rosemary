@@ -1689,6 +1689,61 @@ pub unsafe extern "C" fn CGLGetPixelFormat(ctx: CGLContextObj) -> *mut c_void {
     }
 }
 
+/// `CGLPixelFormatObj CGLRetainPixelFormat(CGLPixelFormatObj)`: the format is
+/// the `NSOpenGLPixelFormat` itself, as for [`CGLDestroyPixelFormat`].
+pub unsafe extern "C" fn CGLRetainPixelFormat(pix: *mut c_void) -> *mut c_void {
+    match pix.is_null() {
+        true => std::ptr::null_mut(),
+        false => objc::arc::retain(pix.cast()).cast(),
+    }
+}
+
+/// `void CGLReleasePixelFormat(CGLPixelFormatObj)`.
+pub unsafe extern "C" fn CGLReleasePixelFormat(pix: *mut c_void) {
+    if !pix.is_null() {
+        objc::arc::release(pix.cast());
+    }
+}
+
+/// The pixel format `-[CAOpenGLLayer copyCGLPixelFormatForDisplayMask:]` answers
+/// by default: "a 32bpp fixed point pixel format, with the NoRecovery and
+/// Accelerated flags set", on the displays `mask` names. Retained, as a copy is.
+pub(crate) fn layer_pixel_format(mask: u32) -> *mut c_void {
+    let attributes = [
+        attribute::COLOR_SIZE,
+        32,
+        attribute::SCREEN_MASK,
+        mask,
+        attribute::NO_RECOVERY,
+        attribute::ACCELERATED,
+        0,
+    ];
+    let mut format = std::ptr::null_mut();
+    // SAFETY: a zero-terminated list, and a writable out-parameter.
+    unsafe { CGLChoosePixelFormat(attributes.as_ptr(), &mut format, std::ptr::null_mut()) };
+    format
+}
+
+/// The depth and stencil bits `format` asked for, which is what a framebuffer
+/// standing in for its drawable has to provide.
+pub(crate) fn depth_and_stencil_bits(format: *mut c_void) -> (i32, i32) {
+    let ask = |attribute: u32| {
+        let mut value = 0;
+        // SAFETY: a pixel format this crate made, and a writable int.
+        unsafe {
+            get_values(
+                format.cast(),
+                objc::sel::get("getValues:forAttribute:forVirtualScreen:"),
+                &mut value,
+                attribute,
+                0,
+            )
+        };
+        value
+    };
+    (ask(attribute::DEPTH_SIZE), ask(attribute::STENCIL_SIZE))
+}
+
 /// `const char *CGLErrorString(CGLError)`.
 #[allow(non_upper_case_globals)]
 pub extern "C" fn CGLErrorString(error: CGLError) -> *const std::ffi::c_char {
@@ -1804,6 +1859,11 @@ pub fn present_single_buffered() {
 
 /// `-flushBuffer`: the swap that puts a frame on the screen.
 unsafe extern "C" fn flush_buffer(receiver: Id, _sel: Sel) {
+    // A layer's subclass is drawing into the layer, not into a window: swapping
+    // the program's window here would put whatever it last drew on screen.
+    if crate::opengllayer::drawing() {
+        return;
+    }
     let window = drawable(context_of(receiver));
     if !window.is_null() {
         chrome_blit::draw(window);

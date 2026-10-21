@@ -482,28 +482,12 @@ pub unsafe extern "C" fn IOSurfaceCreate(properties: CFTypeRef) -> CFTypeRef {
         return std::ptr::null();
     };
     let pixel_format = number(properties, PIXEL_FORMAT).map_or(0, |v| v as u32);
-    // SAFETY: a fresh, unnamed memory file.
-    let fd = unsafe { libc::memfd_create(c"IOSurface".as_ptr(), libc::MFD_CLOEXEC) };
-    if fd < 0 {
-        return refuse("no memory file could be made");
-    }
-    // SAFETY: just made, and owned by nothing else.
-    let file = unsafe { OwnedFd::from_raw_fd(fd) };
-    let mapped = PAGE + alloc_size;
-    // SAFETY: an open memory file.
-    if unsafe { libc::ftruncate(file.as_raw_fd(), mapped as libc::off_t) } != 0 {
-        return refuse(&format!("{alloc_size} bytes could not be allocated"));
-    }
-    static NEXT_ID: AtomicU32 = AtomicU32::new(1);
-    // Unique across processes as well as within one: the process id in the
-    // high bits, as a surface that crosses keeps the id it was made with.
-    let id = (std::process::id() << 12) ^ NEXT_ID.fetch_add(1, Ordering::Relaxed);
     let surface_wide = |value: usize| if planes.is_empty() { value as u64 } else { 0 };
     let mut records = [Plane::default(); MAX_PLANES];
     records[..planes.len()].copy_from_slice(&planes);
-    let header = Header {
+    allocate(Header {
         magic: HEADER_MAGIC,
-        id,
+        id: 0,
         width: width as u64,
         height: height as u64,
         // A planar surface has no surface-wide element or row.
@@ -516,7 +500,69 @@ pub unsafe extern "C" fn IOSurfaceCreate(properties: CFTypeRef) -> CFTypeRef {
         alloc_size: alloc_size as u64,
         plane_count: planes.len() as u32,
         planes: records,
+    })
+}
+
+/// A surface of one plane of `bytes_per_element`-byte elements, for a caller
+/// that is not a guest and so has no property dictionary to build.
+///
+/// Rows are padded as `IOSurfaceCreate` pads them, so a reader finds the same
+/// layout whichever way the surface was made. `None` for an extent past the
+/// maximum, or where the memory for it cannot be had.
+pub fn create(
+    width: usize,
+    height: usize,
+    bytes_per_element: usize,
+    pixel_format: u32,
+) -> Option<CFTypeRef> {
+    if width == 0 || height == 0 || width > MAX_EXTENT || height > MAX_EXTENT {
+        return None;
+    }
+    if bytes_per_element == 0 || bytes_per_element > MAX_BYTES_PER_ELEMENT {
+        return None;
+    }
+    let bytes_per_row = align_up(width.checked_mul(bytes_per_element)?, ROW_ALIGNMENT)?;
+    let alloc_size = align_up(bytes_per_row.checked_mul(height)?, PAGE)?;
+    let surface = allocate(Header {
+        magic: HEADER_MAGIC,
+        id: 0,
+        width: width as u64,
+        height: height as u64,
+        bytes_per_element: bytes_per_element as u64,
+        bytes_per_row: bytes_per_row as u64,
+        element_width: 1,
+        element_height: 1,
+        pixel_format,
+        offset: 0,
+        alloc_size: alloc_size as u64,
+        plane_count: 0,
+        planes: [Plane::default(); MAX_PLANES],
+    });
+    (!surface.is_null()).then_some(surface)
+}
+
+/// A new surface laid out as `header` says, which is given its id here. Null,
+/// with a diagnostic, where the memory for it cannot be had.
+fn allocate(mut header: Header) -> CFTypeRef {
+    let alloc_size = header.alloc_size as usize;
+    // SAFETY: a fresh, unnamed memory file.
+    let fd = unsafe { libc::memfd_create(c"IOSurface".as_ptr(), libc::MFD_CLOEXEC) };
+    if fd < 0 {
+        return refuse("no memory file could be made");
+    }
+    // SAFETY: just made, and owned by nothing else.
+    let file = unsafe { OwnedFd::from_raw_fd(fd) };
+    let Some(mapped) = PAGE.checked_add(alloc_size) else {
+        return std::ptr::null();
     };
+    // SAFETY: an open memory file.
+    if unsafe { libc::ftruncate(file.as_raw_fd(), mapped as libc::off_t) } != 0 {
+        return refuse(&format!("{alloc_size} bytes could not be allocated"));
+    }
+    static NEXT_ID: AtomicU32 = AtomicU32::new(1);
+    // Unique across processes as well as within one: the process id in the
+    // high bits, as a surface that crosses keeps the id it was made with.
+    header.id = (std::process::id() << 12) ^ NEXT_ID.fetch_add(1, Ordering::Relaxed);
     match make(std::sync::Arc::new(file), mapped, Some(header)) {
         Some(surface) => surface,
         None => refuse(&format!("{alloc_size} bytes could not be mapped")),
@@ -551,10 +597,28 @@ const _: () = assert!(size_of::<Header>() <= PAGE);
 /// allocation it describes.
 fn header_planes(header: &Header) -> Option<Vec<Plane>> {
     let planes = header.planes.get(..header.plane_count as usize)?;
-    if planes.is_empty() {
-        return Some(Vec::new());
-    }
     let room = header.alloc_size.checked_sub(header.offset)?;
+    if planes.is_empty() {
+        if header.width == 0
+            || header.height == 0
+            || header.width > MAX_EXTENT as u64
+            || header.height > MAX_EXTENT as u64
+            || header.bytes_per_element == 0
+            || header.bytes_per_element > MAX_BYTES_PER_ELEMENT as u64
+            || header.element_width == 0
+            || header.element_height == 0
+        {
+            return None;
+        }
+        let row = header
+            .width
+            .div_ceil(header.element_width)
+            .checked_mul(header.bytes_per_element)?;
+        let extent = header
+            .bytes_per_row
+            .checked_mul(header.height.div_ceil(header.element_height))?;
+        return (header.bytes_per_row >= row && extent <= room).then(Vec::new);
+    }
     plane_problem(planes, room)
         .is_none()
         .then(|| planes.to_vec())
@@ -564,7 +628,21 @@ fn header_planes(header: &Header) -> Option<Vec<Plane>> {
 /// `header` when it is new, read from its own first page when it arrived from
 /// another process.
 fn make(file: std::sync::Arc<OwnedFd>, mapped: usize, header: Option<Header>) -> Option<CFTypeRef> {
-    // SAFETY: a shared mapping of the whole file, which is `mapped` long.
+    // A memory right need not contain an IOSurface or even a complete header.
+    if mapped < PAGE || size_of::<Header>() > PAGE {
+        return None;
+    }
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: a live descriptor and writable stat storage.
+    if unsafe { libc::fstat(file.as_raw_fd(), stat.as_mut_ptr()) } != 0 {
+        return None;
+    }
+    // SAFETY: fstat initialized the structure on success.
+    let length = usize::try_from(unsafe { stat.assume_init() }.st_size).ok()?;
+    if length < mapped {
+        return None;
+    }
+    // SAFETY: the file currently covers the requested mapping.
     let mapping = unsafe {
         libc::mmap(
             std::ptr::null_mut(),
@@ -588,8 +666,13 @@ fn make(file: std::sync::Arc<OwnedFd>, mapped: usize, header: Option<Header>) ->
         // SAFETY: the first page of a mapping of a surface's file.
         None => unsafe { (mapping as *const Header).read() },
     };
-    let planes = header_planes(&header)
-        .filter(|_| header.magic == HEADER_MAGIC && PAGE + header.alloc_size as usize <= mapped);
+    let planes = header_planes(&header).filter(|_| {
+        header.magic == HEADER_MAGIC
+            && usize::try_from(header.alloc_size)
+                .ok()
+                .and_then(|size| PAGE.checked_add(size))
+                .is_some_and(|end| end <= mapped)
+    });
     let Some(planes) = planes else {
         // SAFETY: the mapping made above.
         unsafe { libc::munmap(mapping.cast(), mapped) };
@@ -674,7 +757,10 @@ pub unsafe extern "C" fn IOSurfaceLookupFromMachPort(port: u32) -> CFTypeRef {
     if offset != 0 {
         return std::ptr::null();
     }
-    let surface = make(file, size as usize, None).unwrap_or(std::ptr::null());
+    let Ok(size) = usize::try_from(size) else {
+        return std::ptr::null();
+    };
+    let surface = make(file, size, None).unwrap_or(std::ptr::null());
     if trace() {
         eprintln!(
             "rosemary: iosurface: {} receives {:#x}",

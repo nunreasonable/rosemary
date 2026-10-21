@@ -68,7 +68,6 @@ unsafe extern "C" fn new_layer(class: Id, _sel: Sel) -> Id {
         )
     };
     let layer = layer_of(object);
-    layer.contents_scale = 1.0;
     layer.view = std::ptr::null_mut();
     layer.delegate = std::ptr::null_mut();
     layer.bounds = NSRect::default();
@@ -76,22 +75,35 @@ unsafe extern "C" fn new_layer(class: Id, _sel: Sel) -> Id {
     layer.opaque = 0;
     layer.needs_display = 0;
     layer.needs_layout = 0;
-    if objc::class::lookup(c"CAMetalLayer").is_some_and(|metal| {
-        // SAFETY: the receiver of a class method is a class object.
-        unsafe { objc::class::from_ptr(class as *const objc::class::Class) }.is_some_and(|actual| {
-            actual
-                .chain()
-                .any(|candidate| std::ptr::eq(candidate, metal))
-        })
-    }) {
+    initialize(object);
+    // SAFETY: a fresh object this call owns.
+    unsafe { corefoundation::api::CFAutorelease(object as corefoundation::base::CFTypeRef) as Id }
+}
+
+/// `-[CALayer init]`.
+///
+/// A layer made by `alloc`/`init` has to start where one made by `+layer` does:
+/// without this its scale reads zero, which is what a caller multiplying its
+/// bounds by it cannot tell from a layer with nothing to draw.
+unsafe extern "C" fn init(receiver: Id, _sel: Sel) -> Id {
+    initialize(receiver);
+    receiver
+}
+
+/// What a layer is before anything has set a property on it, whichever way it
+/// was made.
+fn initialize(object: Id) {
+    layer_of(object).contents_scale = 1.0;
+    if is_metal(object) {
         let metal = metal_layer_of(object);
         // CAMetalLayer's documented defaults.
         metal.pixel_format = 80; // MTLPixelFormatBGRA8Unorm
         metal.framebuffer_only = 1;
         metal.display_sync_enabled = 1;
     }
-    // SAFETY: a fresh object this call owns.
-    unsafe { corefoundation::api::CFAutorelease(object as corefoundation::base::CFTypeRef) as Id }
+    if crate::opengllayer::is_opengl(object) {
+        crate::opengllayer::created(object);
+    }
 }
 
 /// Record which view holds `layer`, as `-[NSView setLayer:]` decides it.
@@ -144,6 +156,23 @@ pub(crate) fn contents_scale_of(layer: Id) -> f64 {
     match is_layer(layer) {
         true => layer_of(layer).contents_scale,
         false => 1.0,
+    }
+}
+
+/// Whether a layer is `-opaque`.
+pub(crate) fn is_opaque_of(layer: Id) -> bool {
+    is_layer(layer) && layer_of(layer).opaque != 0
+}
+
+/// Whether a layer has been asked for display since it was last displayed.
+pub(crate) fn needs_display_of(layer: Id) -> bool {
+    is_layer(layer) && layer_of(layer).needs_display != 0
+}
+
+/// Record that a layer has been displayed, or that it has been asked to be.
+pub(crate) fn set_needs_display_of(layer: Id, needs: bool) {
+    if is_layer(layer) {
+        layer_of(layer).needs_display = needs as u8;
     }
 }
 
@@ -410,6 +439,11 @@ unsafe extern "C" fn action_for_key(receiver: Id, _sel: Sel, key: Id) -> Id {
 /// `-dealloc`, which must unregister the weak delegate slot before the memory
 /// holding it is freed.
 unsafe extern "C" fn dealloc(receiver: Id, _sel: Sel) {
+    if crate::opengllayer::is_opengl(receiver) {
+        // Before anything is taken down: the layer's subclass is asked to give
+        // back what it made for it, and it may read its own state to do so.
+        crate::opengllayer::destroyed(receiver);
+    }
     crate::coreanimation::forget(receiver);
     objc::arc::destroy_weak(&mut layer_of(receiver).delegate);
     let mask = std::mem::replace(&mut layer_of(receiver).mask, std::ptr::null_mut());
@@ -509,6 +543,7 @@ pub(crate) fn install() {
         "layer" => new_layer, c"@16@0:8";
     });
     methods!(class, {
+        "init" => init, c"@16@0:8";
         "contentsScale" => contents_scale, c"d16@0:8";
         "setContentsScale:" => set_contents_scale, c"v24@0:8d16";
         "setOpaque:" => set_opaque, c"v20@0:8c16";
