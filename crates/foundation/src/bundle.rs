@@ -26,6 +26,39 @@ fn opened(path: &Path) -> PathBuf {
     prefix::ns::existing_host_path(&path.to_string_lossy())
 }
 
+/// The CPU types a Mach-O file at `path` has code for: every slice of a fat
+/// file, or the one type of a thin one.
+fn cpu_types(path: &Path) -> Option<Vec<i32>> {
+    use std::io::Read;
+    let mut head = [0u8; 4096];
+    let mut file = std::fs::File::open(path).ok()?;
+    let n = file.read(&mut head).ok()?;
+    let head = &head[..n];
+    let word = |at: usize, be: bool| -> Option<u32> {
+        let bytes: [u8; 4] = head.get(at..at + 4)?.try_into().ok()?;
+        Some(if be {
+            u32::from_be_bytes(bytes)
+        } else {
+            u32::from_le_bytes(bytes)
+        })
+    };
+    match word(0, true)? {
+        // FAT_MAGIC and FAT_MAGIC_64: big-endian, one entry per slice, the CPU
+        // type first in each. Entries are 20 and 32 bytes respectively.
+        magic @ (0xcafe_babe | 0xcafe_babf) => {
+            let stride = if magic == 0xcafe_babe { 20 } else { 32 };
+            let count = word(4, true)? as usize;
+            (0..count)
+                .map(|i| word(8 + i * stride, true).map(|t| t as i32))
+                .collect()
+        }
+        // MH_MAGIC and MH_MAGIC_64, in this file's byte order.
+        0xcefa_edfe | 0xcffa_edfe => Some(vec![word(4, false)? as i32]),
+        0xfeed_face | 0xfeed_facf => Some(vec![word(4, true)? as i32]),
+        _ => None,
+    }
+}
+
 /// A `.app` on disk, and what its `Info.plist` says.
 #[derive(Debug)]
 pub struct Layout {
@@ -715,6 +748,72 @@ pub mod cf {
         }
     }
 
+    /// `void CFBundleGetPackageInfo(CFBundleRef, UInt32 *type, UInt32 *creator)`
+    ///
+    /// The two four-character codes from `Info.plist`, or `????` for one it
+    /// does not give - which is what Apple's answers for a missing key.
+    unsafe extern "C" fn CFBundleGetPackageInfo(bundle: Id, kind: *mut u32, creator: *mut u32) {
+        let code = |key: &str| {
+            layout(bundle)
+                .and_then(|b| b.info_string(key))
+                .and_then(|text| <[u8; 4]>::try_from(text.as_bytes()).ok())
+                .map_or(u32::from_be_bytes(*b"????"), u32::from_be_bytes)
+        };
+        if !kind.is_null() {
+            // SAFETY: writable, per the caller.
+            unsafe { kind.write(code("CFBundlePackageType")) };
+        }
+        if !creator.is_null() {
+            // SAFETY: writable, per the caller.
+            unsafe { creator.write(code("CFBundleSignature")) };
+        }
+    }
+
+    /// `CFArrayRef CFBundleCopyExecutableArchitectures(CFBundleRef)`
+    ///
+    /// The CPU types the executable has slices for, read from its header.
+    unsafe extern "C" fn CFBundleCopyExecutableArchitectures(bundle: Id) -> Id {
+        let Some(layout) = layout(bundle) else {
+            return std::ptr::null_mut();
+        };
+        let Some(types) = super::cpu_types(&layout.executable) else {
+            return std::ptr::null_mut();
+        };
+        let numbers: Vec<CFTypeRef> = types
+            .into_iter()
+            .map(|t| {
+                corefoundation::collections::new_number_of_type(
+                    corefoundation::collections::Number::Integer(i64::from(t)),
+                    // kCFNumberSInt32Type
+                    3,
+                )
+            })
+            .collect();
+        let array = corefoundation::collections::new_array(
+            &numbers,
+            corefoundation::callbacks::Policy::from_type_callbacks(),
+            false,
+        );
+        for number in numbers {
+            // SAFETY: fresh objects this call owns, now held by the array.
+            unsafe { corefoundation::api::CFRelease(number) };
+        }
+        array as Id
+    }
+
+    /// `CFArrayRef CFBundleCopyExecutableArchitecturesForURL(CFURLRef)`
+    unsafe extern "C" fn CFBundleCopyExecutableArchitecturesForURL(url: Id) -> Id {
+        // SAFETY: a `CFURL` or null.
+        let bundle = unsafe { CFBundleCreate(std::ptr::null(), url) };
+        if bundle.is_null() {
+            return std::ptr::null_mut();
+        }
+        // SAFETY: a bundle this call owns a reference to.
+        let array = unsafe { CFBundleCopyExecutableArchitectures(bundle) };
+        objc::arc::release(bundle);
+        array
+    }
+
     /// `UInt32 CFBundleGetVersionNumber(CFBundleRef)`
     ///
     /// Apple's is a packed BCD `vvvv.rr.ss` word. Only the major version is
@@ -902,6 +1001,9 @@ pub mod cf {
             "CFBundleGetInfoDictionary" => CFBundleGetInfoDictionary,
             "CFBundleGetValueForInfoDictionaryKey" => CFBundleGetValueForInfoDictionaryKey,
             "CFBundleGetVersionNumber" => CFBundleGetVersionNumber,
+            "CFBundleGetPackageInfo" => CFBundleGetPackageInfo,
+            "CFBundleCopyExecutableArchitectures" => CFBundleCopyExecutableArchitectures,
+            "CFBundleCopyExecutableArchitecturesForURL" => CFBundleCopyExecutableArchitecturesForURL,
             "CFBundleCreate" => CFBundleCreate,
             "CFBundleLoadExecutable" => CFBundleLoadExecutable,
             "CFBundleGetFunctionPointerForName" => CFBundleGetFunctionPointerForName,
@@ -957,6 +1059,19 @@ fn entries_of_type(directory: &Path, extension: &str) -> Vec<PathBuf> {
 }
 
 /// The main bundle, or `None` for a program that is not in one.
+/// The bundle an `NSBundle` object stands for; null is the main one.
+///
+/// # Safety
+///
+/// `bundle` must be null or an `NSBundle`.
+pub unsafe fn layout_of(bundle: objc::object::Id) -> Option<&'static Layout> {
+    if bundle.is_null() {
+        return main();
+    }
+    // SAFETY: an `NSBundle`, every one of which this crate made.
+    unsafe { class::layout_of(bundle) }
+}
+
 pub fn main() -> Option<&'static Layout> {
     *MAIN.read().unwrap_or_else(|e| e.into_inner())
 }

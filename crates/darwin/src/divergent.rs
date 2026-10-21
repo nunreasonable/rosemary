@@ -359,8 +359,8 @@ mod tests {
         // itself was here until `crate::dirent` answered it, and is asserted
         // the other way round below.
         assert_eq!(reason("getdirentries"), Some(DIRENT));
-        // A Mach call that reaches the kernel about *memory*, which is the half
-        // of the family `crate::mach` does not answer.
+        // A Mach call that maps another task's memory into this one, which
+        // `crate::mach` does not answer.
         assert_eq!(reason("mach_vm_wire"), Some(MACH));
         assert_eq!(
             reason("strlen"),
@@ -388,6 +388,11 @@ mod tests {
             "host_get_exception_ports",
             "semaphore_wait",
             "bootstrap_check_in",
+            // Another task's memory, which it reads and writes for the caller
+            // through the process server.
+            "mach_vm_read",
+            "mach_vm_write",
+            "mach_vm_protect",
             "dispatch_once_f",
             // The libdispatch this crate implements, which the `dispatch_` prefix
             // would otherwise deny along with the rest of the family.
@@ -405,9 +410,9 @@ mod tests {
         // And the families around them are still shut: a member of one that this
         // crate has *not* implemented is refused rather than passed through.
         assert!(contains("dispatch_io_create"));
-        // The half of Mach that is still refused: reading or changing another
-        // task, as opposed to asking the process server about it.
-        assert!(contains("mach_vm_write"));
+        // The half of Mach that is still refused: mapping another task's
+        // memory, and ending it.
+        assert!(contains("mach_vm_wire"));
         assert!(contains("task_terminate"));
         for name in ["task_for_pid", "task_threads", "pid_for_task"] {
             assert!(!contains(name), "{name} is answered by the process server");

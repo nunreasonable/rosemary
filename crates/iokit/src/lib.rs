@@ -1,6 +1,7 @@
 #![allow(clippy::missing_safety_doc, clippy::not_unsafe_ptr_arg_deref)]
 
 pub mod api;
+pub mod event_status;
 pub mod hid;
 pub mod manager;
 pub mod power;
@@ -24,6 +25,8 @@ pub fn available() -> bool {
 
 exports::exports! {
     functions {
+        "NXOpenEventStatus" => event_status::NXOpenEventStatus,
+        "NXCloseEventStatus" => event_status::NXCloseEventStatus,
         "IOHIDManagerCreate" => api::IOHIDManagerCreate,
         "IOHIDQueueCreate" => queue::IOHIDQueueCreate,
         "IOHIDQueueAddElement" => queue::IOHIDQueueAddElement,

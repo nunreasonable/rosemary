@@ -1197,6 +1197,42 @@ pub mod cf {
         crate::string::from_str(&format.format(when)) as CFTypeRef
     }
 
+    /// `CFStringRef CFDateFormatterCreateStringWithAbsoluteTime(CFAllocatorRef,
+    /// CFDateFormatterRef, CFAbsoluteTime)`
+    ///
+    /// # Safety
+    ///
+    /// `formatter` is null or an object this runtime allocated.
+    unsafe extern "C" fn CFDateFormatterCreateStringWithAbsoluteTime(
+        _allocator: CFTypeRef,
+        formatter: CFTypeRef,
+        at: f64,
+    ) -> CFTypeRef {
+        let Some(format) =
+            (unsafe { super::contents::<DateFormat>(formatter, super::date_class()) })
+        else {
+            return std::ptr::null();
+        };
+        let when = at + crate::timer::UNIX_TO_REFERENCE;
+        crate::string::from_str(&format.format(when)) as CFTypeRef
+    }
+
+    /// `void CFDateFormatterSetFormat(CFDateFormatterRef, CFStringRef)`
+    ///
+    /// # Safety
+    ///
+    /// Each argument is null or an object this runtime allocated.
+    unsafe extern "C" fn CFDateFormatterSetFormat(formatter: CFTypeRef, pattern: CFTypeRef) {
+        let Some(format) =
+            (unsafe { super::contents::<DateFormat>(formatter, super::date_class()) })
+        else {
+            return;
+        };
+        format.pattern = (!pattern.is_null()).then(|| {
+            String::from_utf8_lossy(&unsafe { crate::string::bytes(pattern as Id) }).into_owned()
+        });
+    }
+
     /// `CFTypeRef CFDateFormatterCopyProperty(CFDateFormatterRef,
     /// CFDateFormatterKey)`
     ///
@@ -1647,6 +1683,8 @@ pub mod cf {
             "CFDateFormatterGetFormat" => CFDateFormatterGetFormat,
             "CFDateFormatterCreateStringWithDate" => CFDateFormatterCreateStringWithDate,
             "CFDateFormatterCopyProperty" => CFDateFormatterCopyProperty,
+            "CFDateFormatterCreateStringWithAbsoluteTime" => CFDateFormatterCreateStringWithAbsoluteTime,
+            "CFDateFormatterSetFormat" => CFDateFormatterSetFormat,
             "CFCalendarCopyCurrent" => CFCalendarCopyCurrent,
             "CFCalendarCreateWithIdentifier" => CFCalendarCreateWithIdentifier,
             "CFCalendarGetIdentifier" => CFCalendarGetIdentifier,

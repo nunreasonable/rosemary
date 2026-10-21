@@ -161,6 +161,110 @@ pub unsafe extern "C" fn NSInsetRect(rect: NSRect, dx: CGFloat, dy: CGFloat) -> 
     }
 }
 
+/// `NSRect NSIntersectionRect(NSRect, NSRect)`, which is also
+/// `CGRectIntersection` for the empty case's purposes: no overlap is the zero
+/// rectangle.
+#[allow(non_snake_case)]
+pub unsafe extern "C" fn NSIntersectionRect(a: NSRect, b: NSRect) -> NSRect {
+    let x = a.origin.x.max(b.origin.x);
+    let y = a.origin.y.max(b.origin.y);
+    let right = (a.origin.x + a.size.width).min(b.origin.x + b.size.width);
+    let top = (a.origin.y + a.size.height).min(b.origin.y + b.size.height);
+    if right <= x || top <= y {
+        return NSRect::default();
+    }
+    NSRect {
+        origin: NSPoint { x, y },
+        size: NSSize {
+            width: right - x,
+            height: top - y,
+        },
+    }
+}
+
+/// `NSRect NSOffsetRect(NSRect, CGFloat, CGFloat)`, the same as
+/// `CGRectOffset`.
+#[allow(non_snake_case)]
+pub unsafe extern "C" fn NSOffsetRect(rect: NSRect, dx: CGFloat, dy: CGFloat) -> NSRect {
+    NSRect {
+        origin: NSPoint {
+            x: rect.origin.x + dx,
+            y: rect.origin.y + dy,
+        },
+        size: rect.size,
+    }
+}
+
+/// [`standardized`] as a rectangle again.
+fn standard_rect(rect: NSRect) -> NSRect {
+    let (x, y, width, height) = standardized(rect);
+    NSRect {
+        origin: NSPoint { x, y },
+        size: NSSize { width, height },
+    }
+}
+
+/// `CGRect CGRectInset(CGRect, CGFloat, CGFloat)`: standardized first, and
+/// the null rectangle when the inset swallows it.
+#[allow(non_snake_case)]
+pub unsafe extern "C" fn CGRectInset(rect: NSRect, dx: CGFloat, dy: CGFloat) -> NSRect {
+    let rect = standard_rect(rect);
+    let out = unsafe { NSInsetRect(rect, dx, dy) };
+    if out.size.width < 0.0 || out.size.height < 0.0 {
+        return CG_RECT_NULL;
+    }
+    out
+}
+
+/// `CGRect CGRectOffset(CGRect, CGFloat, CGFloat)`
+#[allow(non_snake_case)]
+pub unsafe extern "C" fn CGRectOffset(rect: NSRect, dx: CGFloat, dy: CGFloat) -> NSRect {
+    unsafe { NSOffsetRect(standard_rect(rect), dx, dy) }
+}
+
+/// `CGRect CGRectIntegral(CGRect)`: the smallest integral rectangle that
+/// contains it.
+#[allow(non_snake_case)]
+pub unsafe extern "C" fn CGRectIntegral(rect: NSRect) -> NSRect {
+    if rect.origin.x.is_infinite() || rect.origin.y.is_infinite() {
+        return rect;
+    }
+    let rect = standard_rect(rect);
+    let (x, y) = (rect.origin.x.floor(), rect.origin.y.floor());
+    let right = (rect.origin.x + rect.size.width).ceil();
+    let top = (rect.origin.y + rect.size.height).ceil();
+    NSRect {
+        origin: NSPoint { x, y },
+        size: NSSize {
+            width: right - x,
+            height: top - y,
+        },
+    }
+}
+
+/// `bool CGRectIsEmpty(CGRect)`: zero area, or the null rectangle.
+#[allow(non_snake_case)]
+pub unsafe extern "C" fn CGRectIsEmpty(rect: NSRect) -> u8 {
+    u8::from(
+        rect.size.width == 0.0
+            || rect.size.height == 0.0
+            || rect.origin.x.is_infinite()
+            || rect.origin.y.is_infinite(),
+    )
+}
+
+/// `CGRectNull`: an infinite origin and a zero size.
+const CG_RECT_NULL: NSRect = NSRect {
+    origin: NSPoint {
+        x: f64::INFINITY,
+        y: f64::INFINITY,
+    },
+    size: NSSize {
+        width: 0.0,
+        height: 0.0,
+    },
+};
+
 /// The eight `CGFloat CGRectGet...(CGRect)` accessors.
 ///
 /// Inline functions in the header on a Mac *and* exported symbols, and a guest

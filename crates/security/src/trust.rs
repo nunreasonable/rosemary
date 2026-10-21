@@ -820,32 +820,66 @@ pub unsafe extern "C" fn trust_setting_accepted(trust: CFTypeRef, _a: usize, _b:
     }
 }
 
-/// `OSStatus SecTrustSettingsCopyCertificates(SecTrustSettingsDomain,
-/// CFArrayRef *)`: no domain holds trust settings here.
-pub unsafe extern "C" fn SecTrustSettingsCopyCertificates(_domain: u32, out: *mut CFTypeRef) -> OSStatus {
-    /// `errSecNoTrustSettings`.
-    const NO_TRUST_SETTINGS: OSStatus = -25263;
-    if !out.is_null() {
-        // SAFETY: writable, per the caller.
-        unsafe { out.write(std::ptr::null()) };
+/// `SecTrustSettingsCopyCertificates`: expose the host trust bundle as the
+/// system domain. No per-user or administrator overrides are stored here.
+///
+/// # Safety
+/// `out` is null or writable.
+pub unsafe extern "C" fn SecTrustSettingsCopyCertificates(domain: u32, out: *mut CFTypeRef) -> OSStatus {
+    if out.is_null() || domain > 2 {
+        return PARAM;
     }
-    NO_TRUST_SETTINGS
+    // SAFETY: checked writable output by the caller's contract.
+    unsafe { out.write(std::ptr::null()) };
+    if domain != 2 || host_anchors().is_empty() {
+        return -25263; // errSecNoTrustSettings
+    }
+    // SAFETY: same output contract as this function.
+    unsafe { SecTrustCopyAnchorCertificates(out) }
 }
 
-/// `OSStatus SecTrustSettingsCopyTrustSettings(SecCertificateRef,
-/// SecTrustSettingsDomain, CFArrayRef *)`: none, for any certificate.
+fn trusted_system_root(der: &[u8], anchors: &[Vec<u8>]) -> bool {
+    if !anchors.iter().any(|anchor| anchor == der) {
+        return false;
+    }
+    // An empty settings array means TrustRoot, which only applies to a
+    // self-signed certificate. Never grant it to an arbitrary peer or issuer.
+    let Ok(cert) = openssl::x509::X509::from_der(der) else { return false };
+    let (Ok(subject), Ok(issuer), Ok(key)) = (
+        cert.subject_name().to_der(), cert.issuer_name().to_der(), cert.public_key(),
+    ) else { return false };
+    subject == issuer && cert.verify(&key).unwrap_or(false)
+}
+
+/// `SecTrustSettingsCopyTrustSettings`: a system root is trusted only if its
+/// exact DER occurs in the host's trust bundle and it is self-signed.
+/// Host overrides and non-self-signed trust anchors are not modeled yet.
+///
+/// # Safety
+/// `certificate` is a certificate handle or null; `out` is null or writable.
 pub unsafe extern "C" fn SecTrustSettingsCopyTrustSettings(
-    _certificate: CFTypeRef,
-    _domain: u32,
+    certificate: CFTypeRef,
+    domain: u32,
     out: *mut CFTypeRef,
 ) -> OSStatus {
-    /// `errSecItemNotFound`.
-    const NOT_FOUND: OSStatus = -25300;
-    if !out.is_null() {
-        // SAFETY: writable, per the caller.
-        unsafe { out.write(std::ptr::null()) };
+    if out.is_null() || domain > 2 {
+        return PARAM;
     }
-    NOT_FOUND
+    // SAFETY: the caller provides a writable output.
+    unsafe { out.write(std::ptr::null()) };
+    // SAFETY: certificate is a live handle or null by the contract.
+    let Some(Payload::Certificate(der)) = (unsafe { payload(certificate) }) else {
+        return PARAM;
+    };
+    if domain != 2 || !trusted_system_root(der, host_anchors()) {
+        return -25300; // errSecItemNotFound
+    }
+    let settings = corefoundation::collections::new_array(
+        &[], corefoundation::callbacks::Policy::from_type_callbacks(), false,
+    );
+    // SAFETY: the caller owns the returned array and provides writable output.
+    unsafe { out.write(settings) };
+    SUCCESS
 }
 
 /// `OSStatus SecCertificateGetCLHandle(SecCertificateRef, CSSM_CL_HANDLE *)`:
@@ -928,6 +962,33 @@ exports::exports! {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn system_root_requires_exact_anchor_and_valid_self_signature() {
+        let root = include_bytes!("testdata/self_signed.der").to_vec();
+        assert!(!trusted_system_root(&root, &[]));
+        assert!(trusted_system_root(&root, std::slice::from_ref(&root)));
+        let mut damaged = root.clone();
+        *damaged.last_mut().unwrap() ^= 1;
+        assert!(!trusted_system_root(&damaged, std::slice::from_ref(&root)));
+        assert!(!trusted_system_root(&damaged, std::slice::from_ref(&damaged)));
+    }
+
+    #[test]
+    fn trust_settings_do_not_grant_unknown_certificates_or_user_overrides() {
+        corefoundation::bootstrap();
+        let cert = certificate(include_bytes!("testdata/self_signed.der"));
+        let mut settings = std::ptr::null();
+        unsafe {
+            for domain in 0..=2 {
+                assert_eq!(SecTrustSettingsCopyTrustSettings(cert, domain, &mut settings), -25300);
+                assert!(settings.is_null());
+            }
+            assert_eq!(SecTrustSettingsCopyTrustSettings(cert, 3, &mut settings), PARAM);
+            assert_eq!(SecTrustSettingsCopyCertificates(2, std::ptr::null_mut()), PARAM);
+            corefoundation::api::CFRelease(cert);
+        }
+    }
 
     #[test]
     fn common_name_is_copied_from_the_subject() {

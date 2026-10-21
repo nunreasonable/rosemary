@@ -88,6 +88,17 @@ pub(crate) fn has_stacks() -> bool {
         .any(|s| !s.views.is_empty())
 }
 
+/// Whether `v` is arranged by the stack it is in.
+pub(crate) fn is_arranged(v: Id) -> bool {
+    // SAFETY: a view of this crate's, as every constrained item is.
+    let parent = unsafe { view::superview_of(v) } as usize;
+    stacks()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&parent)
+        .is_some_and(|s| s.views.iter().any(|(a, _)| *a == v as usize))
+}
+
 /// Drop a view that is going away, as a stack or as something arranged in one.
 pub(crate) fn forget(object: Id) {
     crate::cell::forget(object);
@@ -127,6 +138,55 @@ pub(crate) fn forget(object: Id) {
 /// their intrinsic sizes make them in AppKit; anything else keeps the size its
 /// frame or its constraints gave it.
 fn fitting_size(v: Id, depth: usize) -> NSSize {
+    let size = content_fitting_size(v, depth);
+    // A constant on the view's own width or height is what it is, and a lower
+    // bound is the least it can be.
+    let [width, height] = crate::layout::own_size(v);
+    let fit = |natural: f64, (exact, least): (Option<f64>, Option<f64>)| {
+        exact.unwrap_or(natural).max(least.unwrap_or(0.0))
+    };
+    NSSize {
+        width: fit(size.width, width),
+        height: fit(size.height, height),
+    }
+}
+
+/// The size a window's content view needs: a stack's arranged content or the
+/// view's own size constraints, whichever say anything; `None` for a view that
+/// neither sizes, which keeps the size the window gives it.
+pub(crate) fn required_size(v: Id) -> Option<NSSize> {
+    if !view::is_view(v) {
+        return None;
+    }
+    let is_stack = stacks()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&(v as usize))
+        .is_some_and(|s| !s.views.is_empty());
+    let [width, height] = crate::layout::own_size(v);
+    let constrained = [width, height]
+        .iter()
+        .any(|(exact, least)| exact.is_some() || least.is_some());
+    if !is_stack && !constrained {
+        return None;
+    }
+    let size = match is_stack {
+        true => fitting_size(v, 0),
+        false => {
+            let fit = |(exact, least): (Option<f64>, Option<f64>)| {
+                exact.unwrap_or(0.0).max(least.unwrap_or(0.0))
+            };
+            NSSize {
+                width: fit(width),
+                height: fit(height),
+            }
+        }
+    };
+    Some(size)
+}
+
+/// [`fitting_size`] before the view's own size constraints.
+fn content_fitting_size(v: Id, depth: usize) -> NSSize {
     if let Some(size) = crate::label::intrinsic_size(v) {
         return size;
     }
@@ -242,12 +302,22 @@ fn arrange(receiver: Id, stack: &Stack) -> bool {
             }
         }
     }
+    // `NSLayoutAttributeWidth` in a vertical stack, or height in a horizontal
+    // one: every view fills the stack across its axis.
+    let fills = match vertical {
+        true => stack.alignment == 7,
+        false => stack.alignment == 8,
+    };
     let mut moved = false;
     for (v, at, along) in spans {
-        let (_, across) = extent(v);
+        let across = match fills {
+            true => (cross - cross_lead - cross_trail).max(0.0),
+            false => extent(v).1,
+        };
         // Distance from the cross axis's bottom or left edge. Edge alignments
         // across the stack's axis hug that edge; every other one centres.
         let offset = match stack.alignment {
+            _ if fills => cross_lead,
             1 | 5 if vertical => cross_lead,
             2 | 6 if vertical => cross - cross_trail - across,
             3 if !vertical => cross - cross_trail - across,
@@ -1890,6 +1960,26 @@ unsafe extern "C" fn button_with_image(
     button
 }
 
+/// `+imageViewWithImage:`: an image view showing `image`, sized to it.
+unsafe extern "C" fn image_view_with_image(class: Id, _sel: Sel, image: Id) -> Id {
+    let Some(view) = new_view(class) else {
+        return std::ptr::null_mut();
+    };
+    send_object(view, "setImage:", image);
+    if !image.is_null() {
+        // SAFETY: `-size` is `NSSize (id, SEL)`, and `-setFrameSize:` its mirror.
+        unsafe {
+            let size: unsafe extern "C" fn(Id, Sel) -> NSSize =
+                std::mem::transmute(objc::msg::entry());
+            let size = size(image, objc::sel::get("size"));
+            let set: unsafe extern "C" fn(Id, Sel, NSSize) =
+                std::mem::transmute(objc::msg::entry());
+            set(view, objc::sel::get("setFrameSize:"), size);
+        }
+    }
+    view
+}
+
 /// `+labelWithString:`: a text field that can be neither edited nor selected.
 unsafe extern "C" fn label_with_string(class: Id, _sel: Sel, string: Id) -> Id {
     let Some(label) = new_view(class) else {
@@ -2253,6 +2343,9 @@ pub(crate) fn install() {
         "setImageAlignment:" => image_view_set_alignment, c"v24@0:8Q16";
         "imageAlignment" => image_view_alignment, c"Q16@0:8";
         "drawRect:" => image_view_draw_rect, c"v48@0:8{CGRect={CGPoint=dd}{CGSize=dd}}16";
+    });
+    class_methods!(class, {
+        "imageViewWithImage:" => image_view_with_image, c"@24@0:8@16";
     });
 
     let class = objc::class::lookup(c"NSTextField").expect("declared before its methods");

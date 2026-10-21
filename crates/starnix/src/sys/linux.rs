@@ -1,5 +1,6 @@
 //! Linux: `/proc`, `/sys` and `SO_PEERCRED`.
 
+pub mod memory;
 pub mod signal;
 
 use std::io;
@@ -327,8 +328,11 @@ fn mapped_files(base: &str) -> Vec<FileId> {
     files
 }
 
-pub fn regions() -> io::Result<Vec<Region>> {
-    super::procmap::regions("/proc/self/maps")
+pub fn regions(pid: i32) -> io::Result<Vec<Region>> {
+    match pid == crate::process::me() {
+        true => super::procmap::regions("/proc/self/maps"),
+        false => super::procmap::regions(&format!("/proc/{pid}/maps")),
+    }
 }
 
 pub fn audit() -> Audit {

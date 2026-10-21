@@ -12,8 +12,10 @@ use starnix::process::Identity;
 
 use crate::codec::{self, Malformed};
 use crate::location;
+use crate::mailbox::{self, Mailboxes, Submitted};
 use crate::protocol::{Checkin, Reply, Request, VERSION};
 use crate::registry::Registry;
+use crate::task::{self, TaskOp, TaskOutcome};
 
 pub const DEFAULT_LINGER: Duration = Duration::from_secs(5);
 
@@ -80,6 +82,9 @@ pub fn run(options: &Options) -> io::Result<Outcome> {
 
 struct Shared {
     registry: Mutex<Registry>,
+    /// Work queued for guests. When both locks are held, this one is taken
+    /// first: a mailbox asks the registry whether its guest still lives.
+    mailboxes: Mailboxes,
     /// Open connections that are not launchd's or its descendants'. A
     /// connection counts until it checks in as one of those.
     users: Mutex<usize>,
@@ -113,6 +118,15 @@ impl Shared {
         }
     }
 
+    /// Whether `pid` (the host's) is still a guest running `image`, and can
+    /// still answer: a zombie is listed until it is collected, but never runs
+    /// again.
+    fn alive(&self, pid: i32, image: u64) -> bool {
+        self.registry().image(pid) == Some(image)
+            && starnix::process::process(pid)
+                .is_some_and(|process| process.state != starnix::process::State::Zombie)
+    }
+
     fn finish_boot(&self) {
         *lock(&self.booting) = false;
         self.booted.notify_all();
@@ -133,6 +147,7 @@ pub fn serve(listener: UnixListener, linger: Duration, init: Option<&Init>) -> i
     listener.set_nonblocking(true)?;
     let shared = Arc::new(Shared {
         registry: Mutex::new(Registry::new()),
+        mailboxes: Mailboxes::new(),
         users: Mutex::new(0),
         idle_since: Mutex::new(Some(Instant::now())),
         booting: Mutex::new(init.is_some()),
@@ -157,6 +172,11 @@ pub fn serve(listener: UnixListener, linger: Duration, init: Option<&Init>) -> i
                         let mut state = Connection::default();
                         let _ = connection(stream, id, &mut state, &shared);
                         shared.registry().disconnected(id);
+                        if state.serving.is_some() {
+                            shared
+                                .mailboxes
+                                .disconnected(id, |pid, image| shared.alive(pid, image));
+                        }
                         if !state.system {
                             shared.user_left();
                         }
@@ -164,6 +184,11 @@ pub fn serve(listener: UnixListener, linger: Duration, init: Option<&Init>) -> i
             }
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                 reap(&shared, &mut launchd);
+                if !shared.mailboxes.is_empty() {
+                    shared
+                        .mailboxes
+                        .sweep(|pid, image| shared.alive(pid, image));
+                }
                 match &mut shutdown {
                     Some(sequence) => {
                         if sequence.step(&shared, &mut launchd) {
@@ -394,6 +419,11 @@ struct Connection {
     checked_in: Option<i32>,
     /// The peer is launchd or one of its descendants.
     system: bool,
+    /// The host pid whose work this connection fetches, once it said `Serve`.
+    serving: Option<i32>,
+    /// A guest to signal once the reply is written: it fetches on this
+    /// connection, and must not see the signal before the reply it waits for.
+    poke: Option<i32>,
 }
 
 fn connection(
@@ -417,6 +447,9 @@ fn connection(
             Err(Malformed) => Reply::Refused("malformed request".into()),
         };
         codec::write_frame(&mut stream, &codec::encode(&reply))?;
+        if let Some(pid) = state.poke.take() {
+            poke(pid);
+        }
     }
     Ok(())
 }
@@ -452,6 +485,130 @@ fn answer(
             shared.shutdown.store(true, Ordering::Relaxed);
             Reply::Done
         }
+        Request::Launch {
+            application,
+            launch,
+        } => {
+            if peer_pid != 0 && application.pid != peer_pid {
+                return Reply::Refused(format!(
+                    "pid {} launched from pid {peer_pid}",
+                    application.pid
+                ));
+            }
+            match starnix::process::identity(application.pid) {
+                Some(identity) => {
+                    Reply::Launch(shared.registry().launch(application, launch, identity))
+                }
+                None => Reply::Refused(format!("pid {} is not running", application.pid)),
+            }
+        }
+        Request::Applications { identifier } => {
+            Reply::Applications(shared.registry().applications(identifier.as_deref()))
+        }
+        Request::Task { pid, image, op } => {
+            if !is_guest(peer_pid, state, shared) {
+                return Reply::Refused("tasks are asked about by guests".into());
+            }
+            settle_system(peer_pid, state, shared);
+            Reply::Task(perform(shared, pid, image, op))
+        }
+        Request::Regions { pid, image } => {
+            let host = shared.registry().host_pid(pid);
+            if !shared.alive(host, image) {
+                return Reply::Regions(None);
+            }
+            Reply::Regions(starnix::process::regions_of(host).ok())
+        }
+        Request::Serve { image } => {
+            let pid = match (state.checked_in, peer_pid) {
+                (Some(pid), _) => pid,
+                (None, 0) => return Reply::Refused("serving needs a known peer".into()),
+                (None, pid) => pid,
+            };
+            if !shared.alive(pid, image) {
+                return Reply::Refused(format!("pid {pid} is not running image {image}"));
+            }
+            state.serving = Some(pid);
+            settle_system(pid, state, shared);
+            if shared.mailboxes.serve(pid, image, id) {
+                state.poke = Some(pid);
+            }
+            Reply::Done
+        }
+        Request::Fetch => match state.serving {
+            Some(pid) => Reply::Work(shared.mailboxes.fetch(pid, id)),
+            None => Reply::Refused("work is fetched on a service connection".into()),
+        },
+        Request::Complete(completions) => match state.serving {
+            Some(pid) => {
+                shared.mailboxes.complete(pid, id, completions);
+                Reply::Done
+            }
+            None => Reply::Refused("work is completed on a service connection".into()),
+        },
+    }
+}
+
+/// Whether the peer is a guest: one that checked in on this connection, or a
+/// live guest's own pid on a connection it opened without checking in again.
+fn is_guest(peer_pid: i32, state: &Connection, shared: &Shared) -> bool {
+    state.checked_in.is_some() || (peer_pid != 0 && shared.registry().is_guest(peer_pid))
+}
+
+/// A connection that never checks in still belongs to its process: one of
+/// launchd's tree does not keep the prefix up any more than its main
+/// connection does.
+fn settle_system(pid: i32, state: &mut Connection, shared: &Shared) {
+    if !state.system && pid != 0 && shared.registry().is_system(pid) {
+        state.system = true;
+        shared.user_left();
+    }
+}
+
+/// Tell guest `pid` there is work for it.
+fn poke(pid: i32) {
+    if let Some(signal) = task::signal() {
+        let _ = starnix::signal::queue(pid, signal, 0);
+    }
+}
+
+/// Have task `pid` (a guest's pid) at `image` do `op`, and wait for it.
+///
+/// Only this connection's thread waits, and on the work's own slot: a guest
+/// that never answers holds up nobody else.
+fn perform(shared: &Shared, pid: i32, image: u64, op: TaskOp) -> TaskOutcome {
+    let host = shared.registry().host_pid(pid);
+    if !shared.alive(host, image) {
+        return TaskOutcome::Gone;
+    }
+    let submit = |ops: Vec<TaskOp>| match shared.mailboxes.submit(host, image, ops) {
+        Submitted::Queued { pending, signal } => {
+            if signal {
+                poke(host);
+            }
+            Ok(pending)
+        }
+        Submitted::Refused(outcome) => Err(outcome),
+    };
+    match op {
+        // One piece at a time, so a write that fails part-way stops there
+        // rather than going on to write beyond the failure.
+        write @ TaskOp::Write { .. } => {
+            for piece in task::split(write) {
+                match submit(vec![piece]) {
+                    Ok(pending) => match mailbox::gather(&pending) {
+                        TaskOutcome::Done => {}
+                        other => return other,
+                    },
+                    Err(outcome) => return outcome,
+                }
+            }
+            TaskOutcome::Done
+        }
+        op => match submit(task::split(op)) {
+            Ok(pending) => mailbox::gather(&pending),
+            Err(outcome) => outcome,
+        },
     }
 }
 
@@ -463,11 +620,14 @@ fn check_in(
     shared: &Shared,
 ) -> Reply {
     let pid = checkin.pid;
-    let (credentials, system) = {
+    let serviceable = checkin.serviceable;
+    let (credentials, system, image) = {
         let mut registry = shared.registry();
         let credentials = registry.checkin(pid, id, checkin, identity);
-        (credentials, registry.is_system(pid))
+        let image = registry.image(pid).unwrap_or(0);
+        (credentials, registry.is_system(pid), image)
     };
+    shared.mailboxes.open(pid, image, serviceable);
     if !system && shared.stopping.load(Ordering::Relaxed) {
         shared.registry().forget(pid);
         return Reply::Refused("the prefix is shutting down".into());
@@ -486,6 +646,7 @@ fn check_in(
         server_pid: starnix::process::me(),
         credentials,
         launchd: shared.registry().launchd().unwrap_or(0),
+        image,
     }
 }
 

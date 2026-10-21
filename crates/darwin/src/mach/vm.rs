@@ -2,8 +2,12 @@ use std::ffi::c_void;
 
 use starnix::process::Region;
 
+use server::task::{TaskOp, TaskOutcome};
+
 use super::kern::*;
-use super::space::{MACH_PORT_NULL, Name, TASK_SELF};
+use super::local::{self, VM_PROT_EXECUTE, VM_PROT_READ, VM_PROT_WRITE};
+use super::remote;
+use super::space::{self, MACH_PORT_NULL, Name, Target};
 
 /// `VM_REGION_BASIC_INFO_64`, the only flavour with a layout this tree can
 /// promise. The 32-bit `VM_REGION_BASIC_INFO` is a different structure and is
@@ -20,12 +24,6 @@ const VM_REGION_TOP_INFO: i32 = 12;
 const SM_PRIVATE: u8 = 2;
 const SM_SHARED: u8 = 3;
 
-/// `VM_PROT_*`, which happen to be the same bits as `PROT_*` - stated rather
-/// than relied on, because nothing makes two operating systems agree.
-const VM_PROT_READ: i32 = 1;
-const VM_PROT_WRITE: i32 = 2;
-const VM_PROT_EXECUTE: i32 = 4;
-
 /// `VM_INHERIT_COPY`, which is `VM_INHERIT_DEFAULT` and what a private mapping
 /// on this host does across a fork.
 const VM_INHERIT_COPY: u32 = 1;
@@ -37,7 +35,7 @@ const VM_BEHAVIOR_DEFAULT: i32 = 0;
 
 /// `struct vm_region_basic_info_64`, whose layout is ABI: the guest declared
 /// one on its stack and reads the fields back by name.
-#[repr(C)]
+#[repr(C, packed(4))]
 #[derive(Clone, Copy, Default)]
 struct BasicInfo64 {
     protection: i32,
@@ -53,7 +51,9 @@ struct BasicInfo64 {
 const _: () = {
     // `VM_REGION_BASIC_INFO_COUNT_64` is this size in 32-bit words, and a
     // caller passes it in as the capacity of its buffer.
-    assert!(size_of::<BasicInfo64>() == 40);
+    assert!(size_of::<BasicInfo64>() == 36);
+    assert!(std::mem::offset_of!(BasicInfo64, offset) == 20);
+    assert!(std::mem::offset_of!(BasicInfo64, behavior) == 28);
 };
 
 /// `struct vm_region_top_info`. Resident page counts are not tracked and read
@@ -95,13 +95,31 @@ const _: () = {
     assert!(size_of::<ExtendedInfo>() == 32);
 };
 
-/// The first mapping ending above `address`, which is Mach's own search: the
-/// one containing it, or the next one up if there is a hole there.
-fn region_at_or_after(address: u64) -> Option<Region> {
-    starnix::process::regions()
-        .ok()?
-        .into_iter()
-        .find(|region| region.end > address)
+/// The first mapping of `task` ending above `address`, which is Mach's own
+/// search: the one containing it, or the next one up if there is a hole there.
+/// `Ok(None)` past the last one.
+///
+/// Another task's map is the host's to say, and the server asks it: reading a
+/// map needs no access to the memory behind it.
+fn region_at_or_after(task: Name, address: u64) -> Result<Option<Region>, i32> {
+    let regions = match space::target(task)? {
+        Target::Local => starnix::process::regions().map_err(|_| KERN_FAILURE)?,
+        Target::Remote { pid, image } => match server::client::regions(pid, image) {
+            Some(Some(regions)) => regions,
+            Some(None) => {
+                space::task_died(task);
+                return Err(MACH_SEND_INVALID_DEST);
+            }
+            None => return Err(KERN_FAILURE),
+        },
+    };
+    Ok(regions.into_iter().find(|region| region.end > address))
+}
+
+/// [`region_at_or_after`] as the `vm_region` calls answer it: past the last
+/// mapping is `KERN_INVALID_ADDRESS`, which is how a walk is told to stop.
+fn region(task: Name, address: u64) -> Result<Region, i32> {
+    region_at_or_after(task, address)?.ok_or(KERN_INVALID_ADDRESS)
 }
 
 /// A region's `VM_PROT_*` bits.
@@ -151,16 +169,16 @@ pub unsafe extern "C" fn vm_region_64(
     if address.is_null() || size.is_null() || info.is_null() || count.is_null() {
         return KERN_INVALID_ARGUMENT;
     }
-    if task != TASK_SELF {
-        return KERN_INVALID_ARGUMENT;
+    if let Err(code) = space::target(task) {
+        return code;
     }
     if flavor == VM_REGION_TOP_INFO {
         // SAFETY: the caller's obligations, as below.
-        return unsafe { top_info(address, size, info, count, object_name) };
+        return unsafe { top_info(task, address, size, info, count, object_name) };
     }
     if flavor == VM_REGION_EXTENDED_INFO {
         // SAFETY: the caller's obligations, as below.
-        return unsafe { extended_info(address, size, info, count, object_name) };
+        return unsafe { extended_info(task, address, size, info, count, object_name) };
     }
     if flavor != VM_REGION_BASIC_INFO_64 {
         unsupported(flavor);
@@ -171,10 +189,9 @@ pub unsafe extern "C" fn vm_region_64(
         return KERN_INVALID_ARGUMENT;
     }
     // SAFETY: the caller states `address` is readable.
-    let Some(region) = region_at_or_after(unsafe { *address }) else {
-        // Past the last mapping. Mach says this with `KERN_INVALID_ADDRESS`,
-        // and a walk stops on it.
-        return KERN_INVALID_ADDRESS;
+    let region = match region(task, unsafe { *address }) {
+        Ok(region) => region,
+        Err(code) => return code,
     };
     let basic = BasicInfo64 {
         protection: protection(&region),
@@ -214,6 +231,7 @@ pub unsafe extern "C" fn vm_region_64(
 ///
 /// As [`vm_region_64`].
 unsafe fn top_info(
+    task: Name,
     address: *mut u64,
     size: *mut u64,
     info: *mut c_void,
@@ -225,8 +243,9 @@ unsafe fn top_info(
         return KERN_INVALID_ARGUMENT;
     }
     // SAFETY: the caller states `address` is readable.
-    let Some(region) = region_at_or_after(unsafe { *address }) else {
-        return KERN_INVALID_ADDRESS;
+    let region = match region(task, unsafe { *address }) {
+        Ok(region) => region,
+        Err(code) => return code,
     };
     let top = TopInfo {
         ref_count: 1,
@@ -256,6 +275,7 @@ unsafe fn top_info(
 ///
 /// As [`vm_region_64`].
 unsafe fn extended_info(
+    task: Name,
     address: *mut u64,
     size: *mut u64,
     info: *mut c_void,
@@ -269,8 +289,9 @@ unsafe fn extended_info(
         return KERN_INVALID_ARGUMENT;
     }
     // SAFETY: the caller states `address` is readable.
-    let Some(region) = region_at_or_after(unsafe { *address }) else {
-        return KERN_INVALID_ADDRESS;
+    let region = match region(task, unsafe { *address }) {
+        Ok(region) => region,
+        Err(code) => return code,
     };
     let extended = ExtendedInfo {
         protection: protection(&region),
@@ -326,8 +347,8 @@ pub unsafe extern "C" fn vm_region_recurse_64(
     if address.is_null() || size.is_null() || info.is_null() || count.is_null() {
         return KERN_INVALID_ARGUMENT;
     }
-    if task != TASK_SELF {
-        return KERN_INVALID_ARGUMENT;
+    if let Err(code) = space::target(task) {
+        return code;
     }
     // SAFETY: the caller states `count` is readable.
     let capacity = unsafe { *count } as usize;
@@ -335,8 +356,9 @@ pub unsafe extern "C" fn vm_region_recurse_64(
         return KERN_INVALID_ARGUMENT;
     }
     // SAFETY: the caller states `address` is readable.
-    let Some(region) = region_at_or_after(unsafe { *address }) else {
-        return KERN_INVALID_ADDRESS;
+    let region = match region(task, unsafe { *address }) {
+        Ok(region) => region,
+        Err(code) => return code,
     };
     let words = capacity.min(V1_WORDS);
     let mut out = vec![0u32; words];
@@ -371,121 +393,157 @@ pub unsafe extern "C" fn vm_region_recurse_64(
     KERN_SUCCESS
 }
 
-/// `VM_FLAGS_*` that `vm_allocate` answers. `FIXED` is zero: the absence of
-/// `ANYWHERE`.
-const VM_FLAGS_ANYWHERE: i32 = 0x0001;
-const VM_FLAGS_RANDOM_ADDR: i32 = 0x0008;
-const VM_FLAGS_OVERWRITE: i32 = 0x4000;
-/// `VM_FLAGS_ALIAS_MASK`: the `VM_MAKE_TAG` label, which only feeds `vmmap`'s
-/// statistics and has nothing to attach to on this host.
-const VM_FLAGS_ALIAS_MASK: i32 = 0xff00_0000u32 as i32;
+/// Say once that `vm_allocate` was asked for something it does not do, because
+/// the alternative is a caller left guessing at a bare `KERN_INVALID_ARGUMENT`.
+fn unsupported_flags(flags: i32) {
+    static SAID: std::sync::Once = std::sync::Once::new();
+    SAID.call_once(|| eprintln!("rosemary: vm_allocate: unsupported flags {flags:#x}"));
+}
 
 /// `kern_return_t vm_allocate(vm_map_t target_task, vm_address_t *address,
 /// vm_size_t size, int flags)`, and `mach_vm_allocate`, which is the same call
 /// on a 64-bit task.
 ///
-/// Zero-filled anonymous memory, as Mach's is. Crashpad allocates its message
-/// buffers this way; the host's own would be asked about a task name this
-/// runtime made up.
+/// Zero-filled anonymous memory, as Mach's is, in this task or another.
 ///
 /// # Safety
 ///
 /// `address` is readable and writable.
 pub unsafe extern "C" fn vm_allocate(task: Name, address: *mut u64, size: u64, flags: i32) -> i32 {
-    if task != TASK_SELF || address.is_null() {
+    if address.is_null() {
         return KERN_INVALID_ARGUMENT;
     }
-    // Purgeable, superpage, 4GB-chunk and the rest change what the memory is,
-    // and pretending to honour them would hand back something else.
-    if flags
-        & !(VM_FLAGS_ANYWHERE | VM_FLAGS_RANDOM_ADDR | VM_FLAGS_OVERWRITE | VM_FLAGS_ALIAS_MASK)
-        != 0
-    {
-        eprintln!("rosemary: vm_allocate: unsupported flags {flags:#x}");
-        return KERN_INVALID_ARGUMENT;
-    }
-    if size == 0 {
-        // SAFETY: the caller states `address` is writable.
-        unsafe { *address = 0 };
-        return KERN_SUCCESS;
-    }
-    let page = super::info::page_size();
-    let Some(length) = size.checked_next_multiple_of(page) else {
-        return KERN_INVALID_ARGUMENT;
-    };
-    let anywhere = flags & VM_FLAGS_ANYWHERE != 0;
     // SAFETY: the caller states `address` is readable.
-    let hint = match anywhere {
-        true => 0,
-        false => (unsafe { *address }) & !(page - 1),
+    let hint = unsafe { *address };
+    let placed = match space::target(task) {
+        Err(code) => Err(code),
+        Ok(Target::Local) => local::allocate(hint, size, flags),
+        Ok(Target::Remote { pid, image }) => {
+            let op = TaskOp::Allocate {
+                address: hint,
+                size,
+                flags,
+            };
+            match remote::perform(task, pid, image, op) {
+                Ok(TaskOutcome::Address(placed)) => Ok(placed),
+                Ok(_) => Err(KERN_FAILURE),
+                Err(code) => Err(code),
+            }
+        }
     };
-    let fixed = match !anywhere && flags & VM_FLAGS_OVERWRITE != 0 {
-        true => libc::MAP_FIXED,
-        false => 0,
-    };
-    // SAFETY: a new anonymous mapping; `MAP_FIXED` only where the caller asked
-    // to replace what is there.
-    let mapped = unsafe {
-        libc::mmap(
-            hint as *mut c_void,
-            length as usize,
-            libc::PROT_READ | libc::PROT_WRITE,
-            libc::MAP_PRIVATE | libc::MAP_ANON | fixed,
-            -1,
-            0,
-        )
-    };
-    if mapped == libc::MAP_FAILED {
-        return KERN_NO_SPACE;
+    match placed {
+        Ok(placed) => {
+            // SAFETY: the caller states `address` is writable.
+            unsafe { *address = placed };
+            KERN_SUCCESS
+        }
+        Err(KERN_INVALID_ARGUMENT) => {
+            unsupported_flags(flags);
+            KERN_INVALID_ARGUMENT
+        }
+        Err(code) => code,
     }
-    // A fixed request without `OVERWRITE` must not land anywhere else, and a
-    // hint is all `mmap` will take without displacing a neighbour.
-    if !anywhere && mapped as u64 != hint {
-        // SAFETY: the mapping made above, which nothing else has seen.
-        unsafe { libc::munmap(mapped, length as usize) };
-        return KERN_NO_SPACE;
-    }
-    // SAFETY: the caller states `address` is writable.
-    unsafe { *address = mapped as u64 };
-    KERN_SUCCESS
 }
 
 /// `kern_return_t vm_deallocate(vm_map_t target_task, vm_address_t address,
-/// vm_size_t size)`
+/// vm_size_t size)`, over whole pages as Mach's is.
 ///
 /// # Safety
 ///
-/// `address` and `size` describe a mapping this process made and is done with.
+/// `address` and `size` describe memory the task is done with.
 pub unsafe extern "C" fn vm_deallocate(task: Name, address: u64, size: u64) -> i32 {
-    if task != TASK_SELF {
-        return KERN_INVALID_ARGUMENT;
+    match space::target(task) {
+        Err(code) => code,
+        // SAFETY: the caller's obligation.
+        Ok(Target::Local) => unsafe { local::deallocate(address, size) },
+        Ok(Target::Remote { pid, image }) => {
+            remote::done(task, pid, image, TaskOp::Deallocate { address, size })
+        }
     }
-    // Mach accepts a zero-length deallocation and does nothing; `munmap` calls
-    // it an error.
-    if size == 0 {
-        return KERN_SUCCESS;
+}
+
+/// `kern_return_t vm_protect(vm_map_t target_task, vm_address_t address,
+/// vm_size_t size, boolean_t set_maximum, vm_prot_t new_protection)`, and
+/// `mach_vm_protect`, the same call on a 64-bit task.
+pub extern "C" fn vm_protect(
+    task: Name,
+    address: u64,
+    size: u64,
+    set_maximum: u32,
+    protection: i32,
+) -> i32 {
+    let set_maximum = set_maximum != 0;
+    match space::target(task) {
+        Err(code) => code,
+        Ok(Target::Local) => local::protect(address, size, set_maximum, protection),
+        Ok(Target::Remote { pid, image }) => remote::done(
+            task,
+            pid,
+            image,
+            TaskOp::Protect {
+                address,
+                size,
+                set_maximum,
+                protection,
+            },
+        ),
     }
-    // SAFETY: the caller states this is its own mapping.
-    let out = unsafe { libc::munmap(address as *mut c_void, size as usize) };
-    match out {
-        0 => {
-            super::memory::forget(address, size);
+}
+
+/// Write `data` to this task's `address`, checked: the destination is the
+/// caller's own buffer here, and a bad one is an error rather than a fault.
+fn deliver(address: u64, data: &[u8]) -> i32 {
+    // SAFETY: the caller named this buffer to be written.
+    match unsafe { local::write(address, data) } {
+        Ok(()) => KERN_SUCCESS,
+        Err(code) => code,
+    }
+}
+
+/// Read `size` bytes of `task` at `address`, a chunk at a time, handing each
+/// to `each` with its offset. Stops at the first failure, all or nothing to
+/// the caller.
+fn read_task(task: Name, address: u64, size: u64, mut each: impl FnMut(u64, &[u8]) -> i32) -> i32 {
+    if address.checked_add(size).is_none() {
+        return KERN_INVALID_ADDRESS;
+    }
+    match space::target(task) {
+        Err(code) => code,
+        Ok(Target::Local) => {
+            let mut buffer = [0u8; 4096];
+            let mut done = 0;
+            while done < size {
+                let n = (size - done).min(buffer.len() as u64) as usize;
+                if let Err(code) = local::read(address + done, &mut buffer[..n]) {
+                    return code;
+                }
+                let rc = each(done, &buffer[..n]);
+                if rc != KERN_SUCCESS {
+                    return rc;
+                }
+                done += n as u64;
+            }
             KERN_SUCCESS
         }
-        _ => KERN_INVALID_ADDRESS,
+        Ok(Target::Remote { pid, image }) => {
+            match remote::perform(task, pid, image, TaskOp::Read { address, size }) {
+                Ok(TaskOutcome::Data(bytes)) if bytes.len() as u64 == size => each(0, &bytes),
+                Ok(_) => KERN_FAILURE,
+                Err(code) => code,
+            }
+        }
     }
 }
 
 /// `kern_return_t vm_read_overwrite(vm_map_t target_task, vm_address_t address,
-/// vm_size_t size, vm_address_t data, vm_size_t *outsize)`
+/// vm_size_t size, vm_address_t data, vm_size_t *outsize)`, and
+/// `mach_vm_read_overwrite`.
 ///
-/// Within one address space this is a copy, which is what it is on Darwin too
-/// when the task is the caller's own.
+/// The task's memory into the caller's own buffer at `data`.
 ///
 /// # Safety
 ///
-/// `address` is readable for `size` bytes and `data` writable for `size`; they
-/// do not overlap. `out_size` is null or writable.
+/// `out_size` is null or writable.
 pub unsafe extern "C" fn vm_read_overwrite(
     task: Name,
     address: u64,
@@ -493,56 +551,139 @@ pub unsafe extern "C" fn vm_read_overwrite(
     data: u64,
     out_size: *mut u64,
 ) -> i32 {
-    if task != TASK_SELF {
+    let rc = read_task(task, address, size, |offset, bytes| {
+        deliver(data.wrapping_add(offset), bytes)
+    });
+    if rc == KERN_SUCCESS && !out_size.is_null() {
+        // SAFETY: the caller's out-parameter.
+        unsafe { *out_size = size };
+    }
+    rc
+}
+
+/// `kern_return_t vm_read(vm_map_read_t target_task, vm_address_t address,
+/// vm_size_t size, vm_offset_t *data, mach_msg_type_number_t *dataCnt)`, and
+/// `mach_vm_read`.
+///
+/// The task's memory, copied into fresh pages of the caller's that it frees
+/// with `vm_deallocate(mach_task_self(), data, count)`. The copy starts at the
+/// same offset into its first page as `address` does, which is where Mach's
+/// out-of-line memory puts it.
+///
+/// # Safety
+///
+/// `data` and `count` are writable.
+pub unsafe extern "C" fn vm_read(
+    task: Name,
+    address: u64,
+    size: u64,
+    data: *mut u64,
+    count: *mut u32,
+) -> i32 {
+    if data.is_null() || count.is_null() {
         return KERN_INVALID_ARGUMENT;
     }
-    if address == 0 || data == 0 {
-        return KERN_INVALID_ADDRESS;
+    // The count is a `mach_msg_type_number_t`.
+    let Ok(length) = u32::try_from(size) else {
+        return KERN_INVALID_ARGUMENT;
+    };
+    if let Err(code) = space::target(task) {
+        return code;
     }
-    // SAFETY: the caller's obligation, including that the two do not overlap.
-    unsafe {
-        std::ptr::copy_nonoverlapping(
-            address as *const u8,
-            data as *mut u8,
-            usize::try_from(size).unwrap_or(0),
-        );
-        if !out_size.is_null() {
-            *out_size = size;
+    if size == 0 {
+        // SAFETY: the caller's out-parameters.
+        unsafe {
+            *data = 0;
+            *count = 0;
         }
+        return KERN_SUCCESS;
+    }
+    let (into, base) = match local::out_of_line(address, size) {
+        Ok(pages) => pages,
+        Err(code) => return code,
+    };
+    let rc = read_task(task, address, size, |offset, bytes| {
+        // SAFETY: the fresh pages hold `size` bytes from `into`.
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), into.add(offset as usize), bytes.len())
+        };
+        KERN_SUCCESS
+    });
+    if rc != KERN_SUCCESS {
+        // SAFETY: the pages made above, which nobody has seen.
+        unsafe { local::deallocate(base, into as u64 - base + size) };
+        return rc;
+    }
+    // SAFETY: the caller's out-parameters.
+    unsafe {
+        *data = into as u64;
+        *count = length;
     }
     KERN_SUCCESS
 }
 
+/// `kern_return_t vm_write(vm_map_t target_task, vm_address_t address,
+/// vm_offset_t data, mach_msg_type_number_t dataCnt)`, and `mach_vm_write`.
+///
+/// `count` bytes of the caller's own memory at `data` into the task at
+/// `address`: `KERN_INVALID_ADDRESS` where nothing is mapped there, and
+/// `KERN_PROTECTION_FAILURE` where something is but cannot be written.
+pub extern "C" fn vm_write(task: Name, address: u64, data: u64, count: u32) -> i32 {
+    let size = u64::from(count);
+    match space::target(task) {
+        Err(code) => code,
+        // The source is this task's memory as much as the destination is.
+        // SAFETY: the guest named both ranges.
+        Ok(Target::Local) => unsafe { local::copy(data, size, address) },
+        Ok(Target::Remote { pid, image }) => {
+            let mut bytes = vec![0u8; count as usize];
+            if let Err(code) = local::read(data, &mut bytes) {
+                return code;
+            }
+            let op = TaskOp::Write {
+                address,
+                data: bytes,
+            };
+            remote::done(task, pid, image, op)
+        }
+    }
+}
+
 /// `kern_return_t vm_copy(vm_map_t target_task, vm_address_t source_address,
-/// vm_size_t size, vm_address_t dest_address)`
+/// vm_size_t size, vm_address_t dest_address)`, and `mach_vm_copy`.
 ///
 /// Darwin takes the source as it was before the call, so an overlapping copy
 /// is a `memmove`. jemalloc uses it to move page runs in `realloc`.
-///
-/// # Safety
-///
-/// `source` is readable and `dest` writable for `size` bytes.
-pub unsafe extern "C" fn vm_copy(task: Name, source: u64, size: u64, dest: u64) -> i32 {
-    if task != TASK_SELF {
-        return KERN_INVALID_ARGUMENT;
+pub extern "C" fn vm_copy(task: Name, source: u64, size: u64, dest: u64) -> i32 {
+    match space::target(task) {
+        Err(code) => code,
+        // SAFETY: the guest named both ranges, in its own task.
+        Ok(Target::Local) => unsafe { local::copy(source, size, dest) },
+        Ok(Target::Remote { pid, image }) => {
+            remote::done(task, pid, image, TaskOp::Copy { source, size, dest })
+        }
     }
-    if size == 0 {
-        return KERN_SUCCESS;
-    }
-    if source == 0 || dest == 0 {
-        return KERN_INVALID_ADDRESS;
-    }
-    let Ok(len) = usize::try_from(size) else {
-        return KERN_INVALID_ADDRESS;
-    };
-    // SAFETY: the caller's obligation; `copy` permits the two to overlap.
-    unsafe { std::ptr::copy(source as *const u8, dest as *mut u8, len) };
-    KERN_SUCCESS
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mach::local::VM_FLAGS_ANYWHERE;
+    use crate::mach::space::{HOST_SELF, TASK_SELF};
+
+    fn map(prot: i32) -> u64 {
+        let mut address = 0_u64;
+        // SAFETY: a writable out-parameter.
+        assert_eq!(
+            unsafe { vm_allocate(TASK_SELF, &mut address, 2 * 4096, VM_FLAGS_ANYWHERE) },
+            KERN_SUCCESS
+        );
+        assert_eq!(
+            vm_protect(TASK_SELF, address, 2 * 4096, 0, prot),
+            KERN_SUCCESS
+        );
+        address
+    }
 
     /// The call names the region a known address is in, which is the whole of
     /// what a memory walk reads out of it.
@@ -551,8 +692,8 @@ mod tests {
         let page = vec![0_u8; 4096];
         let mut address = page.as_ptr() as u64;
         let mut size = 0_u64;
-        let mut info = [0_u32; 16];
-        let mut count = (size_of::<BasicInfo64>() / size_of::<u32>()) as u32;
+        let mut info = [0xfeed_beef_u32; 10];
+        let mut count = 9;
         let mut object = 1_u32;
         // SAFETY: writable out-parameters, and a buffer whose capacity is what
         // `count` says.
@@ -568,6 +709,8 @@ mod tests {
             )
         };
         assert_eq!(status, KERN_SUCCESS);
+        assert_eq!(count, 9);
+        assert_eq!(info[9], 0xfeed_beef);
         assert!(address <= page.as_ptr() as u64);
         assert!(address + size > page.as_ptr() as u64);
         assert_eq!(object, MACH_PORT_NULL);
@@ -599,9 +742,10 @@ mod tests {
         assert_eq!(status, KERN_INVALID_ADDRESS);
     }
 
-    /// Another task is refused rather than answered about with this one's map.
+    /// A name that holds nothing is refused as Darwin's MIG refuses a send to
+    /// it, rather than answered about with this task's map.
     #[test]
-    fn another_task_is_refused() {
+    fn a_name_that_is_no_task_is_refused() {
         let mut address = 0_u64;
         let mut size = 0_u64;
         let mut info = [0_u32; 16];
@@ -618,7 +762,9 @@ mod tests {
                 std::ptr::null_mut(),
             )
         };
-        assert_eq!(status, KERN_INVALID_ARGUMENT);
+        assert_eq!(status, MACH_SEND_INVALID_DEST);
+        // A right to something else is the wrong argument.
+        assert_eq!(vm_copy(HOST_SELF, 0, 0, 0), KERN_INVALID_ARGUMENT);
     }
 
     /// A read of this task's own memory is a copy.
@@ -648,9 +794,90 @@ mod tests {
         let mut buf = [1_u8, 2, 3, 4, 5, 6];
         let base = buf.as_mut_ptr() as u64;
         // SAFETY: both ranges lie inside `buf`.
-        let status = unsafe { vm_copy(TASK_SELF, base, 4, base + 2) };
+        let status = vm_copy(TASK_SELF, base, 4, base + 2);
         assert_eq!(status, KERN_SUCCESS);
         assert_eq!(buf, [1, 2, 1, 2, 3, 4]);
+    }
+
+    /// `mach_vm_read` hands the bytes back in fresh pages, at the same offset
+    /// into the first one as the address read, which `vm_deallocate` frees.
+    #[test]
+    fn reads_into_fresh_pages_the_caller_frees() {
+        let from = map(VM_PROT_READ | VM_PROT_WRITE);
+        let marker = b"rosemary";
+        // SAFETY: inside the two pages just mapped.
+        unsafe { std::ptr::copy_nonoverlapping(marker.as_ptr(), (from + 4090) as *mut u8, 8) };
+        let (mut data, mut count) = (0_u64, 0_u32);
+        assert_eq!(
+            unsafe { vm_read(TASK_SELF, from + 4090, 8, &mut data, &mut count) },
+            KERN_SUCCESS
+        );
+        assert_eq!(count, 8);
+        assert_eq!(data % 4096, 4090 % 4096);
+        // SAFETY: the 8 bytes just handed back.
+        assert_eq!(
+            unsafe { std::slice::from_raw_parts(data as *const u8, 8) },
+            marker
+        );
+        assert_eq!(unsafe { vm_deallocate(TASK_SELF, data, 8) }, KERN_SUCCESS);
+        unsafe { vm_deallocate(TASK_SELF, from, 2 * 4096) };
+    }
+
+    /// A read of a hole is an invalid address, and of an unreadable page a
+    /// protection failure - and neither faults.
+    #[test]
+    fn bad_reads_fail_with_darwins_codes() {
+        let base = map(VM_PROT_READ | VM_PROT_WRITE);
+        assert_eq!(vm_protect(TASK_SELF, base + 4096, 4096, 0, 0), KERN_SUCCESS);
+        let (mut data, mut count) = (0_u64, 0_u32);
+        assert_eq!(
+            unsafe { vm_read(TASK_SELF, base + 4000, 200, &mut data, &mut count) },
+            KERN_PROTECTION_FAILURE
+        );
+        unsafe { vm_deallocate(TASK_SELF, base, 2 * 4096) };
+        // The first page is never mapped, so no other test can be there.
+        let mut into = [0_u8; 4];
+        assert_eq!(
+            unsafe {
+                vm_read_overwrite(
+                    TASK_SELF,
+                    16,
+                    4,
+                    into.as_mut_ptr() as u64,
+                    std::ptr::null_mut(),
+                )
+            },
+            KERN_INVALID_ADDRESS
+        );
+    }
+
+    /// A write lands where it can and is refused where the page is read-only.
+    #[test]
+    fn writes_this_tasks_memory_unless_it_is_read_only() {
+        let base = map(VM_PROT_READ | VM_PROT_WRITE);
+        let data = *b"written";
+        assert_eq!(
+            vm_write(TASK_SELF, base + 10, data.as_ptr() as u64, 7),
+            KERN_SUCCESS
+        );
+        // SAFETY: inside the mapping.
+        assert_eq!(
+            unsafe { std::slice::from_raw_parts((base + 10) as *const u8, 7) },
+            &data
+        );
+        assert_eq!(
+            vm_protect(TASK_SELF, base, 4096, 0, VM_PROT_READ),
+            KERN_SUCCESS
+        );
+        assert_eq!(
+            vm_write(TASK_SELF, base + 10, data.as_ptr() as u64, 7),
+            KERN_PROTECTION_FAILURE
+        );
+        unsafe { vm_deallocate(TASK_SELF, base, 2 * 4096) };
+        assert_eq!(
+            vm_write(TASK_SELF, 16, data.as_ptr() as u64, 7),
+            KERN_INVALID_ADDRESS
+        );
     }
 
     /// The buffer Crashpad's message server receives into.

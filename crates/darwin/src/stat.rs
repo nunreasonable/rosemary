@@ -1122,14 +1122,17 @@ pub extern "C" fn devname(_device: i32, _mode: i32) -> *const c_char {
 exports::exports! {
     functions {
         "stat" => stat_unsuffixed,
-        "stat$INODE64" => stat,
+        // The `64` spellings are the 10.5-era names of the `$INODE64` layout,
+        // still exported by libSystem. Unanswered here, they would reach the
+        // host's own `stat64` with an untranslated path and its own layout.
+        "stat$INODE64" | "stat64" => stat,
         "lstat" => lstat_unsuffixed,
-        "lstat$INODE64" => lstat,
+        "lstat$INODE64" | "lstat64" => lstat,
         "fstat" => fstat_unsuffixed,
-        "fstat$INODE64" => fstat,
+        "fstat$INODE64" | "fstat64" => fstat,
         "fstatat" | "fstatat$INODE64" => fstatat,
-        "statfs" | "statfs$INODE64" => statfs,
-        "fstatfs" | "fstatfs$INODE64" => fstatfs,
+        "statfs" | "statfs$INODE64" | "statfs64" => statfs,
+        "fstatfs" | "fstatfs$INODE64" | "fstatfs64" => fstatfs,
         "getmntinfo" | "getmntinfo$INODE64" => getmntinfo,
         "getfsstat" | "getfsstat$INODE64" => getfsstat,
         "devname" => devname,

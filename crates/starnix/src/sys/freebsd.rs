@@ -2,6 +2,12 @@
 
 pub mod signal;
 
+/// No call reaches this process's memory through the kernel more directly
+/// than a pipe does.
+pub mod memory {
+    pub use crate::memory::piped::{read, write};
+}
+
 use std::ffi::{CStr, c_char};
 use std::io;
 use std::os::fd::RawFd;
@@ -202,8 +208,8 @@ fn vmentries(bytes: &[u8]) -> impl Iterator<Item = libc::kinfo_vmentry> + '_ {
     })
 }
 
-pub fn regions() -> io::Result<Vec<Region>> {
-    let bytes = sysctl::bytes(&proc_mib(libc::KERN_PROC_VMMAP, crate::process::me()))?;
+pub fn regions(pid: i32) -> io::Result<Vec<Region>> {
+    let bytes = sysctl::bytes(&proc_mib(libc::KERN_PROC_VMMAP, pid))?;
     Ok(vmentries(&bytes)
         .map(|entry| Region {
             start: entry.kve_start,

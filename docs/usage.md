@@ -84,9 +84,9 @@ rosemary server --stop         # ask this prefix's server to exit
 | `ROSEMARY_SERVER_LINGER` | `5` | Seconds a process server stays up with no guest connected, so a shell running one short guest after another keeps one server rather than starting a new one each time. Fractions are accepted; `0` exits as soon as the last guest leaves. |
 | `ROSEMARY_DECORATIONS` | `client` | Who draws a titled window's titlebar. `client` draws a Mac-style titlebar (window buttons, title, and the application's menus) in the window itself, and keeps SDL from loading libdecor, whose GTK 3 plugin cannot share a process with the GTK 4 that WebKit loads. `server` leaves the titlebar to the host's window manager. Applies to the `builtin` AppKit on every host, including macOS with `ROSEMARY_OBJC=builtin`. |
 | `ROSEMARY_MENU` | `titlebar` (`client`), `strip` (`server`) | Where the application's main menu is shown. `titlebar` puts it in the titlebar after the window buttons; `strip` puts it in a row of its own under the titlebar, which is the only placement under `server` decorations; `none` shows no menus. Key equivalents work whichever is chosen. |
-| `ROSEMARY_MENU_CTRL` | `1` | Let Control stand in for Command in menu key equivalents, so Ctrl+S reaches an item whose equivalent is Command-S. Only when nothing took the key as Control first. Set to `0` to leave Control to the program. |
-| `ROSEMARY_SWAP_CTRL_CMD` | unset | Swap the Control and Command (Super) keys everywhere the guest reads them: key codes, `-modifierFlags` and Carbon's `GetCurrentKeyModifiers`, so the key a PC keyboard has where a Mac's Command is acts as Command. Any value but `0` turns it on. |
-| `ROSEMARY_CONTROL_EDIT_KEYS` | unset | Let Control stand in for Command in the editing shortcuts only (A, C, V, X, Y and Z: select all, copy, paste, cut, redo, undo) and stay Control everywhere else, for a program that also reads Control as a key of its own. From the editing key until Control is let go, the guest sees Control released and Command held; any other key or a click pressed meanwhile gets Control back first. Meant for desktops that keep Super's letter chords for themselves, where Command-V never reaches the guest. Does nothing under `ROSEMARY_SWAP_CTRL_CMD`. Any value but `0` turns it on. |
+| `ROSEMARY_COMMAND_KEY` | `super` | Which host key the guest sees as Command, everywhere it reads modifiers: key codes, `-modifierFlags` and Carbon's `GetCurrentKeyModifiers`. `super`, `ctrl` or `alt`; the key named takes Command's place and Super takes the role that key had, so `ctrl` swaps Control and Super and `alt` (Command where a Mac keyboard has it) swaps Option and Super. Add `+ctrl:<keys>` to also let Control stand in for Command in chords with those keys only, and stay Control everywhere else, for a program that reads Control as a key of its own: `<keys>` is `edit` (A, C, V, X, Y and Z: select all, copy, paste, cut, redo, undo) or a run of letters and digits, as in `super+ctrl:edit` or `super+ctrl:acvxyzs`. From the chord key until Control is let go, the guest sees Control released and Command held; any other key or a click pressed meanwhile gets Control back first. Meant for desktops that keep Super's letter chords for themselves, where Command-V never reaches the guest. Not with `ctrl`, where Control is Command already. The deprecated `ROSEMARY_SWAP_CTRL_CMD=1` still means `ctrl` when this is unset. |
+| `ROSEMARY_CONTROL_EDIT_KEYS` | unset | Shorthand for `ROSEMARY_COMMAND_KEY=super+ctrl:edit`: Control acts as Command in the editing shortcuts only. Ignored when `ROSEMARY_COMMAND_KEY` or `ROSEMARY_SWAP_CTRL_CMD` is set. Any value but `0` turns it on. |
+| `ROSEMARY_PLAIN_CTRL_CLICK` | `0` | Deliver a left click made with Control held as a plain left click, Control taken out of its `-modifierFlags`. Mac programs read Control-click as the secondary click, which on a PC turns every left click made while Control is held (crouch, in many games) into a right click; the right button is still a right click. Set to `0` to give the guest Control-clicks as a Mac would. |
 | `ROSEMARY_CONFINE_POINTER` | unset | Keep the pointer inside the focused window's content, off the titlebar Rosemary draws; pushed against the edge it holds still and keeps reporting deltas. A workaround, not Mac behavior: some ports (Feral's, e.g. Life Is Strange) confine the cursor with a Win32 `ClipCursor` emulation that clamps only once and counts on warping the pointer back when it strays, which cannot reach a pointer that has left the window on Wayland. Their drag interactions stop short without it. |
 | `ROSEMARY_GLIBC` | `auto` | (packaged builds) Which glibc the launcher runs Rosemary on: `host`, `bundled`, or `auto`, which uses the host's when it defines every symbol version the bundle's libraries need and the bundled one otherwise. |
 | `ROSEMARY_EXE` | (set by the launcher) | The path that starts another copy of Rosemary. Under the bundled glibc the kernel reports the bundled dynamic loader as this process's executable, so the runtime re-launches itself (`rosemary server`, a guest spawning a Mach-O) through this instead. |
@@ -220,3 +220,25 @@ and extensions.
 `ROSEMARY_FRAME_LIMIT` caps captures per process (default 8; 0 disables capture).
 Filenames include the process ID to avoid collisions between guests. PPM files
 contain RGB only; trace output separately reports nonzero RGB and alpha pixels.
+
+### URL session diagnostics
+
+`ROSEMARY_TRACE_URLSESSION=1` reports at most 128 completed Foundation HTTP
+responses per process: sequence, route category, HTTP status, body size and a
+small allowlist of error codes. Unrecognized codes are omitted. URLs, request
+headers, identifiers, credentials and response bodies are never printed. This
+traces only requests actually sent through Foundation's transport; absence of a
+trace does not prove that an application made no request through another stack.
+
+`ROSEMARY_TRACE_PTHREAD=1` reports at most 256 native guest thread create,
+join and detach events per process. It records opaque handles and return codes;
+failed operations also include a code backtrace. Thread arguments and returned
+values are not printed. This is diagnostic only and does not change thread
+ownership or suppress termination of a joinable C++ thread.
+
+Foundation session callbacks run on the session's delegate operation queue,
+which is serial when no queue is supplied. Invalidation waits for registered
+tasks' terminal callbacks; cancellation queues one cancellation callback even
+before first resume. The blocking transport may continue until its timeout after
+cancellation, but its late result is discarded. Session configuration properties,
+transport-level suspension and immediate socket cancellation are not yet modeled.

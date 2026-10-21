@@ -9,6 +9,7 @@ pub mod raw;
 mod rwlock;
 mod sched;
 pub mod sync;
+mod trace;
 
 #[cfg(test)]
 pub(crate) mod testing;
@@ -40,7 +41,7 @@ pub fn id() -> u32 {
     }
     #[cfg(target_os = "linux")]
     {
-        unsafe { libc::syscall(libc::SYS_gettid) as u32 }
+        rustix::thread::gettid().as_raw_pid() as u32
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
@@ -910,7 +911,11 @@ pub unsafe extern "C" fn key_create(
 /// a writable pointer slot or null.
 pub unsafe extern "C" fn join(thread: u64, value: u64) -> i32 {
     super::idle::reached(super::idle::Idle::Wait);
-    err::from_host(unsafe { libc::pthread_join(thread_of(thread), value as usize as *mut _) })
+    trace::event("join-begin", thread, 0);
+    let rc =
+        err::from_host(unsafe { libc::pthread_join(thread_of(thread), value as usize as *mut _) });
+    trace::event("join-end", thread, rc);
+    rc
 }
 
 /// The stack a guest thread's frames go on when its attributes ask for nothing.
@@ -967,6 +972,9 @@ extern "C" fn run(context: *mut core::ffi::c_void) -> *mut core::ffi::c_void {
     let qos = u64::from(start.qos_class) | ((start.qos_relative_priority as u32 as u64) << 32);
     thread_ids::register(thread_bits(unsafe { libc::pthread_self() }), id(), qos);
     handle::begin();
+    // Before the guest runs: the server may ask this task for something at
+    // any moment, and this thread may be the one the signal lands on.
+    crate::mach::service::prepare_thread();
     start
         .registered
         .store(true, std::sync::atomic::Ordering::Release);
@@ -1045,7 +1053,9 @@ pub unsafe extern "C" fn create(out: u64, attr: u64, start: u64, arg: u64) -> i3
     }
     // SAFETY: the caller states `out` is a writable `pthread_t`, which is eight
     // opaque bytes on both platforms - see [`thread_of`], which reads it back.
-    unsafe { (out as usize as *mut u64).write(handle::for_host(thread_bits(thread))) };
+    let guest = handle::for_host(thread_bits(thread));
+    unsafe { (out as usize as *mut u64).write(guest) };
+    trace::event("create", guest, 0);
     0
 }
 
@@ -1055,7 +1065,9 @@ pub unsafe extern "C" fn create(out: u64, attr: u64, start: u64, arg: u64) -> i3
 ///
 /// As [`join`].
 pub unsafe extern "C" fn detach(thread: u64) -> i32 {
-    err::from_host(unsafe { libc::pthread_detach(thread_of(thread)) })
+    let rc = err::from_host(unsafe { libc::pthread_detach(thread_of(thread)) });
+    trace::event("detach", thread, rc);
+    rc
 }
 
 /// # Safety

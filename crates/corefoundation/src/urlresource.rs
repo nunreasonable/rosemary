@@ -385,6 +385,99 @@ pub unsafe extern "C" fn CFURLCreateFromFileSystemRepresentation(
     crate::url::new_file_url(&path, is_directory != 0)
 }
 
+/// `CFURLRef CFURLCreateFromFileSystemRepresentationRelativeToBase(CFAllocatorRef,
+/// const UInt8 *, CFIndex, Boolean isDirectory, CFURLRef baseURL)`
+///
+/// # Safety
+///
+/// As [`CFURLCreateFromFileSystemRepresentation`]; `base` is null or a `CFURL`.
+pub unsafe extern "C" fn CFURLCreateFromFileSystemRepresentationRelativeToBase(
+    allocator: CFTypeRef,
+    buffer: *const u8,
+    length: CFIndex,
+    is_directory: Boolean,
+    base: CFTypeRef,
+) -> CFTypeRef {
+    if buffer.is_null() || length < 0 {
+        return std::ptr::null();
+    }
+    // SAFETY: the caller states the bytes are readable.
+    let bytes = unsafe { std::slice::from_raw_parts(buffer, length as usize) };
+    let path = String::from_utf8_lossy(bytes);
+    let base_path = (!std::path::Path::new(&*path).is_absolute())
+        .then(|| unsafe { crate::url::as_url(base) }.and_then(|b| b.file_path()))
+        .flatten();
+    match base_path {
+        Some(base_path) => {
+            let joined = std::path::Path::new(&base_path).join(&*path);
+            crate::url::new_file_url(&joined.to_string_lossy(), is_directory != 0)
+        }
+        // SAFETY: the caller's buffer, as above.
+        None => unsafe {
+            CFURLCreateFromFileSystemRepresentation(allocator, buffer, length, is_directory)
+        },
+    }
+}
+
+/// `Boolean CFURLCreateDataAndPropertiesFromResource(CFAllocatorRef, CFURLRef,
+/// CFDataRef *resourceData, CFDictionaryRef *properties, CFArrayRef
+/// desiredProperties, SInt32 *errorCode)`
+///
+/// The deprecated way to read a file. Only the data is answered; a caller
+/// asking for properties gets NULL, which the documentation permits for a
+/// property the scheme does not support.
+///
+/// # Safety
+///
+/// `url` is null or a `CFURL`; each out-pointer is null or writable.
+pub unsafe extern "C" fn CFURLCreateDataAndPropertiesFromResource(
+    _allocator: CFTypeRef,
+    url: CFTypeRef,
+    data: *mut CFTypeRef,
+    properties: *mut CFTypeRef,
+    _desired: CFTypeRef,
+    error: *mut i32,
+) -> Boolean {
+    /// `kCFURLUnknownError` and `kCFURLResourceNotFoundError`.
+    const UNKNOWN: i32 = -10;
+    const NOT_FOUND: i32 = -12;
+    let set_error = |code: i32| {
+        if !error.is_null() {
+            // SAFETY: writable, per the caller.
+            unsafe { error.write(code) };
+        }
+    };
+    if !properties.is_null() {
+        // SAFETY: writable, per the caller.
+        unsafe { properties.write(std::ptr::null()) };
+    }
+    if !data.is_null() {
+        // SAFETY: as above.
+        unsafe { data.write(std::ptr::null()) };
+    }
+    let Some(path) = (unsafe { crate::url::as_url(url) }).and_then(|u| u.file_path()) else {
+        set_error(UNKNOWN);
+        return 0;
+    };
+    if data.is_null() {
+        let exists = std::fs::metadata(prefix::ns::host_path(&path)).is_ok();
+        set_error(if exists { 0 } else { NOT_FOUND });
+        return Boolean::from(exists);
+    }
+    let Ok(bytes) = std::fs::read(prefix::ns::host_path(&path)) else {
+        set_error(NOT_FOUND);
+        return 0;
+    };
+    // SAFETY: a buffer described by its own length.
+    let object = unsafe {
+        crate::api::CFDataCreate(std::ptr::null(), bytes.as_ptr(), bytes.len() as CFIndex)
+    };
+    // SAFETY: writable, per the caller.
+    unsafe { data.write(object) };
+    set_error(0);
+    1
+}
+
 /// `CFURLRef CFURLCreateWithBytes(CFAllocatorRef, const UInt8 *, CFIndex,
 /// CFStringEncoding, CFURLRef baseURL)`
 ///
@@ -539,6 +632,8 @@ exports::exports! {
         "CFURLCopyResourcePropertyForKey" => CFURLCopyResourcePropertyForKey,
         "CFURLCopyResourcePropertiesForKeys" => CFURLCopyResourcePropertiesForKeys,
         "CFURLCreateFromFileSystemRepresentation" => CFURLCreateFromFileSystemRepresentation,
+        "CFURLCreateFromFileSystemRepresentationRelativeToBase" => CFURLCreateFromFileSystemRepresentationRelativeToBase,
+        "CFURLCreateDataAndPropertiesFromResource" => CFURLCreateDataAndPropertiesFromResource,
         "CFURLCreateWithBytes" => CFURLCreateWithBytes,
         "CFURLEnumeratorCreateForMountedVolumes" => CFURLEnumeratorCreateForMountedVolumes,
         "CFURLEnumeratorGetNextURL" => CFURLEnumeratorGetNextURL,

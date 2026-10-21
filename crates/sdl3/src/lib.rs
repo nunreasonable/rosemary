@@ -5,6 +5,7 @@ use std::sync::OnceLock;
 
 pub mod keycodes;
 pub mod mouse;
+pub mod tray;
 pub mod wayland;
 
 pub mod init {

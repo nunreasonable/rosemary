@@ -360,13 +360,10 @@ pub(crate) fn deliver_past_modal(event: sdl3::video::Event) {
                 crate::screen::apply_mouse_association();
                 crate::screen::confine_pointer(object);
             }
-            post(
-                window,
-                match gained {
-                    true => window::DID_BECOME_KEY,
-                    false => window::DID_RESIGN_KEY,
-                },
-            );
+            match gained {
+                true => announce_key(object),
+                false => announce_resign(object),
+            }
         }
         Event::Key {
             window: id,
@@ -668,7 +665,7 @@ fn begin_edit_chord(id: u32, window: Id, sdl_modifiers: u16) {
         .filter(|s| sides & s != 0)
     {
         control &= !side;
-        let flags = crate::keymap::modifiers(rest | control);
+        let flags = crate::keymap::chord_flags(rest, control, 0);
         flags_changed(window, crate::keymap::chord_control(side), flags);
     }
     let mut command = 0;
@@ -677,7 +674,7 @@ fn begin_edit_chord(id: u32, window: Id, sdl_modifiers: u16) {
         .filter(|s| sides & s != 0)
     {
         command |= side;
-        let flags = crate::keymap::modifiers(rest | (command << 4));
+        let flags = crate::keymap::chord_flags(rest, 0, command);
         flags_changed(window, crate::keymap::chord_command(side), flags);
     }
     CHORD_WINDOW.store(id, std::sync::atomic::Ordering::Relaxed);
@@ -704,7 +701,7 @@ pub(crate) fn leave_edit_chord(sdl_modifiers: u16) {
         .filter(|s| sides & s != 0)
     {
         command &= !side;
-        let flags = crate::keymap::modifiers(rest | (command << 4));
+        let flags = crate::keymap::chord_flags(rest, 0, command);
         flags_changed(window, crate::keymap::chord_command(side), flags);
     }
     let held = sdl_modifiers & keymod::CTRL;
@@ -714,7 +711,7 @@ pub(crate) fn leave_edit_chord(sdl_modifiers: u16) {
         .filter(|s| held & s != 0)
     {
         control |= side;
-        let flags = crate::keymap::modifiers(rest | control);
+        let flags = crate::keymap::chord_flags(rest, control, 0);
         flags_changed(window, crate::keymap::chord_control(side), flags);
     }
 }
@@ -776,9 +773,6 @@ fn without_control(modifiers: u64) -> u64 {
 
 /// Offer a key press to whatever takes it as a key equivalent: the window's
 /// views, then the main menu. True when something did.
-///
-/// With [`crate::decor::Config::control_shortcuts`], Control also reaches a
-/// menu item whose equivalent is Command, once nothing took it as it was.
 fn key_equivalent(window: Id, fields: Fields, text: &str) -> bool {
     use crate::keymap::flags;
     let modifiers = fields.modifiers;
@@ -803,19 +797,8 @@ fn key_equivalent(window: Id, fields: Fields, text: &str) -> bool {
         }
     };
     let menu = crate::menu::main_menu();
-    let event = nsevent::make(fields.clone());
-    if offer(window, event) || offer(menu, event) {
-        return true;
-    }
-    let control_only = modifiers & flags::CONTROL != 0 && modifiers & flags::COMMAND == 0;
-    if !(control_only && !crate::decor::config().control_shortcuts) {
-        return false;
-    }
-    let aliased = nsevent::make(Fields {
-        modifiers: (modifiers & !flags::CONTROL) | flags::COMMAND,
-        ..fields
-    });
-    offer(menu, aliased)
+    let event = nsevent::make(fields);
+    offer(window, event) || offer(menu, event)
 }
 
 /// A pointer position SDL reports against the window's top-left, in the
@@ -853,6 +836,7 @@ fn send(id: u32, at: Option<(f32, f32)>, fields: impl FnOnce(Id, NSPoint) -> Fie
 
 /// Hand a built event to its window's `-sendEvent:`, after the local monitors.
 pub(crate) fn dispatch(window: Id, event: Id) {
+    crate::cgevent::count(nsevent::kind_of(event));
     // Before the window sees it, which is where AppKit runs a local monitor: a
     // monitor exists to swallow an event, and one that ran afterwards could
     // only take it back.
@@ -1413,6 +1397,69 @@ fn post(id: u32, name: &str) {
         return;
     }
     post_for(object, name);
+}
+
+/// The window last announced as key and main, which is not always
+/// [`window::key_window`]: that one follows every ordering, and this one only
+/// changes with a pair of notifications, so no window becomes key twice
+/// without resigning in between.
+static ANNOUNCED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+fn answers(object: Id, selector: &str) -> bool {
+    // SAFETY: a window this crate made; both selectors are `BOOL (id, SEL)`,
+    // sent so a subclass's override decides.
+    unsafe {
+        let f: unsafe extern "C" fn(Id, objc::sel::Sel) -> u8 =
+            std::mem::transmute(objc::msg::entry());
+        f(object, objc::sel::get(selector)) != 0
+    }
+}
+
+/// `object` becomes the key window, and the main one when it can: the window
+/// before it resigns both first, as AppKit orders them. Toolkits activate on
+/// these - Gecko only fires DOM focus events in a window it was told is key.
+pub(crate) fn announce_key(object: Id) {
+    if object.is_null() || !answers(object, "canBecomeKeyWindow") {
+        return;
+    }
+    let previous = ANNOUNCED.swap(object as usize, std::sync::atomic::Ordering::AcqRel) as Id;
+    if previous == object {
+        return;
+    }
+    if !previous.is_null() {
+        post_for(previous, window::DID_RESIGN_KEY);
+        post_for(previous, window::DID_RESIGN_MAIN);
+    }
+    post_for(object, window::DID_BECOME_KEY);
+    if answers(object, "canBecomeMainWindow") {
+        post_for(object, window::DID_BECOME_MAIN);
+    }
+}
+
+/// `object` stops being key and main, if it was: focus left it, or it left
+/// the screen.
+pub(crate) fn announce_resign(object: Id) {
+    let was = ANNOUNCED.compare_exchange(
+        object as usize,
+        0,
+        std::sync::atomic::Ordering::AcqRel,
+        std::sync::atomic::Ordering::Acquire,
+    );
+    if was.is_ok() && !object.is_null() {
+        post_for(object, window::DID_RESIGN_KEY);
+        post_for(object, window::DID_RESIGN_MAIN);
+    }
+}
+
+/// A window being freed is no longer the announced one; nothing is posted
+/// about an object that is going.
+pub(crate) fn forget_announced(object: Id) {
+    let _ = ANNOUNCED.compare_exchange(
+        object as usize,
+        0,
+        std::sync::atomic::Ordering::AcqRel,
+        std::sync::atomic::Ordering::Acquire,
+    );
 }
 
 /// Send the window notification `name` about `object` to its delegate and to

@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use starnix::process::{self as host, Identity};
 
 use crate::credentials::{Change, Credentials, Denied};
-use crate::protocol::{Checkin, Process, Thread, Usage};
+use crate::protocol::{Application, Checkin, Launch, Process, Thread, Usage};
 
 pub const LAUNCHD: i32 = 1;
 
@@ -23,13 +23,29 @@ struct Record {
     connection: Option<u64>,
     /// Names the guest gave its threads, which the host may have truncated.
     thread_names: HashMap<i32, String>,
+    /// Which image of the pid this is; see [`Process::image`].
+    image: u64,
+}
+
+/// A running application, LaunchServices' table of them.
+struct Running {
+    application: Application,
+    identity: Identity,
+    /// Whether the image that launched has checked in since. The next fresh
+    /// check-in under the pid is an `exec` into something else, which is no
+    /// longer the application.
+    imaged: bool,
 }
 
 #[derive(Default)]
 pub struct Registry {
     records: HashMap<i32, Record>,
+    /// Oldest first.
+    applications: Vec<Running>,
     /// The host pid of the prefix's launchd, which guests see as [`LAUNCHD`].
     launchd: Option<i32>,
+    /// The last image handed out; never reused while the server runs.
+    images: u64,
 }
 
 impl Registry {
@@ -140,7 +156,26 @@ impl Registry {
                 .exec(checkin.setid),
             false => checkin.credentials.clone(),
         };
+        if checkin.fresh {
+            self.applications
+                .retain(|app| app.application.pid != pid || !app.imaged);
+            for app in &mut self.applications {
+                if app.application.pid == pid {
+                    app.imaged = true;
+                }
+            }
+        }
         let system = self.in_launchd_tree(pid);
+        // A fresh image is a new task; checking in again on a new connection
+        // continues the one there was. A pid with no live record - a `fork`
+        // child, or a reused pid - is a new task either way.
+        let image = match self.live(pid) {
+            Some(record) if !checkin.fresh => record.image,
+            _ => {
+                self.images += 1;
+                self.images
+            }
+        };
         self.records.insert(
             pid,
             Record {
@@ -150,6 +185,7 @@ impl Registry {
                 system,
                 connection: Some(connection),
                 thread_names: HashMap::new(),
+                image,
             },
         );
         credentials
@@ -206,8 +242,57 @@ impl Registry {
         self.records.get_mut(&pid)
     }
 
+    /// Make `application` a running application, unless an instance that
+    /// already runs is the application for this `launch` (see
+    /// [`Application::answers`]): then that one, which the launch is handed to.
+    pub fn launch(
+        &mut self,
+        application: Application,
+        launch: Launch,
+        identity: Identity,
+    ) -> Option<Application> {
+        self.prune_applications();
+        let pid = application.pid;
+        let running = self
+            .applications
+            .iter()
+            .map(|app| &app.application)
+            .find(|other| other.answers(&application, launch));
+        if let Some(running) = running {
+            return Some(running.clone());
+        }
+        self.applications.retain(|app| app.application.pid != pid);
+        self.applications.push(Running {
+            application,
+            identity,
+            imaged: false,
+        });
+        None
+    }
+
+    /// The running applications, oldest first, with `identifier` if given.
+    pub fn applications(&mut self, identifier: Option<&str>) -> Vec<Application> {
+        self.prune_applications();
+        self.applications
+            .iter()
+            .map(|app| &app.application)
+            .filter(|app| identifier.is_none() || app.identifier.as_deref() == identifier)
+            .cloned()
+            .collect()
+    }
+
+    fn prune_applications(&mut self) {
+        self.applications
+            .retain(|app| host::alive(app.application.pid, &app.identity));
+    }
+
     pub fn is_guest(&mut self, pid: i32) -> bool {
         self.live(pid).is_some()
+    }
+
+    /// The image `pid` (the host's) is running, while it is a live guest.
+    pub fn image(&mut self, pid: i32) -> Option<u64> {
+        self.live(pid).map(|record| record.image)
     }
 
     /// Every connected process, for diagnostics and for tests.
@@ -252,6 +337,7 @@ impl Registry {
             cputype: record.checkin.cputype,
             cpusubtype: record.checkin.cpusubtype,
             translated: record.checkin.translated,
+            image: record.image,
         })
     }
 
@@ -300,6 +386,24 @@ impl Registry {
 mod tests {
     use super::*;
     use crate::credentials::SetId;
+
+    #[test]
+    fn an_exec_is_a_new_image_and_a_reconnect_is_not() {
+        let mut registry = Registry::new();
+        let identity = host::identity(me()).unwrap();
+        registry.checkin(me(), 1, fresh("/bin/sh", SetId::default()), identity);
+        let first = registry.image(me()).unwrap();
+        let again = Checkin {
+            fresh: false,
+            ..checkin("/bin/sh")
+        };
+        registry.checkin(me(), 2, again, identity);
+        assert_eq!(registry.image(me()), Some(first));
+        registry.checkin(me(), 3, fresh("/bin/ls", SetId::default()), identity);
+        let exec = registry.image(me()).unwrap();
+        assert_ne!(exec, first);
+        assert_eq!(registry.process(me()).unwrap().image, exec);
+    }
 
     fn me() -> i32 {
         // SAFETY: `getpid` has no preconditions.
@@ -393,6 +497,115 @@ mod tests {
         assert_eq!(list[0].command(), "top");
         // The test runner's parent did not check in, so it is launchd's child.
         assert_eq!(list[0].ppid, LAUNCHD);
+    }
+
+    fn app(pid: i32, bundle: &str, identifier: &str, prohibited: bool) -> Application {
+        Application {
+            pid,
+            bundle: bundle.into(),
+            identifier: Some(identifier.into()),
+            name: None,
+            prohibited,
+        }
+    }
+
+    /// Two live processes: this one and the one that started it.
+    fn two() -> (i32, i32) {
+        (me(), std::os::unix::process::parent_id() as i32)
+    }
+
+    fn launch(registry: &mut Registry, app: Application, how: Launch) -> Option<i32> {
+        let identity = host::identity(app.pid).unwrap();
+        registry
+            .launch(app, how, identity)
+            .map(|running| running.pid)
+    }
+
+    #[test]
+    fn opening_a_running_bundle_hands_the_launch_to_it() {
+        let (first, second) = two();
+        let mut registry = Registry::new();
+        let a = |pid| app(pid, "/Applications/A.app", "com.example.a", false);
+        assert_eq!(launch(&mut registry, a(first), Launch::Open), None);
+        assert_eq!(launch(&mut registry, a(second), Launch::Open), Some(first));
+        assert_eq!(registry.applications(None).len(), 1);
+    }
+
+    #[test]
+    fn a_new_instance_or_a_direct_run_is_another_application() {
+        let (first, second) = two();
+        let mut registry = Registry::new();
+        let a = |pid| app(pid, "/Applications/A.app", "com.example.a", false);
+        assert_eq!(launch(&mut registry, a(first), Launch::Open), None);
+        assert_eq!(launch(&mut registry, a(second), Launch::NewInstance), None);
+        assert_eq!(registry.applications(Some("com.example.a")).len(), 2);
+
+        let mut registry = Registry::new();
+        assert_eq!(launch(&mut registry, a(first), Launch::Open), None);
+        assert_eq!(launch(&mut registry, a(second), Launch::Direct), None);
+        assert_eq!(registry.applications(None).len(), 2);
+    }
+
+    #[test]
+    fn copies_of_one_application_run_side_by_side() {
+        let (first, second) = two();
+        let mut registry = Registry::new();
+        let at = |pid, bundle| app(pid, bundle, "com.example.a", false);
+        assert_eq!(
+            launch(
+                &mut registry,
+                at(first, "/Applications/A.app"),
+                Launch::Open
+            ),
+            None
+        );
+        assert_eq!(
+            launch(&mut registry, at(second, "/tmp/A.app"), Launch::Open),
+            None
+        );
+    }
+
+    #[test]
+    fn a_prohibited_application_is_one_per_identifier_even_with_new_instance() {
+        let (first, second) = two();
+        let mut registry = Registry::new();
+        let at = |pid, bundle| app(pid, bundle, "com.example.a", true);
+        assert_eq!(
+            launch(
+                &mut registry,
+                at(first, "/Applications/A.app"),
+                Launch::Open
+            ),
+            None
+        );
+        assert_eq!(
+            launch(&mut registry, at(second, "/tmp/A.app"), Launch::NewInstance),
+            Some(first)
+        );
+        // Run directly, it is not LaunchServices' to refuse.
+        assert_eq!(
+            launch(&mut registry, at(second, "/tmp/A.app"), Launch::Direct),
+            None
+        );
+    }
+
+    #[test]
+    fn an_exec_into_another_image_is_no_longer_the_application() {
+        let (first, second) = two();
+        let mut registry = Registry::new();
+        let a = |pid| app(pid, "/Applications/A.app", "com.example.a", false);
+        assert_eq!(launch(&mut registry, a(first), Launch::Open), None);
+        let identity = host::identity(first).unwrap();
+        registry.checkin(
+            first,
+            1,
+            fresh("/Applications/A.app/Contents/MacOS/A", SetId::default()),
+            identity,
+        );
+        assert_eq!(registry.applications(None).len(), 1);
+        registry.checkin(first, 2, fresh("/bin/sh", SetId::default()), identity);
+        assert!(registry.applications(None).is_empty());
+        assert_eq!(launch(&mut registry, a(second), Launch::Open), None);
     }
 
     #[test]

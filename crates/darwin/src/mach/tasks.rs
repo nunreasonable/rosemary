@@ -1,18 +1,19 @@
 //! Other tasks and their threads: the calls a process monitor walks the
 //! system with.
 //!
-//! A task port here is a pid in the port space, and every question about the
-//! task behind it is the process server's to answer (see `crate::process`).
-//! Only guests are tasks: a host process is not part of the system a guest
-//! can see, and `task_for_pid` on one fails as it would for a process the
-//! caller may not inspect.
-use std::collections::BTreeMap;
+//! A task port here is a pid and an image of it in the port space, and every
+//! question about the task behind it is the process server's to answer (see
+//! `crate::process`); every change to it, the task's own to make, which the
+//! server asks it to (see `super::service`). Only guests are tasks: a host
+//! process is not part of the system a guest can see, and `task_for_pid` on
+//! one fails as it would for a process the caller may not inspect.
 use std::ffi::c_void;
-use std::sync::{Mutex, MutexGuard};
+
+use server::task::TaskOp;
 
 use super::info::{TimeValue, publish};
 use super::kern::*;
-use super::space::{self, HOST_SELF, Name, PSET_CONTROL, PSET_NAME};
+use super::space::{self, HOST_SELF, Name, PSET_CONTROL, PSET_NAME, Target};
 use server::protocol::{State, Thread};
 
 /// Copy `names` into fresh pages, as the kernel hands an out-of-line array
@@ -68,13 +69,13 @@ pub unsafe extern "C" fn task_for_pid(target: Name, pid: i32, out: *mut Name) ->
     if space::task_pid(target).is_none() {
         return KERN_INVALID_ARGUMENT;
     }
-    if !crate::process::visible(pid) {
+    let Some(process) = crate::process::describe(pid) else {
         // What a Mac answers for a pid the caller may not have, and for one
         // that does not exist - the two are deliberately indistinguishable.
         return KERN_FAILURE;
-    }
+    };
     // SAFETY: the caller's out-parameter.
-    unsafe { out.write(space::insert_task(pid)) };
+    unsafe { out.write(space::insert_task(pid, process.image)) };
     KERN_SUCCESS
 }
 
@@ -180,7 +181,7 @@ pub unsafe extern "C" fn processor_set_tasks(
     }
     let tasks: Vec<Name> = crate::process::list()
         .iter()
-        .map(|process| space::insert_task(process.pid))
+        .map(|process| space::insert_task(process.pid, process.image))
         .collect();
     // SAFETY: the caller's out-parameters.
     unsafe { out_of_line(&tasks, array, count) }
@@ -438,74 +439,35 @@ pub extern "C" fn task_policy_get(
     KERN_INVALID_ARGUMENT
 }
 
-/// Suspend counts of the tasks this process has suspended, by host pid.
-///
-/// Darwin keeps the count in the kernel's task. A host stop signal does not
-/// count, so this process counts for it; a task suspended from two processes
-/// resumes when either one lets go.
-static SUSPENDED: Mutex<BTreeMap<i32, u32>> = Mutex::new(BTreeMap::new());
-
-fn suspended() -> MutexGuard<'static, BTreeMap<i32, u32>> {
-    SUSPENDED.lock().unwrap_or_else(|e| e.into_inner())
-}
-
 /// `kern_return_t task_suspend(task_t)`
 ///
-/// The first suspension stops the process and the rest only count. Suspending
-/// this task stops the caller too, as on Darwin, until another process
-/// resumes it.
+/// The task's threads park where they are, and it answers for its memory
+/// while they do: the suspension is the task's own, kept by the task (see
+/// `super::thread`), whichever process asked. Suspending this task parks the
+/// caller too, as on Darwin, until another process resumes it.
 pub extern "C" fn task_suspend(task: Name) -> i32 {
-    let Some(pid) = space::task_pid(task) else {
-        return KERN_INVALID_ARGUMENT;
-    };
-    let pid = crate::process::host_pid(pid);
-    let first = {
-        let mut counts = suspended();
-        let count = counts.entry(pid).or_insert(0);
-        *count += 1;
-        *count == 1
-    };
-    // Signalled outside the lock: stopping this process while holding it
-    // would leave it held for whichever thread runs first after the resume.
-    // SAFETY: `kill` has no memory preconditions.
-    if first && unsafe { libc::kill(pid, libc::SIGSTOP) } != 0 {
-        let mut counts = suspended();
-        if let Some(count) = counts.get_mut(&pid) {
-            *count -= 1;
-            if *count == 0 {
-                counts.remove(&pid);
+    match space::target(task) {
+        Err(code) => code,
+        Ok(Target::Local) => {
+            let rc = super::thread::suspend_task();
+            if rc == KERN_SUCCESS {
+                // SAFETY: not in a signal handler; there is no context.
+                unsafe { super::thread::park_self(std::ptr::null_mut()) };
             }
+            rc
         }
-        return KERN_FAILURE;
+        Ok(Target::Remote { pid, image }) => super::remote::done(task, pid, image, TaskOp::Suspend),
     }
-    KERN_SUCCESS
 }
 
 /// `kern_return_t task_resume(task_t)`
 ///
 /// A task with no suspension outstanding is refused, as Darwin refuses it.
-/// The process sees `SIGCONT` when the last one is lifted, which Darwin's
-/// does not.
 pub extern "C" fn task_resume(task: Name) -> i32 {
-    let Some(pid) = space::task_pid(task) else {
-        return KERN_INVALID_ARGUMENT;
-    };
-    let pid = crate::process::host_pid(pid);
-    {
-        let mut counts = suspended();
-        let Some(count) = counts.get_mut(&pid) else {
-            return KERN_FAILURE;
-        };
-        *count -= 1;
-        if *count > 0 {
-            return KERN_SUCCESS;
-        }
-        counts.remove(&pid);
-    }
-    // SAFETY: `kill` has no memory preconditions.
-    match unsafe { libc::kill(pid, libc::SIGCONT) } {
-        0 => KERN_SUCCESS,
-        _ => KERN_FAILURE,
+    match space::target(task) {
+        Err(code) => code,
+        Ok(Target::Local) => super::thread::resume_task(),
+        Ok(Target::Remote { pid, image }) => super::remote::done(task, pid, image, TaskOp::Resume),
     }
 }
 
@@ -638,38 +600,14 @@ mod tests {
         );
     }
 
-    /// A suspended child stops, a second suspension only counts, and it runs
-    /// again once both are lifted - and not before.
+    /// Nothing outstanding is refused, and so is a task this process cannot
+    /// reach without a server.
     #[test]
-    fn a_suspended_task_stops_until_every_suspension_is_lifted() {
-        let mut child = std::process::Command::new("sleep")
-            .arg("30")
-            .spawn()
-            .unwrap();
-        let pid = child.id() as i32;
-        let task = space::insert_task(pid);
-        let waited = |flag| {
-            let mut status = 0;
-            // SAFETY: a child of this process and a writable status.
-            let rc = unsafe { libc::waitpid(pid, &mut status, flag) };
-            (rc == pid).then_some(status)
-        };
-
-        assert_eq!(task_suspend(task), KERN_SUCCESS);
-        let status = waited(libc::WUNTRACED).unwrap();
-        assert!(libc::WIFSTOPPED(status));
-        assert_eq!(task_suspend(task), KERN_SUCCESS);
-
-        assert_eq!(task_resume(task), KERN_SUCCESS);
-        assert_eq!(waited(libc::WCONTINUED | libc::WNOHANG), None);
-        assert_eq!(task_resume(task), KERN_SUCCESS);
-        let status = waited(libc::WCONTINUED).unwrap();
-        assert!(libc::WIFCONTINUED(status));
-
-        // Nothing is outstanding now.
-        assert_eq!(task_resume(task), KERN_FAILURE);
-        assert_eq!(task_suspend(0xdead_0003), KERN_INVALID_ARGUMENT);
-        child.kill().unwrap();
-        child.wait().unwrap();
+    fn a_resume_needs_a_suspension_and_another_task_needs_a_server() {
+        assert_eq!(task_resume(TASK_SELF), KERN_FAILURE);
+        assert_eq!(task_suspend(0xdead_0003), MACH_SEND_INVALID_DEST);
+        assert_eq!(task_suspend(HOST_SELF), KERN_INVALID_ARGUMENT);
+        let other = space::insert_task(me() + 1_000_000, 7);
+        assert_eq!(task_suspend(other), KERN_FAILURE);
     }
 }

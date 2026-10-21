@@ -10,6 +10,8 @@ struct ColorSpace {
     /// The `kCGColorSpace...` name it was made with, retained, or null for one
     /// made without a name.
     name: CFTypeRef,
+    /// Colour components: 3 for RGB, 1 for gray, 0 for a pattern space.
+    components: usize,
 }
 
 /// `CGDataProviderReleaseDataCallback`.
@@ -36,6 +38,12 @@ struct Image {
     bitmap_info: u32,
     provider: CFTypeRef,
     space: CFTypeRef,
+    /// Made by `CGImageMaskCreate`: its samples say where to paint, 0 being
+    /// "paint" and full scale "do not".
+    is_mask: bool,
+    /// A mask's decode array, which maps a sample's 0 and full scale to the
+    /// values above: `[0, 1]` unless the caller gave another.
+    decode: [f64; 2],
 }
 
 /// An ImageIO source. The encoded data stays retained so decoding can be
@@ -175,6 +183,25 @@ pub unsafe extern "C" fn CGImageSourceCreateImageAtIndex(
     crate::raster::decode(encoded).map_or(std::ptr::null(), image_from_bitmap)
 }
 
+/// The bytes a data provider of this runtime's serves, or `None` for anything
+/// else.
+pub(crate) fn provider_bytes(provider: CFTypeRef) -> Option<&'static [u8]> {
+    let class = objc::class::lookup(c"__CGDataProvider")?;
+    // SAFETY: null or an object this runtime allocated; type-checked.
+    if !unsafe { corefoundation::base::is_kind_of(provider, class) } {
+        return None;
+    }
+    // SAFETY: a `__CGDataProvider`, whose body is `DataProvider` and whose
+    // bytes live as long as it does - which the caller holds a reference for.
+    unsafe {
+        let provider = &*(provider as *const DataProvider);
+        if provider.data.is_null() {
+            return None;
+        }
+        Some(std::slice::from_raw_parts(provider.data, provider.size))
+    }
+}
+
 pub unsafe extern "C" fn CGDataProviderCreateWithData(
     info: *mut c_void,
     data: *const c_void,
@@ -232,19 +259,7 @@ pub unsafe extern "C" fn CGDataProviderCreateWithCFData(data: CFTypeRef) -> CFTy
 /// # Safety
 ///
 /// `provider` is null or a live object.
-pub unsafe fn provider_bytes<'a>(provider: CFTypeRef) -> Option<&'a [u8]> {
-    let class = objc::class::lookup(c"__CGDataProvider")?;
-    // SAFETY: the caller's guarantee; the layout is checked by class.
-    if provider.is_null() || !unsafe { corefoundation::base::is_kind_of(provider, class) } {
-        return None;
-    }
-    let provider = provider as *const DataProvider;
-    // SAFETY: a provider of this class, whose bytes it keeps alive.
-    unsafe {
-        ((*provider).size > 0)
-            .then(|| std::slice::from_raw_parts((*provider).data, (*provider).size))
-    }
-}
+
 
 pub unsafe extern "C" fn CGDataProviderRelease(provider: CFTypeRef) {
     if !provider.is_null() {
@@ -304,9 +319,54 @@ pub unsafe extern "C" fn CGImageCreate(
             } else {
                 corefoundation::api::CFRetain(space)
             },
+            is_mask: false,
+            decode: [0.0, 1.0],
         };
     }
     image as CFTypeRef
+}
+
+/// A `CGImage` that owns `pixels`, laid out as the arguments say.
+pub(crate) fn image_from_pixels(
+    pixels: Vec<u8>,
+    width: usize,
+    height: usize,
+    bytes_per_row: usize,
+    bitmap_info: u32,
+) -> CFTypeRef {
+    unsafe extern "C" fn release(info: *mut c_void, _data: *const c_void, _size: usize) {
+        // SAFETY: the box `image_from_pixels` leaked into `info`.
+        drop(unsafe { Box::from_raw(info as *mut Vec<u8>) });
+    }
+    let pixels = Box::new(pixels);
+    let (data, size) = (pixels.as_ptr(), pixels.len());
+    // SAFETY: the provider owns the box until its release callback frees it,
+    // and the vector's buffer does not move while boxed.
+    unsafe {
+        let provider = CGDataProviderCreateWithData(
+            Box::into_raw(pixels).cast(),
+            data.cast(),
+            size,
+            Some(release),
+        );
+        let space = CGColorSpaceCreateDeviceRGB();
+        let image = CGImageCreate(
+            width,
+            height,
+            8,
+            32,
+            bytes_per_row,
+            space,
+            bitmap_info,
+            provider,
+            std::ptr::null(),
+            0,
+            0,
+        );
+        CGColorSpaceRelease(space);
+        CGDataProviderRelease(provider);
+        image
+    }
 }
 
 /// A `CGImage` over a decoded bitmap, which it takes ownership of.
@@ -411,8 +471,147 @@ pub unsafe extern "C" fn CGImageGetColorSpace(image: CFTypeRef) -> CFTypeRef {
 }
 
 const ALPHA_INFO_MASK: u32 = 0x1f;
+/// `kCGImageAlphaOnly`.
+const ALPHA_ONLY: u32 = 7;
 const BYTE_ORDER_MASK: u32 = 0x7000;
 const BYTE_ORDER_32_LITTLE: u32 = 0x2000;
+
+/// How much of each pixel an image lets through when it is used as a mask, top
+/// row first: an image mask's inverted samples, an image's alpha, or an opaque
+/// image's luminance.
+pub(crate) fn image_coverage(image: CFTypeRef) -> Option<(usize, usize, Vec<u8>)> {
+    let is_mask = image_of(image)?.is_mask;
+    let [low, high] = image_of(image)?.decode;
+    let has_alpha = matches!(
+        image_of(image)?.bitmap_info & ALPHA_INFO_MASK,
+        1..=4 | ALPHA_ONLY
+    );
+    let (width, height, bgra) = image_bgra(image)?;
+    let coverage = bgra
+        .chunks_exact(4)
+        .map(|p| match (is_mask, has_alpha) {
+            (true, _) => {
+                let decoded = low + f64::from(p[2]) / 255.0 * (high - low);
+                ((1.0 - decoded).clamp(0.0, 1.0) * 255.0).round() as u8
+            }
+            (false, true) => p[3],
+            (false, false) => {
+                ((u32::from(p[2]) * 299 + u32::from(p[1]) * 587 + u32::from(p[0]) * 114) / 1000)
+                    as u8
+            }
+        })
+        .collect();
+    Some((width, height, coverage))
+}
+
+/// Whether an image is an image mask, which paints the fill colour where its
+/// samples allow rather than drawing pixels of its own.
+pub(crate) fn is_image_mask(image: CFTypeRef) -> bool {
+    image_of(image).is_some_and(|image| image.is_mask)
+}
+
+/// `CGImageRef CGImageMaskCreate(size_t width, size_t height, size_t bpc,
+/// size_t bpp, size_t bytesPerRow, CGDataProviderRef, const CGFloat *decode,
+/// bool shouldInterpolate)`
+///
+/// Eight-bit masks only; a one-bit mask is refused rather than read wrongly.
+pub unsafe extern "C" fn CGImageMaskCreate(
+    width: usize,
+    height: usize,
+    bits_per_component: usize,
+    bits_per_pixel: usize,
+    bytes_per_row: usize,
+    provider: CFTypeRef,
+    decode: *const f64,
+    interpolate: u8,
+) -> CFTypeRef {
+    if bits_per_component != 8 || bits_per_pixel != 8 {
+        return std::ptr::null();
+    }
+    // SAFETY: the caller's provider; a gray image of the same samples.
+    let image = unsafe {
+        let space = CGColorSpaceCreateDeviceGray();
+        let image = CGImageCreate(
+            width,
+            height,
+            8,
+            8,
+            bytes_per_row,
+            space,
+            0,
+            provider,
+            decode,
+            interpolate,
+            0,
+        );
+        CGColorSpaceRelease(space);
+        image
+    };
+    if !image.is_null() {
+        // SAFETY: an `Image` this call just made; `decode` is one pair for the
+        // one component.
+        unsafe {
+            (*(image as *mut Image)).is_mask = true;
+            if !decode.is_null() {
+                (*(image as *mut Image)).decode = [*decode, *decode.add(1)];
+            }
+        }
+    }
+    image
+}
+
+/// `CGImageRef CGImageCreateWithImageInRect(CGImageRef, CGRect)`: the pixels
+/// under the rectangle, which is in pixels from the top left and is cut to
+/// the image.
+pub unsafe extern "C" fn CGImageCreateWithImageInRect(
+    image: CFTypeRef,
+    rect: foundation::geometry::NSRect,
+) -> CFTypeRef {
+    let Some((width, height, bgra)) = image_bgra(image) else {
+        return std::ptr::null();
+    };
+    let left = rect.origin.x.floor().max(0.0) as usize;
+    let top = rect.origin.y.floor().max(0.0) as usize;
+    let right = ((rect.origin.x + rect.size.width).ceil().max(0.0) as usize).min(width);
+    let bottom = ((rect.origin.y + rect.size.height).ceil().max(0.0) as usize).min(height);
+    if left >= right || top >= bottom {
+        return std::ptr::null();
+    }
+    let (w, h) = (right - left, bottom - top);
+    let mut pixels = Vec::with_capacity(w * h * 4);
+    for row in top..bottom {
+        pixels.extend_from_slice(&bgra[(row * width + left) * 4..(row * width + right) * 4]);
+    }
+    let mask = image_of(image).filter(|i| i.is_mask).map(|i| i.decode);
+    let image = image_from_pixels(pixels, w, h, w * 4, PREMULTIPLIED_BGRA);
+    if let Some(decode) = mask
+        && !image.is_null()
+    {
+        // SAFETY: a fresh image of this module's.
+        unsafe {
+            (*(image as *mut Image)).is_mask = true;
+            (*(image as *mut Image)).decode = decode;
+        }
+    }
+    image
+}
+
+/// `kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little`, the layout
+/// [`image_bgra`] answers in.
+pub(crate) const PREMULTIPLIED_BGRA: u32 = 2 | BYTE_ORDER_32_LITTLE;
+
+/// `CGImageRef CGImageCreateWithPNGDataProvider(CGDataProviderRef, const
+/// CGFloat *decode, bool, CGColorRenderingIntent)`
+pub unsafe extern "C" fn CGImageCreateWithPNGDataProvider(
+    provider: CFTypeRef,
+    _decode: *const f64,
+    _interpolate: u8,
+    _intent: i32,
+) -> CFTypeRef {
+    provider_bytes(provider)
+        .and_then(crate::raster::decode)
+        .map_or(std::ptr::null(), image_from_bitmap)
+}
 
 /// A `CGImage`'s pixels as premultiplied B, G, R, A rows, top row first -
 /// the layout [`crate::backing`] composites in.
@@ -429,6 +628,7 @@ pub(crate) fn image_bgra(image: CFTypeRef) -> Option<(usize, usize, Vec<u8>)> {
     let channels = match image.bits_per_pixel {
         32 => 4,
         24 => 3,
+        8 => 1,
         _ => return None,
     };
     let stride = image.bytes_per_row.max(image.width * channels);
@@ -461,9 +661,17 @@ pub(crate) fn image_bgra(image: CFTypeRef) -> Option<(usize, usize, Vec<u8>)> {
             let (a, r, g, b) = match (channels, alpha_first) {
                 (4, true) => (ordered[0], ordered[1], ordered[2], ordered[3]),
                 (4, false) => (ordered[3], ordered[0], ordered[1], ordered[2]),
+                // `kCGImageAlphaOnly`: coverage and no colour.
+                (1, _) if alpha == ALPHA_ONLY => (ordered[0], 0, 0, 0),
+                // Gray, or an image mask read as one.
+                (1, _) => (255, ordered[0], ordered[0], ordered[0]),
                 _ => (255, ordered[0], ordered[1], ordered[2]),
             };
-            let a = if has_alpha { a } else { 255 };
+            let a = if has_alpha || (channels == 1 && alpha == ALPHA_ONLY) {
+                a
+            } else {
+                255
+            };
             let scale = |c: u8| match premultiplied || a == 255 {
                 true => c.min(a),
                 false => ((u16::from(c) * u16::from(a) + 127) / 255) as u8,
@@ -475,6 +683,15 @@ pub(crate) fn image_bgra(image: CFTypeRef) -> Option<(usize, usize, Vec<u8>)> {
 }
 
 pub unsafe extern "C" fn CGColorSpaceCreateWithName(name: CFTypeRef) -> CFTypeRef {
+    let gray = !name.is_null() && {
+        // SAFETY: a string, as the parameter is declared.
+        let text = unsafe { foundation::string::bytes(name as _) };
+        text.windows(4).any(|w| w == b"Gray")
+    };
+    make_space(name, if gray { 1 } else { 3 })
+}
+
+fn make_space(name: CFTypeRef, components: usize) -> CFTypeRef {
     let class = objc::class::lookup(c"__CGColorSpace").expect("installed during bootstrap");
     // SAFETY: `ColorSpace` is the registered class layout.
     let space = unsafe { corefoundation::base::allocate::<ColorSpace>(class) };
@@ -484,8 +701,37 @@ pub unsafe extern "C" fn CGColorSpaceCreateWithName(name: CFTypeRef) -> CFTypeRe
             true => name,
             false => corefoundation::api::CFRetain(name),
         };
+        (*space).components = components;
     }
     space as CFTypeRef
+}
+
+pub unsafe extern "C" fn CGColorSpaceCreateDeviceGray() -> CFTypeRef {
+    make_space(std::ptr::null(), 1)
+}
+
+/// `CGColorSpaceCreateWithPlatformColorSpace(const void *profile)`: a
+/// ColorSync profile, which is RGB for every display.
+pub unsafe extern "C" fn CGColorSpaceCreateWithPlatformColorSpace(
+    _profile: *const c_void,
+) -> CFTypeRef {
+    make_space(std::ptr::null(), 3)
+}
+
+/// `CGColorSpaceCreatePattern(CGColorSpaceRef base)`: a space whose colours
+/// are patterns. The base, for an uncoloured pattern, is not kept: every
+/// colour here is RGB.
+pub unsafe extern "C" fn CGColorSpaceCreatePattern(_base: CFTypeRef) -> CFTypeRef {
+    make_space(std::ptr::null(), 0)
+}
+
+pub unsafe extern "C" fn CGColorSpaceGetNumberOfComponents(space: CFTypeRef) -> usize {
+    color_space_of(space).map_or(0, |space| space.components)
+}
+
+/// The components of a space, or `None` for something that is not one.
+pub(crate) fn space_components(space: CFTypeRef) -> Option<usize> {
+    color_space_of(space).map(|space| space.components)
 }
 
 fn color_space_of<'a>(space: CFTypeRef) -> Option<&'a ColorSpace> {
@@ -521,7 +767,7 @@ pub unsafe extern "C" fn CGColorSpaceCopyPropertyList(space: CFTypeRef) -> CFTyp
 }
 
 pub unsafe extern "C" fn CGColorSpaceCreateDeviceRGB() -> CFTypeRef {
-    unsafe { CGColorSpaceCreateWithName(std::ptr::null()) }
+    make_space(std::ptr::null(), 3)
 }
 
 /// `CGColorSpaceRef CGDisplayCopyColorSpace(CGDirectDisplayID)`: sRGB, owned

@@ -2,11 +2,14 @@ use std::ffi::c_char;
 
 pub const KERN_SUCCESS: i32 = 0;
 pub const KERN_INVALID_ADDRESS: i32 = 1;
+pub const KERN_PROTECTION_FAILURE: i32 = 2;
 pub const KERN_NO_SPACE: i32 = 3;
 pub const KERN_INVALID_ARGUMENT: i32 = 4;
 pub const KERN_FAILURE: i32 = 5;
 pub const KERN_RESOURCE_SHORTAGE: i32 = 6;
 pub const KERN_NOT_RECEIVER: i32 = 7;
+pub const KERN_MEMORY_FAILURE: i32 = 9;
+pub const KERN_MEMORY_ERROR: i32 = 10;
 pub const KERN_INVALID_NAME: i32 = 15;
 pub const KERN_INVALID_TASK: i32 = 16;
 pub const KERN_INVALID_HOST: i32 = 22;
@@ -52,11 +55,14 @@ pub fn describe(code: i32) -> Option<&'static str> {
     Some(match code {
         KERN_SUCCESS => "(os/kern) successful",
         KERN_INVALID_ADDRESS => "(os/kern) invalid address",
+        KERN_PROTECTION_FAILURE => "(os/kern) protection failure",
         KERN_NO_SPACE => "(os/kern) no space available",
         KERN_INVALID_ARGUMENT => "(os/kern) invalid argument",
         KERN_FAILURE => "(os/kern) failure",
         KERN_RESOURCE_SHORTAGE => "(os/kern) resource shortage",
         KERN_NOT_RECEIVER => "(os/kern) not receiver",
+        KERN_MEMORY_FAILURE => "(os/kern) memory failure",
+        KERN_MEMORY_ERROR => "(os/kern) memory error",
         KERN_INVALID_NAME => "(os/kern) invalid name",
         KERN_INVALID_TASK => "(os/kern) invalid task",
         KERN_INVALID_RIGHT => "(os/kern) invalid right",
@@ -65,6 +71,7 @@ pub fn describe(code: i32) -> Option<&'static str> {
         KERN_INVALID_CAPABILITY => "(os/kern) invalid capability",
         KERN_RIGHT_EXISTS => "(os/kern) right exists",
         KERN_NOT_IN_SET => "(os/kern) not in set",
+        KERN_TERMINATED => "(os/kern) terminated",
         KERN_OPERATION_TIMED_OUT => "(os/kern) operation timed out",
         MACH_SEND_INVALID_DEST => "(ipc/send) invalid destination port",
         MACH_SEND_TIMED_OUT => "(ipc/send) send timed out",

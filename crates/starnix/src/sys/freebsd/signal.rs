@@ -257,3 +257,70 @@ pub fn send_to_thread(tid: i32, signo: c_int) -> std::io::Result<()> {
         _ => Err(std::io::Error::last_os_error()),
     }
 }
+
+pub fn queue(pid: i32, signo: c_int, value: usize) -> std::io::Result<()> {
+    let value = libc::sigval {
+        sival_ptr: value as *mut c_void,
+    };
+    // SAFETY: plain values.
+    match unsafe { libc::sigqueue(pid, signo, value) } {
+        0 => Ok(()),
+        _ => Err(std::io::Error::last_os_error()),
+    }
+}
+
+/// `KERN_PROC_PID | KERN_PROC_INC_THREAD`, one `kinfo_proc` per thread, into
+/// pages mapped for the purpose: the list may be longer than a stack holds.
+pub fn for_each_thread(each: &mut dyn FnMut(i32)) -> bool {
+    let mib = [
+        libc::CTL_KERN,
+        libc::KERN_PROC,
+        libc::KERN_PROC_PID | libc::KERN_PROC_INC_THREAD,
+        crate::process::me(),
+    ];
+    let mut size = 0usize;
+    // SAFETY: a size query with a valid MIB.
+    if unsafe {
+        libc::sysctl(
+            mib.as_ptr(),
+            4,
+            core::ptr::null_mut(),
+            &mut size,
+            core::ptr::null(),
+            0,
+        )
+    } != 0
+    {
+        return false;
+    }
+    // Room for threads started between the two calls.
+    let capacity = size * 2 + size_of::<libc::kinfo_proc>() * 16;
+    // SAFETY: a fresh anonymous mapping, unmapped below.
+    let pages = unsafe {
+        libc::mmap(
+            core::ptr::null_mut(),
+            capacity,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANON,
+            -1,
+            0,
+        )
+    };
+    if pages == libc::MAP_FAILED {
+        return false;
+    }
+    let mut size = capacity;
+    // SAFETY: the mapping holds `capacity` bytes.
+    let ok = unsafe { libc::sysctl(mib.as_ptr(), 4, pages, &mut size, core::ptr::null(), 0) } == 0;
+    if ok {
+        let count = size / size_of::<libc::kinfo_proc>();
+        for i in 0..count {
+            // SAFETY: within the `size` bytes the kernel filled.
+            let entry = unsafe { &*pages.cast::<libc::kinfo_proc>().add(i) };
+            each(entry.ki_tid as i32);
+        }
+    }
+    // SAFETY: the mapping made above.
+    unsafe { libc::munmap(pages, capacity) };
+    ok
+}

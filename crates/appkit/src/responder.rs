@@ -202,6 +202,38 @@ unsafe extern "C" fn try_to_perform(receiver: Id, _sel: Sel, action: Sel, object
     0
 }
 
+/// `-[NSResponder doCommandBySelector:]`: the command sent, with a nil
+/// argument, to a receiver that implements it, and otherwise passed to the
+/// next responder as this same message - so a responder further up that
+/// overrides it sees the command. The end of the chain drops it, where AppKit
+/// would beep.
+unsafe extern "C" fn do_command_by_selector(receiver: Id, sel: Sel, command: Sel) {
+    if command.is_null() {
+        return;
+    }
+    // SAFETY: a live responder this method was sent to.
+    if let Some(method) =
+        (unsafe { objc::object::class_of(receiver) }).and_then(|class| class.method(command))
+    {
+        // SAFETY: a command is an action, `void (id, SEL, id)`.
+        unsafe {
+            let f: unsafe extern "C" fn(Id, Sel, Id) = std::mem::transmute(method.implementation());
+            f(receiver, command, std::ptr::null_mut());
+        }
+        return;
+    }
+    // SAFETY: `-nextResponder` answers an object or nil; the forward is this
+    // method's own shape.
+    unsafe {
+        let next: unsafe extern "C" fn(Id, Sel) -> Id = std::mem::transmute(objc::msg::entry());
+        let next = next(receiver, objc::sel::get("nextResponder"));
+        if !next.is_null() && next != receiver {
+            let send: unsafe extern "C" fn(Id, Sel, Sel) = std::mem::transmute(objc::msg::entry());
+            send(next, sel, command);
+        }
+    }
+}
+
 /// The standard editing command a key means, or `None` for a key that types
 /// something rather than commanding something.
 ///
@@ -453,6 +485,7 @@ pub(crate) fn install() {
         "mouseExited:" => forward_event, c"v24@0:8@16";
         "interpretKeyEvents:" => interpret_key_events, c"v24@0:8@16";
         "tryToPerform:with:" => try_to_perform, c"c32@0:8:16@24";
+        "doCommandBySelector:" => do_command_by_selector, c"v24@0:8:16";
     });
     let application = objc::class::lookup(c"NSApplication").expect("declared before its methods");
     methods!(application, {
@@ -702,6 +735,49 @@ mod tests {
                 "{name:?} does not reach NSResponder's"
             );
         }
+    }
+
+    /// A command the receiver does not implement goes up the responder chain
+    /// to the first that does, with a nil argument.
+    #[test]
+    fn an_unhandled_command_goes_to_the_next_responder() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static TARGET: AtomicUsize = AtomicUsize::new(0);
+        static ARGUMENT: AtomicUsize = AtomicUsize::new(1);
+        unsafe extern "C" fn record(receiver: Id, _sel: Sel, argument: Id) {
+            TARGET.store(receiver as usize, Ordering::Release);
+            ARGUMENT.store(argument as usize, Ordering::Release);
+        }
+        crate::bootstrap();
+        let view = objc::class::lookup(c"NSView").expect("NSView");
+        let class = objc::class::allocate_pair(Some(view), c"NewlineTaker", 0).expect("a subclass");
+        class.add_method(
+            objc::sel::get("insertNewline:"),
+            record as objc::class::Imp,
+            c"v24@0:8@16",
+        );
+        objc::class::register_pair(class);
+        let parent = objc::object::create_instance(class, 0);
+        let child = responder(c"NSView");
+        // SAFETY: `-setNextResponder:` takes one responder.
+        unsafe {
+            let f: unsafe extern "C" fn(Id, Sel, Id) = std::mem::transmute(objc::msg::entry());
+            f(child, objc::sel::get("setNextResponder:"), parent);
+            let g: unsafe extern "C" fn(Id, Sel, Sel) = std::mem::transmute(objc::msg::entry());
+            g(
+                child,
+                objc::sel::get("doCommandBySelector:"),
+                objc::sel::get("insertNewline:"),
+            );
+            // Nothing takes this one, and that is not an error.
+            g(
+                child,
+                objc::sel::get("doCommandBySelector:"),
+                objc::sel::get("noSuchCommand:"),
+            );
+        }
+        assert_eq!(TARGET.load(Ordering::Acquire), parent as usize);
+        assert_eq!(ARGUMENT.load(Ordering::Acquire), 0);
     }
 
     /// Every responder subclass inherits it, which is the point of putting it on

@@ -195,6 +195,7 @@ pub fn bind<M: machish::memory::Regions>(
         .iter()
         .find(|i| is_libcxxabi(&i.name))
         .map(|i| i.slide)
+        .or_else(|| crate::dyld::program_image_slide(is_libcxxabi))
     else {
         // No C++ runtime is no exceptions, so there is nothing for a type record
         // to be compared against.

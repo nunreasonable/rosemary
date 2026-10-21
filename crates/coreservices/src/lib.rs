@@ -10,6 +10,7 @@ pub mod files;
 pub mod icons;
 mod lockdown;
 pub mod process;
+pub mod opendirectory;
 pub mod resources;
 pub mod uti;
 mod urlhandlers;

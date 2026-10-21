@@ -61,6 +61,9 @@ enum Action {
     },
     /// Each character in turn, as the key that types it.
     Type(String),
+    /// Click the notification-area entry with this label, which no window
+    /// event can reach.
+    Tray(String),
     /// Drive a different window from here on, by the names
     /// `ROSEMARY_DEBUG_INPUT_WINDOW` takes.
     ///
@@ -132,6 +135,7 @@ fn action(rest: &str) -> Option<Action> {
         },
         "type" => Some(Action::Type(argument.to_owned())),
         "window" => Some(Action::Window(argument.to_owned())),
+        "tray" => Some(Action::Tray(argument.to_owned())),
         _ => None,
     }
 }
@@ -230,16 +234,24 @@ pub fn run() {
         Ok(value) => parse(&value),
         Err(_) => Vec::new(),
     });
-    if target().is_none() {
-        return;
+    let window = target().is_some();
+    if window {
+        run_file();
     }
-    run_file();
     let mut next = NEXT.load(Ordering::Relaxed);
     if next >= script.len() {
         return;
     }
+    // A tray click needs no window, and the program may have none shown.
+    let tray_next = matches!(script[next].action, Action::Tray(_));
+    if !window && !tray_next {
+        return;
+    }
     let elapsed = START.get_or_init(Instant::now).elapsed().as_secs_f64();
     while next < script.len() && script[next].at <= elapsed {
+        if target().is_none() && !matches!(script[next].action, Action::Tray(_)) {
+            break;
+        }
         perform(&script[next].action);
         next += 1;
         NEXT.store(next, Ordering::Relaxed);
@@ -315,6 +327,12 @@ fn perform(action: &Action) {
     // And to `ROSEMARY_EVENT_LOG`, which a guest that replaces its own stderr
     // cannot take with it.
     crate::event::debug_log(&format!("script {action:?}"));
+    if let Action::Tray(label) = action {
+        if !crate::status::click(label) {
+            eprintln!("rosemary: appkit: {ENV}: no tray entry is labelled {label:?}");
+        }
+        return;
+    }
     let Some(window) = target() else {
         return;
     };
@@ -364,6 +382,7 @@ fn perform(action: &Action) {
             down: *down,
             repeat: false,
         }),
+        Action::Tray(_) => {}
         Action::Window(name) => {
             *CHOSEN.lock().unwrap_or_else(|e| e.into_inner()) = Some(name.clone());
         }

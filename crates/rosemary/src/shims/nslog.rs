@@ -417,6 +417,17 @@ pub mod native {
         alert_trampoline as *const c_void
     }
 
+    /// The address `_CFStringCreateWithFormat` is bound to by the built-in
+    /// frameworks.
+    pub fn cfstring_create_with_format() -> *const c_void {
+        cfstring_trampoline as *const c_void
+    }
+
+    /// The address `_CFStringCreateWithFormatAndArguments` is bound to.
+    pub fn cfstring_create_with_format_and_arguments() -> *const c_void {
+        render_cfstring as *const c_void
+    }
+
     /// This process's own memory.
     ///
     /// A native image's pointers are host pointers, and what a `%s` names is as
@@ -482,6 +493,24 @@ pub mod native {
         }
     }
 
+    /// `CFStringRef CFStringCreateWithFormatAndArguments(CFAllocatorRef,
+    /// CFDictionaryRef formatOptions, CFStringRef format, va_list)`, which is
+    /// also where [`cfstring_trampoline`] lands with the tail it captured.
+    ///
+    /// The result follows the create rule, and the options - a locale
+    /// dictionary - are not consulted, as `NSLog` does not consult one either.
+    unsafe extern "C" fn render_cfstring(
+        _allocator: u64,
+        _options: u64,
+        format: u64,
+        tail: u64,
+    ) -> u64 {
+        match render_tail("CFStringCreateWithFormat", format, tail) {
+            Some(out) => corefoundation::string::from_bytes(&out, false) as usize as u64,
+            None => 0,
+        }
+    }
+
     unsafe extern "C" fn render_alert_native(
         title: u64,
         format: u64,
@@ -512,6 +541,17 @@ pub mod native {
             "mov x1, sp",
             "b   {render}",
             render = sym render_native,
+        )
+    }
+
+    /// The tail after three named arguments is on the stack from its start.
+    #[cfg(target_arch = "aarch64")]
+    #[unsafe(naked)]
+    unsafe extern "C" fn cfstring_trampoline() {
+        core::arch::naked_asm!(
+            "mov x3, sp",
+            "b   {render}",
+            render = sym render_cfstring,
         )
     }
 
@@ -609,6 +649,43 @@ pub mod native {
             "pop  rbp",
             "ret",
             render = sym render_alert_native,
+        )
+    }
+
+    /// The tail after three named integer arguments, which leaves `rcx`, `r8`
+    /// and `r9` to it.
+    #[cfg(not(target_arch = "aarch64"))]
+    #[unsafe(naked)]
+    unsafe extern "C" fn cfstring_trampoline() {
+        core::arch::naked_asm!(
+            "push rbp",
+            "mov  rbp, rsp",
+            "sub  rsp, 208",
+            "mov  [rsp + 24], rcx",
+            "mov  [rsp + 32], r8",
+            "mov  [rsp + 40], r9",
+            "test al, al",
+            "je   2f",
+            "movaps [rsp + 48],  xmm0",
+            "movaps [rsp + 64],  xmm1",
+            "movaps [rsp + 80],  xmm2",
+            "movaps [rsp + 96],  xmm3",
+            "movaps [rsp + 112], xmm4",
+            "movaps [rsp + 128], xmm5",
+            "movaps [rsp + 144], xmm6",
+            "movaps [rsp + 160], xmm7",
+            "2:",
+            "mov  dword ptr [rsp + 176], 24",
+            "mov  dword ptr [rsp + 180], 48",
+            "lea  rax, [rbp + 16]",
+            "mov  [rsp + 184], rax",
+            "mov  [rsp + 192], rsp",
+            "lea  rcx, [rsp + 176]",
+            "call {render}",
+            "mov  rsp, rbp",
+            "pop  rbp",
+            "ret",
+            render = sym render_cfstring,
         )
     }
 }

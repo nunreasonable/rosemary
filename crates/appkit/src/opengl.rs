@@ -90,6 +90,26 @@ struct Shared {
     swap_interval: Option<i32>,
 }
 
+/// How many contexts have `wanted` set, so the idle hook can skip its lock
+/// when no thread is waiting for anything.
+static WANTED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+impl Shared {
+    /// Set `wanted`, keeping [`WANTED`] in step. Only a change counts, because
+    /// several waiters may ask for, or give up on, the same context.
+    fn set_wanted(&mut self, wanted: bool) {
+        use std::sync::atomic::Ordering::SeqCst;
+        if self.wanted == wanted {
+            return;
+        }
+        self.wanted = wanted;
+        match wanted {
+            true => WANTED.fetch_add(1, SeqCst),
+            false => WANTED.fetch_sub(1, SeqCst),
+        };
+    }
+}
+
 pub const PIXEL_FORMAT_INSTANCE_SIZE: usize = size_of::<PixelFormat>();
 pub const CONTEXT_INSTANCE_SIZE: usize = size_of::<Context>();
 // `corefoundation::base::register` takes the complete instance size, not the
@@ -940,13 +960,13 @@ fn claim_window(receiver: Id, window: sdl3::Window) {
     if state.owner != Some(thread) {
         return;
     }
-    state.wanted = true;
+    state.set_wanted(true);
     let (mut state, wait) = cell
         .released
         .wait_timeout_while(state, HANDOFF, |state| state.owner == Some(thread))
         .unwrap_or_else(|e| e.into_inner());
     if wait.timed_out() {
-        state.wanted = false;
+        state.set_wanted(false);
     }
 }
 
@@ -959,7 +979,7 @@ fn let_go(receiver: Id) {
     let mut state = cell.state.lock().unwrap_or_else(|e| e.into_inner());
     if state.owner == Some(std::thread::current().id()) {
         state.owner = None;
-        state.wanted = false;
+        state.set_wanted(false);
         cell.released.notify_all();
     }
 }
@@ -1051,7 +1071,7 @@ pub fn release_for_other_threads() {
     unbind_here();
     BINDING.with(|binding| binding.0.set(std::ptr::null_mut()));
     state.owner = None;
-    state.wanted = false;
+    state.set_wanted(false);
     CURRENT.set(std::ptr::null_mut());
     cell.released.notify_all();
 }
@@ -1065,11 +1085,18 @@ pub fn release_for_other_threads() {
 /// that is never.
 pub fn going_idle(idle: darwin::idle::Idle) {
     if idle == darwin::idle::Idle::Wait {
+        // Unconditional: the thread that wants this context arrives after this
+        // one is asleep, so waiting to be asked is too late.
         let lingering = LINGERING.replace(std::ptr::null_mut());
         if !lingering.is_null() {
             let_go(lingering);
             return;
         }
+    }
+    // Only a context some thread is already waiting for is given up here, so
+    // skip the lock on every sleep and yield while nobody is.
+    if WANTED.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+        return;
     }
     release_for_other_threads();
 }
@@ -1108,7 +1135,7 @@ unsafe extern "C" fn make_current_context(receiver: Id, _sel: Sel) {
     // shared, so the context itself is worth waiting for and a sibling is the
     // fallback rather than the answer.
     if state.owner.is_some_and(|owner| owner != thread) {
-        state.wanted = true;
+        state.set_wanted(true);
         let (guard, wait) = cell
             .released
             .wait_timeout_while(state, HANDOFF, |state| {
@@ -1117,7 +1144,7 @@ unsafe extern "C" fn make_current_context(receiver: Id, _sel: Sel) {
             .unwrap_or_else(|e| e.into_inner());
         state = guard;
         if wait.timed_out() {
-            state.wanted = false;
+            state.set_wanted(false);
             if state.egl {
                 warn_about_the_fallback();
             }

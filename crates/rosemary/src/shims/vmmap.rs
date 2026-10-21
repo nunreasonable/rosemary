@@ -222,9 +222,14 @@ fn mmap(_symbol: &str, ctx: &mut RegisterContext, _mem: &mut dyn GuestMemory) ->
     Ok(())
 }
 
-/// `int mprotect(void *addr, size_t len, int prot)`
-fn mprotect(_symbol: &str, ctx: &mut RegisterContext, _mem: &mut dyn GuestMemory) -> Result<()> {
-    let (addr, len, prot) = (ctx.rdi as usize, ctx.rsi as usize, ctx.rdx as i32);
+/// Change a guest range's protection as the guest asked, keeping the code
+/// cache's books: an executable range is an arena, and whatever guard the cache
+/// held on these pages was just replaced. Answers `mprotect`'s return value.
+///
+/// Async-signal-safe once [`crate::smc::warm`] has run, but for the rare
+/// allocation of another chunk of arena slots: `darwin`'s service handler
+/// calls it for `vm_protect` from another task.
+fn protect(addr: usize, len: usize, prot: i32) -> i32 {
     let want_prot = host_prot(prot);
 
     // SAFETY: the guest's own request, with executable permission removed.
@@ -233,11 +238,32 @@ fn mprotect(_symbol: &str, ctx: &mut RegisterContext, _mem: &mut dyn GuestMemory
     if prot & libc::PROT_EXEC != 0 && rc == 0 {
         arenas::push(addr as u64, len as u64);
     }
-    // Any protection, not only an executable one: whatever guard the code cache
-    // held on these pages was just replaced. See [`crate::smc`].
+    // Any protection, not only an executable one. See [`crate::smc`].
     if rc == 0 && contains(addr as u64) {
         crate::smc::track(addr as u64, len as u64, prot);
     }
+    rc
+}
+
+/// [`protect`] as `darwin::mach::local`'s hook for `vm_protect`: an `errno`, or 0.
+///
+/// # Safety
+///
+/// The range is the guest's to change.
+pub(crate) unsafe fn protect_hook(address: u64, len: u64, prot: i32) -> i32 {
+    match protect(address as usize, len as usize, prot) {
+        0 => 0,
+        _ => std::io::Error::last_os_error()
+            .raw_os_error()
+            .unwrap_or(libc::EINVAL),
+    }
+}
+
+/// `int mprotect(void *addr, size_t len, int prot)`
+fn mprotect(_symbol: &str, ctx: &mut RegisterContext, _mem: &mut dyn GuestMemory) -> Result<()> {
+    let (addr, len, prot) = (ctx.rdi as usize, ctx.rsi as usize, ctx.rdx as i32);
+    let want_prot = host_prot(prot);
+    let rc = protect(addr, len, prot);
 
     if tracing() {
         eprintln!(

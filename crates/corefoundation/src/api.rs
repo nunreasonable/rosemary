@@ -335,6 +335,12 @@ pub unsafe extern "C" fn CFStringCreateWithSubstring(
     string::from_utf16(&units[location..end])
 }
 
+/// No hyphenation dictionaries are installed by this implementation. Report
+/// the capability as unavailable so callers can use ordinary line breaking.
+pub extern "C" fn CFStringIsHyphenationAvailableForLocale(_locale: CFTypeRef) -> Boolean {
+    0
+}
+
 pub unsafe extern "C" fn CFStringGetLength(s: CFTypeRef) -> CFIndex {
     unsafe { string::as_string(s) }.map_or(0, |s| s.length())
 }
@@ -2701,14 +2707,22 @@ pub unsafe extern "C" fn CFRunLoopRunInMode(
 /// loop run in another named mode is not told apart, and one not running at
 /// all answers the default rather than null, since AppKit's event loop here
 /// is not a Core Foundation run.
-pub unsafe extern "C" fn CFRunLoopCopyCurrentMode(_run_loop: CFTypeRef) -> CFTypeRef {
-    // SAFETY: a fresh string this call hands over.
-    unsafe { CFRetain(crate::base::interned_name(runloop::DEFAULT_MODE) as usize as CFTypeRef) }
-}
+
 
 pub unsafe extern "C" fn CFRunLoopRun() {
     // `CFRunLoopRun` is the default mode with no timeout, until stopped.
     runloop::current().run_in_mode(runloop::DEFAULT_MODE, f64::INFINITY, false);
+}
+
+/// `CFStringRef CFRunLoopCopyCurrentMode(CFRunLoopRef)`: NULL when the loop is
+/// not running.
+pub unsafe extern "C" fn CFRunLoopCopyCurrentMode(loop_: CFTypeRef) -> CFTypeRef {
+    let Some(l) = (unsafe { borrow::<RunLoop>(loop_) }) else {
+        return std::ptr::null();
+    };
+    l.current_mode().map_or(std::ptr::null(), |mode| {
+        string::from_bytes(mode.as_bytes(), false)
+    })
 }
 
 pub unsafe extern "C" fn CFRunLoopStop(loop_: CFTypeRef) {

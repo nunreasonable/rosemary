@@ -319,6 +319,42 @@ fn wants_monospace(family: &str) -> bool {
         .any(|name| family.contains(name))
 }
 
+/// Resolve a family through the host's configured aliases without treating an
+/// unknown name as the default font. Exact installed families take precedence.
+pub fn family_members(family: &str) -> Vec<FaceInfo> {
+    let faces = all_faces();
+    let config = system_cache().fallback_config();
+    let mut candidates = config.expand_family(family, &[]);
+    // Guests assume macOS's standard families exist. Map only these known
+    // system names when the host has neither the face nor an explicit alias.
+    let generic = match family.to_ascii_lowercase().as_str() {
+        "times" | "times new roman" => Some(GenericFamily::Serif),
+        "helvetica" | "helvetica neue" | "arial" | "lucida grande" => {
+            Some(GenericFamily::SansSerif)
+        }
+        "courier" | "courier new" | "menlo" | "monaco" => Some(GenericFamily::Monospace),
+        _ => None,
+    };
+    if let Some(generic) = generic {
+        candidates.extend(config.generic_candidates(generic).iter().cloned());
+    }
+    members_from_candidates(&faces, &candidates)
+}
+
+fn members_from_candidates(faces: &[FaceInfo], candidates: &[String]) -> Vec<FaceInfo> {
+    for candidate in candidates {
+        let members: Vec<_> = faces
+            .iter()
+            .filter(|face| face.family.eq_ignore_ascii_case(candidate))
+            .cloned()
+            .collect();
+        if !members.is_empty() {
+            return members;
+        }
+    }
+    Vec::new()
+}
+
 /// The face for `family` closest to `weight` and `italic`, falling back to the
 /// host's default sans-serif or monospace family.
 pub fn resolve(family: &str, weight: u16, italic: bool) -> Option<FaceInfo> {
@@ -613,6 +649,35 @@ mod tests {
         cache.insert(("large".into(), 0), large, 9);
         assert!(weak.upgrade().is_none());
         assert_eq!(cache.bytes, 8);
+    }
+
+    #[test]
+    fn family_aliases_preserve_priority_styles_and_unknown_names() {
+        let face = |family: &str, weight| FaceInfo {
+            family: family.into(),
+            style: "Regular".into(),
+            postscript: format!("{family}-{weight}"),
+            path: "font.ttf".into(),
+            index: 0,
+            weight,
+            italic: false,
+            monospace: false,
+        };
+        let faces = vec![
+            face("Installed", 400),
+            face("Installed", 700),
+            face("Alias", 400),
+        ];
+        let candidates = vec!["alias".into(), "Installed".into()];
+        assert_eq!(
+            members_from_candidates(&faces, &candidates),
+            vec![faces[2].clone()]
+        );
+        assert_eq!(
+            members_from_candidates(&faces[..2], &candidates),
+            faces[..2]
+        );
+        assert!(members_from_candidates(&faces, &["Unknown".into()]).is_empty());
     }
 
     #[test]

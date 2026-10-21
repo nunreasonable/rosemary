@@ -172,6 +172,25 @@ pub fn string(text: &str) -> Id {
     autoreleased(Desc::leaf(TYPE_UNICODE_TEXT, data))
 }
 
+/// A `typeFileURL` descriptor for `url`, autoreleased: what an `odoc` event's
+/// list holds, one per document.
+pub fn file_url(url: &str) -> Id {
+    autoreleased(Desc::leaf(TYPE_FILE_URL, url.as_bytes().to_vec()))
+}
+
+/// A list descriptor of `items`, in order, autoreleased.
+///
+/// # Safety
+///
+/// Every item must be a descriptor this module made.
+pub unsafe fn list(items: &[Id]) -> Id {
+    autoreleased(Desc {
+        kind: TYPE_LIST,
+        list: items.iter().map(|item| objc::arc::retain(*item)).collect(),
+        ..Desc::default()
+    })
+}
+
 /// An Apple Event with no parameters, autoreleased.
 ///
 /// The target is this process, which is the only one an event raised in this
@@ -1097,6 +1116,22 @@ exports::exports! {
         "AEGetDescDataSize" => AEGetDescDataSize,
         "AEGetDescData" => AEGetDescData,
     }
+}
+
+/// Whether the program installed a handler for the event, in either table.
+/// AppKit answers the core events itself only where it did not.
+pub fn has_handler(event_class: u32, event_id: u32) -> bool {
+    let matches = |class, id| (class, id) == (event_class, event_id);
+    HANDLERS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .any(|h| matches(h.event_class, h.event_id))
+        || C_HANDLERS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .any(|h| matches(h.event_class, h.event_id))
 }
 
 /// Build and dispatch a parameterless event, for the ones this runtime raises.

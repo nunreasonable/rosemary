@@ -311,6 +311,7 @@ pub(super) static RUNTIME: &[Runtime] = &[
     rtc!([0] -> true, "object_getClass", P, P),
     rtc!([0], "object_getClassName", P, P),
     rt!("object_getIndexedIvars", P, P),
+    rtc!([0], "object_getInstanceVariable", P, P, P, P),
     rtc!([0] -> true, "object_getIvar", P, P, P),
     // `isa`-swizzling: the class an object is moved to, and the one it had.
     rtc!([0, 1] -> true, "object_setClass", P, P, P),

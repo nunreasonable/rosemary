@@ -90,6 +90,7 @@ exports::exports! {
         "object_getClassName" => api::object_getClassName,
         "object_getIndexedIvars" => api::object_getIndexedIvars,
         "object_getIvar" => api::object_getIvar,
+        "object_getInstanceVariable" => api::object_getInstanceVariable,
         "object_setIvar" => api::object_setIvar,
         "objc_constructInstance" => api::objc_constructInstance,
         "objc_destructInstance" => api::objc_destructInstance,

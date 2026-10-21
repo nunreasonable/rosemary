@@ -73,6 +73,7 @@ exports::exports! {
         "CFStringCreateCopy" => api::CFStringCreateCopy,
         "CFStringCreateWithSubstring" => api::CFStringCreateWithSubstring,
         "CFStringGetLength" => api::CFStringGetLength,
+        "CFStringIsHyphenationAvailableForLocale" => api::CFStringIsHyphenationAvailableForLocale,
         "CFStringGetIntValue" => api::CFStringGetIntValue,
         "CFStringGetDoubleValue" => api::CFStringGetDoubleValue,
         "CFStringGetMaximumSizeForEncoding" => api::CFStringGetMaximumSizeForEncoding,

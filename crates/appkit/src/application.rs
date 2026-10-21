@@ -161,6 +161,12 @@ unsafe extern "C" fn main_menu(receiver: Id, _sel: Sel) -> Id {
 unsafe extern "C" fn set_main_menu(receiver: Id, _sel: Sel, value: Id) {
     // SAFETY: an application.
     let slot = unsafe { &mut (*(receiver as *mut Application)).main_menu };
+    // Toolkits may reassign the same menu when a popup takes or returns focus.
+    // Reassignment is not a replacement: closing menu tracking here would
+    // dismiss the popup before the user can choose an item.
+    if *slot == value {
+        return;
+    }
     let old = std::mem::replace(slot, objc::arc::retain(value));
     objc::arc::release(old);
     // The menu bar shows the menus of the one it is given now.
@@ -254,28 +260,17 @@ unsafe extern "C" fn finish_launching(receiver: Id, _sel: Sel) {
     // After the delegate has built its menus, and before any key press, so
     // Control-Command-F works without the menu having been opened.
     crate::menu::add_full_screen_item();
+    // Launches handed over while this one was under way, then any later.
+    crate::launch::finished_launching();
 }
 
 /// The URLs this launch was asked to open, in the order they were given.
 fn launch_urls() -> Vec<String> {
-    fn scheme(argument: &str) -> bool {
-        let Some((scheme, rest)) = argument.split_once(':') else {
-            return false;
-        };
-        // Two characters at least, so a lone drive letter or a stray `x:` is
-        // not mistaken for one, and a body.
-        scheme.len() >= 2
-            && !rest.is_empty()
-            && scheme.starts_with(|c: char| c.is_ascii_alphabetic())
-            && scheme
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
-    }
     foundation::processinfo::guest_arguments()
         .iter()
         .skip(1)
         .filter_map(|argument| argument.to_str().map(str::to_owned))
-        .filter(|argument| scheme(argument))
+        .filter(|argument| crate::launch::is_launch_url(argument))
         .collect()
 }
 
@@ -294,9 +289,46 @@ fn launch_urls() -> Vec<String> {
 /// `receiver` is an application and `delegate` is null or live.
 unsafe fn open_launch_urls(receiver: Id, delegate: Id) {
     let urls = launch_urls();
-    if urls.is_empty() || delegate.is_null() {
+    if urls.is_empty() {
         return;
     }
+    // SAFETY: the caller's.
+    unsafe { send_open_urls(receiver, delegate, &urls) };
+}
+
+/// The delegate of the shared application, or nil.
+pub(crate) fn shared_delegate() -> Id {
+    match shared() {
+        app if app.is_null() => app,
+        // SAFETY: the shared application.
+        app => unsafe { (*(app as *const Application)).delegate },
+    }
+}
+
+/// `-[delegate application:openURLs:]` on the shared application's delegate,
+/// for URLs handed to the running application. False when the delegate does
+/// not implement it.
+///
+/// # Safety
+///
+/// The shared application's delegate is null or live.
+pub(crate) unsafe fn open_urls(urls: &[String]) -> bool {
+    // SAFETY: the caller's.
+    unsafe { send_open_urls(shared(), shared_delegate(), urls) }
+}
+
+/// # Safety
+///
+/// `receiver` is an application and `delegate` is null or live.
+unsafe fn send_open_urls(receiver: Id, delegate: Id, urls: &[String]) -> bool {
+    if delegate.is_null() {
+        return false;
+    }
+    let sel = objc::sel::get("application:openURLs:");
+    let Some(method) = (unsafe { objc::object::class_of(delegate) }).and_then(|c| c.method(sel))
+    else {
+        return false;
+    };
     let objects: Vec<corefoundation::base::CFTypeRef> = urls
         .iter()
         .map(|url| corefoundation::url::new(url))
@@ -311,21 +343,18 @@ unsafe fn open_launch_urls(receiver: Id, delegate: Id) {
         // SAFETY: a URL this call just made.
         unsafe { corefoundation::api::CFRelease(*object) };
     }
-    let sel = objc::sel::get("application:openURLs:");
-    let method = (unsafe { objc::object::class_of(delegate) }).and_then(|c| c.method(sel));
-    if let Some(method) = method {
-        // SAFETY: `-application:openURLs:` is `void (id, SEL, NSApplication *,
-        // NSArray<NSURL *> *)`.
-        unsafe {
-            let f: unsafe extern "C" fn(Id, Sel, Id, Id) = std::mem::transmute::<
-                *const c_void,
-                unsafe extern "C" fn(Id, Sel, Id, Id),
-            >(method.implementation());
-            f(delegate, sel, receiver, array as Id);
-        }
+    // SAFETY: `-application:openURLs:` is `void (id, SEL, NSApplication *,
+    // NSArray<NSURL *> *)`.
+    unsafe {
+        let f: unsafe extern "C" fn(Id, Sel, Id, Id) = std::mem::transmute::<
+            *const c_void,
+            unsafe extern "C" fn(Id, Sel, Id, Id),
+        >(method.implementation());
+        f(delegate, sel, receiver, array as Id);
     }
     // SAFETY: the array this call made, which the delegate retains if it keeps it.
     unsafe { corefoundation::api::CFRelease(array) };
+    true
 }
 
 unsafe extern "C" fn run(receiver: Id, sel: Sel) {
@@ -844,6 +873,13 @@ unsafe extern "C" fn modal_window(receiver: Id, _sel: Sel) -> Id {
     unsafe { (*(receiver as *const Application)).modal_window }
 }
 
+/// `-_isRunningModal`, private but sent by Gecko: whether a modal session is
+/// running, which here is whether there is a modal window.
+unsafe extern "C" fn is_running_modal(receiver: Id, sel: Sel) -> u8 {
+    // SAFETY: an application.
+    u8::from(!unsafe { modal_window(receiver, sel) }.is_null())
+}
+
 /// `NSModalResponse`. Apple's values, because a caller compares against them.
 mod modal_response {
     /// `NSModalResponseStop`, which is what `-stopModal` makes the session return.
@@ -1100,6 +1136,9 @@ pub(crate) fn install() {
         "postEvent:atStart:" => post_event, c"v28@0:8@16B24";
         "currentEvent" => current_event, c"@16@0:8";
         "sendEvent:" => send_event, c"v24@0:8@16";
+        // Private: the window server's hit-testing cache, which this runtime
+        // has none of. Gecko drops a hidden popup from it.
+        "_removeWindowFromCache:" => ignored_sender, c"v24@0:8@16";
         // Private but SDL 1.2's SDLMain calls it for the application menu.
         "setAppleMenu:" => ignored_sender, c"v24@0:8@16";
         "hide:" => ignored_sender, c"v24@0:8@16";
@@ -1114,6 +1153,8 @@ pub(crate) fn install() {
         "requestUserAttention:" => request_user_attention, c"q24@0:8q16";
         "cancelUserAttentionRequest:" => cancel_user_attention_request, c"v24@0:8q16";
         "modalWindow" => modal_window, c"@16@0:8";
+        "_isRunningModal" => is_running_modal, c"c16@0:8";
+        "_isRunningAppModal" => is_running_modal, c"c16@0:8";
         "beginModalSessionForWindow:" => begin_modal_session, c"@24@0:8@16";
         "runModalSession:" => run_modal_session, c"q24@0:8^v16";
         "endModalSession:" => end_modal_session, c"v24@0:8^v16";
@@ -1141,6 +1182,35 @@ mod tests {
             assert!(window_with_window_number(std::ptr::null_mut(), sel, 0).is_null());
             assert!(window_with_window_number(std::ptr::null_mut(), sel, -7).is_null());
         }
+    }
+
+    /// Qt can send the same menu again when a popup window gains focus. A
+    /// no-op reassignment must preserve both identity and ownership.
+    #[test]
+    fn setting_the_same_main_menu_does_not_replace_or_release_it() {
+        crate::bootstrap();
+        let app_class = objc::class::lookup(c"NSApplication").expect("application class");
+        let menu_class = objc::class::lookup(c"NSMenu").expect("menu class");
+        let app = objc::object::create_instance(app_class, INSTANCE_SIZE);
+        let first = objc::object::create_instance(menu_class, 0);
+        let second = objc::object::create_instance(menu_class, 0);
+        let selector = objc::sel::get("setMainMenu:");
+        // SAFETY: `app` is an NSApplication and both menus are live NSMenus.
+        unsafe {
+            set_main_menu(app, selector, first);
+            assert_eq!(main_menu(app, selector), first);
+            let count = objc::arc::retain_count(first);
+            set_main_menu(app, selector, first);
+            assert_eq!(main_menu(app, selector), first);
+            assert_eq!(objc::arc::retain_count(first), count);
+            set_main_menu(app, selector, second);
+            assert_eq!(main_menu(app, selector), second);
+            assert_eq!(objc::arc::retain_count(first), count - 1);
+            set_main_menu(app, selector, std::ptr::null_mut());
+        }
+        objc::arc::release(first);
+        objc::arc::release(second);
+        objc::arc::release(app);
     }
 
     /// Tests below temporarily replace the process-wide guest argv.

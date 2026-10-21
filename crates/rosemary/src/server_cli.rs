@@ -45,16 +45,22 @@ fn launch(directory: &Path) -> std::io::Result<()> {
     }
 }
 
-/// Point this process at its prefix's server and check in as the guest at
-/// `guest`, before the program's first instruction. Without a server the
-/// check-in still settles who the guest is, from its image alone.
-pub fn join(guest: &str, argv: &[OsString]) {
+/// Point this process at its prefix's server, unless guests are kept apart.
+/// Idempotent.
+pub fn configure() {
     if enabled() {
         server::client::configure(server::client::Config {
             directory: directory(),
             launch: Some(launch),
         });
     }
+}
+
+/// Point this process at its prefix's server and check in as the guest at
+/// `guest`, before the program's first instruction. Without a server the
+/// check-in still settles who the guest is, from its image alone.
+pub fn join(guest: &str, argv: &[OsString]) {
+    configure();
     let argv = argv
         .iter()
         .map(|arg| arg.as_encoded_bytes().to_vec())

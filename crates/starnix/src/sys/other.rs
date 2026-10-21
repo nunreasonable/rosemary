@@ -3,6 +3,12 @@
 
 pub mod signal;
 
+/// No call reaches this process's memory through the kernel more directly
+/// than a pipe does.
+pub mod memory {
+    pub use crate::memory::piped::{read, write};
+}
+
 use std::io;
 use std::os::fd::RawFd;
 use std::path::PathBuf;
@@ -49,7 +55,7 @@ pub fn descriptors() -> io::Result<Vec<Descriptor>> {
     Err(unsupported())
 }
 
-pub fn regions() -> io::Result<Vec<Region>> {
+pub fn regions(_pid: i32) -> io::Result<Vec<Region>> {
     Err(unsupported())
 }
 

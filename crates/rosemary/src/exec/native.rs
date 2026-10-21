@@ -373,7 +373,13 @@ impl Native {
             return Ok(());
         };
         let mut extended = current.clone();
+        let before = extended.refusals().len();
         crate::objc::register_loaded(self, &mut extended, report)?;
+        // A class refused here is one the image's own code still sends to, and
+        // the send reads guest bytes as a class this runtime never made.
+        for r in &extended.refusals()[before..] {
+            eprintln!("rosemary: objc: {r:?}");
+        }
         let leaked: &'static crate::objc::ObjcRuntime = Box::leak(Box::new(extended));
         crate::objc::publish(leaked);
         crate::objc::rewrite_refs(self, leaked, report)?;
@@ -390,6 +396,9 @@ impl Native {
         // has no variadic tail without this.
         crate::shims::variadic::install();
         let rt = Box::leak(Box::new(crate::objc::register(self)?));
+        for r in rt.refusals() {
+            eprintln!("rosemary: objc: {r:?}");
+        }
         crate::objc::publish(rt);
         crate::objc::rewrite_refs(self, rt, &self.report)?;
         // `+load` before the C constructors of the same image, which is dyld's

@@ -25,6 +25,7 @@ use std::ffi::CString;
 pub mod accounts;
 #[cfg(not(target_os = "macos"))]
 pub mod acl;
+pub mod appmailbox;
 mod atomics;
 pub mod attrlist;
 pub mod audit;
@@ -40,6 +41,7 @@ pub mod credentials;
 pub mod data;
 pub mod dirent;
 pub mod dispatch;
+pub mod distnote;
 pub mod divergent;
 pub mod env;
 pub mod errno;

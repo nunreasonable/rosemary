@@ -1398,6 +1398,47 @@ pub fn spawn_child(
     }
 }
 
+/// Launch the application bundle at the guest path `bundle` as LaunchServices
+/// does: this runtime runs the bundle itself, so the child claims the
+/// application and hands the launch to an instance already running instead,
+/// unless `new_instance`. `args` follow the bundle, as `open --args` passes them.
+pub fn spawn_application(
+    bundle: &CStr,
+    args: &[CString],
+    new_instance: bool,
+) -> Result<libc::pid_t, c_int> {
+    let runtime = runtime_path().ok_or(libc::ENOENT)?;
+    let mut argv = vec![runtime.clone(), c"run".to_owned()];
+    if EMULATED.load(Ordering::Relaxed) {
+        argv.push(c"--emulated".to_owned());
+    }
+    if new_instance {
+        argv.push(c"--new-instance".to_owned());
+    }
+    argv.push(bundle.to_owned());
+    argv.extend(args.iter().cloned());
+    let argv = as_argv(&argv);
+    // SAFETY: the guest's environment is a live, null-terminated vector.
+    let environment = unsafe { runtime_environ(environ()) };
+    let environment = as_argv(&environment);
+    let mut pid = 0;
+    // SAFETY: every string and array outlives the call.
+    let rc = unsafe {
+        libc::posix_spawn(
+            &mut pid,
+            runtime.as_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            argv.as_ptr() as *const *mut c_char,
+            environment.as_ptr() as *const *mut c_char,
+        )
+    };
+    match rc {
+        0 => Ok(pid),
+        error => Err(error),
+    }
+}
+
 /// Reap a child [`spawn_child`] made, answering its Darwin wait status.
 ///
 /// `Ok(None)` when `block` is false and the child is still running.

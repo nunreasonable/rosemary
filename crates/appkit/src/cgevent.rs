@@ -222,6 +222,51 @@ pub unsafe extern "C" fn CGGetLastMouseDelta(dx: *mut i32, dy: *mut i32) {
 
 /// `CGEventFlags CGEventSourceFlagsState(CGEventSourceStateID)`
 ///
+/// Input events delivered so far, by `CGEventType` - which for every input
+/// event is the same number as its `NSEventType`.
+static COUNTS: [std::sync::atomic::AtomicU32; 32] =
+    [const { std::sync::atomic::AtomicU32::new(0) }; 32];
+
+/// Note one delivered event of `kind`, for [`CGEventSourceCounterForEventType`].
+pub(crate) fn count(kind: u64) {
+    if let Some(counter) = COUNTS.get(kind as usize) {
+        counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// `uint32_t CGEventSourceCounterForEventType(CGEventSourceStateID, CGEventType)`
+///
+/// How many events of a type have arrived, which a program samples twice to
+/// learn whether the user did anything in between. `kCGAnyInputEventType` is
+/// the sum of every type.
+#[allow(non_snake_case)]
+pub extern "C" fn CGEventSourceCounterForEventType(_state: u32, kind: u32) -> u32 {
+    /// `kCGAnyInputEventType`.
+    const ANY_INPUT: u32 = u32::MAX;
+    let load = |c: &std::sync::atomic::AtomicU32| c.load(std::sync::atomic::Ordering::Relaxed);
+    match kind {
+        ANY_INPUT => COUNTS.iter().map(load).fold(0, u32::wrapping_add),
+        _ => COUNTS.get(kind as usize).map_or(0, load),
+    }
+}
+
+/// `CFMachPortRef CGEventTapCreate(CGEventTapLocation, CGEventTapPlacement,
+/// CGEventTapOptions, CGEventMask, CGEventTapCallBack, void *)`
+///
+/// NULL, which is what Apple's answers to a process not trusted for
+/// accessibility: no other process's input passes through this one.
+#[allow(non_snake_case)]
+pub extern "C" fn CGEventTapCreate(
+    _tap: u32,
+    _place: u32,
+    _options: u32,
+    _mask: u64,
+    _callback: *const c_void,
+    _info: *mut c_void,
+) -> *mut c_void {
+    std::ptr::null_mut()
+}
+
 /// The keyboard's modifiers now. The flags are NSEvent's modifier bits, which
 /// is how AppKit defines them, so the same translation answers both.
 #[allow(non_snake_case)]

@@ -70,6 +70,27 @@ pub unsafe fn set_property(
     })
 }
 
+/// Forward `AudioUnitGetPropertyInfo`.
+///
+/// # Safety
+/// Output pointers are null or writable, and the handle belongs to the guest unit.
+pub unsafe fn get_property_info(
+    handle: *mut c_void,
+    id: u32,
+    scope: u32,
+    element: u32,
+    size: *mut u32,
+    writable: *mut u8,
+) -> Option<i32> {
+    let f = entry(c"AudioUnitGetPropertyInfo")?;
+    // SAFETY: the caller supplies the framework's handle and optional outputs.
+    Some(unsafe {
+        let f: unsafe extern "C" fn(*mut c_void, u32, u32, u32, *mut u32, *mut u8) -> i32 =
+            std::mem::transmute(f);
+        f(handle, id, scope, element, size, writable)
+    })
+}
+
 /// Forward `AudioUnitGetProperty`.
 ///
 /// # Safety

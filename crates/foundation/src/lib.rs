@@ -18,6 +18,7 @@ pub mod cookies;
 pub mod decimal;
 pub mod defaults;
 mod define;
+mod distributed;
 pub mod error;
 pub mod exception;
 pub mod filehandle;
@@ -50,6 +51,7 @@ pub mod unarchiver;
 pub mod url;
 mod urlcomponents;
 pub mod urlsession;
+mod urlsession_trace;
 pub mod value;
 
 mod collections;
@@ -75,6 +77,7 @@ pub fn bootstrap() {
         runtime::install();
         signature::install();
         notification::install();
+        distributed::install();
         constant::install();
         declare_abstract();
         bundle::class::install();
@@ -271,6 +274,7 @@ pub const CLASSES: &[&str] = &[
     "NSNull",
     "NSNotification",
     "NSNotificationCenter",
+    "NSDistributedNotificationCenter",
     "NSAutoreleasePool",
     "NSBundle",
     "NSDate",
@@ -386,6 +390,12 @@ pub const STRING_GLOBALS: &[(&str, &str)] = &[
     ("_NSFileSystemFreeSize", "NSFileSystemFreeSize"),
     ("_NSFileSystemSize", "NSFileSystemSize"),
     ("_NSFileSystemNumber", "NSFileSystemNumber"),
+    ("_NSFileHFSCreatorCode", "NSFileHFSCreatorCode"),
+    ("_NSFileHFSTypeCode", "NSFileHFSTypeCode"),
+    ("_NSFileTypeUnknown", "NSFileTypeUnknown"),
+    ("_NSFileTypeDirectory", "NSFileTypeDirectory"),
+    ("_NSFileTypeRegular", "NSFileTypeRegular"),
+    ("_NSFileTypeSymbolicLink", "NSFileTypeSymbolicLink"),
     ("_NSPOSIXErrorDomain", "NSPOSIXErrorDomain"),
     ("_NSCocoaErrorDomain", "NSCocoaErrorDomain"),
     ("_NSFilePathErrorKey", "NSFilePath"),
@@ -408,6 +418,7 @@ pub const STRING_GLOBALS: &[(&str, &str)] = &[
 ];
 
 pub const NOTIFICATION_NAMES: &[&str] = &[
+    "NSSystemTimeZoneDidChangeNotification",
     "NSProcessInfoThermalStateDidChangeNotification",
     "NSProcessInfoPowerStateDidChangeNotification",
     "NSCurrentLocaleDidChangeNotification",
@@ -434,6 +445,31 @@ mod tests {
     fn class(name: &std::ffi::CStr) -> Id {
         bootstrap();
         objc::class::ptr(objc::class::lookup(name).expect("registered")) as Id
+    }
+
+    /// Qt's Cocoa file picker loads these as Objective-C pointer globals.
+    /// Missing cells leave Mach-O GOT slots zero and crash the picker when it
+    /// categorizes a directory, regular file, or symbolic link.
+    #[test]
+    fn file_type_globals_are_present_with_the_expected_string_values() {
+        bootstrap();
+        let symbols = data_symbols();
+        for value in [
+            "NSFileTypeDirectory",
+            "NSFileTypeRegular",
+            "NSFileTypeSymbolicLink",
+        ] {
+            let symbol = format!("_{value}");
+            let (_, address) = symbols
+                .iter()
+                .find(|(name, _)| name == &symbol)
+                .unwrap_or_else(|| panic!("missing Foundation data symbol {symbol}"));
+            // SAFETY: `string_globals` registers each value as a pointer-sized
+            // cell and the test just looked up its actual returned address.
+            let object = unsafe { *(*address as *const Id) };
+            assert!(!object.is_null(), "{symbol} must hold an NSString");
+            assert_eq!(unsafe { string::bytes(object) }, value.as_bytes());
+        }
     }
 
     #[test]

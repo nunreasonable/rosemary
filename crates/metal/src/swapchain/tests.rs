@@ -165,16 +165,15 @@ fn two_layers_in_a_window_are_composited_into_one_image() {
     if std::env::var_os("ROSEMARY_TEST_VULKAN").is_none() {
         return;
     }
-    let Ok(adapters) = crate::vulkan::adapters() else {
-        return;
-    };
-    let Some(gpu) = adapters.first().and_then(|adapter| adapter.gpu().ok()) else {
-        return;
-    };
+    let adapters = crate::vulkan::adapters().expect("Vulkan explicitly requested");
+    let gpu = adapters
+        .first()
+        .expect("a Vulkan adapter")
+        .gpu()
+        .expect("a Vulkan device");
     let flags = sdl3::video::flags::HIGH_PIXEL_DENSITY;
-    let Some(window) = sdl3::video::create_window(c"rosemary compositing", 320, 240, flags) else {
-        return;
-    };
+    let window = sdl3::video::create_window(c"rosemary compositing", 320, 240, flags)
+        .expect("a display is required for the requested presentation test");
     sdl3::video::show_window(window);
     let (width, height) =
         sdl3::video::window_size_in_pixels(window).expect("a window SDL just made");
@@ -199,6 +198,30 @@ fn two_layers_in_a_window_are_composited_into_one_image() {
     };
     let background = image(width, height);
     let overlay = image(width / 2, height / 2);
+    gpu.one_shot(|device, command| {
+        for (image, color) in [
+            (&background, [1.0, 0.0, 0.0, 1.0]),
+            (&overlay, [0.0, 1.0, 0.0, 1.0]),
+        ] {
+            // SAFETY: live images in GENERAL, exclusively used by this test.
+            unsafe {
+                device.cmd_clear_color_image(
+                    command,
+                    image.image,
+                    vk::ImageLayout::GENERAL,
+                    &vk::ClearColorValue { float32: color },
+                    &[vk::ImageSubresourceRange {
+                        aspect_mask: vk::ImageAspectFlags::COLOR,
+                        base_mip_level: 0,
+                        level_count: 1,
+                        base_array_layer: 0,
+                        layer_count: 1,
+                    }],
+                );
+            }
+        }
+    })
+    .expect("known image upload");
 
     let whole = appkit::view::Frame {
         window,
@@ -238,6 +261,54 @@ fn two_layers_in_a_window_are_composited_into_one_image() {
         "a window with two layers presented without a composite image"
     );
 
+    // Read the actual window composite, not the source textures. This catches
+    // empty frames and misplaced layers even when presentation itself succeeds.
+    {
+        let all = SWAPCHAINS.lock().expect("window swapchains");
+        let composite = all
+            .as_ref()
+            .unwrap()
+            .get(&(window as usize))
+            .unwrap()
+            .composite
+            .as_ref()
+            .unwrap();
+        let target = crate::capture::Target {
+            image: composite.image,
+            aspect: vk::ImageAspectFlags::COLOR,
+            level: 0,
+            slice: 0,
+            width,
+            height,
+            format: composite.format,
+            samples: vk::SampleCountFlags::TYPE_1,
+            role: "window-test".into(),
+        };
+        let mut captured = None;
+        gpu.one_shot(|_, command| {
+            captured = Some(
+                crate::capture::record(gpu, command, 0, "test", &target)
+                    .expect("composite readback"),
+            );
+        })
+        .expect("composite completion");
+        let captured = captured.unwrap();
+        // SAFETY: one_shot waited; the coherent allocation covers the image.
+        let pixels = unsafe {
+            std::slice::from_raw_parts(
+                captured.buffer.contents,
+                width as usize * height as usize * 4,
+            )
+        };
+        for (x, y, expected) in [
+            (width / 4, height / 4, [0, 0, 255, 255]),
+            (width * 3 / 4, height * 3 / 4, [0, 255, 0, 255]),
+        ] {
+            let offset = ((y * width + x) * 4) as usize;
+            assert_eq!(&pixels[offset..offset + 4], &expected);
+        }
+        gpu.destroy_buffer(captured.buffer);
+    }
     SWAPCHAINS
         .lock()
         .expect("window swapchains")
@@ -525,8 +596,11 @@ fn a_layer_on_a_guests_own_window_is_presented_through_a_swapchain() {
         .expect("the layer's view is in a window this runtime made");
     assert_eq!(frame.window, sdl);
     assert!(
-        frame.covers_window(),
-        "a content view the size of its window did not cover it"
+        frame.width > 1
+            && frame.height > 1
+            && frame.width <= frame.window_width
+            && frame.height <= frame.window_height,
+        "the content layer must have drawable area inside the decorated window"
     );
 
     let source = gpu

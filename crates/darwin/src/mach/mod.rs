@@ -5,8 +5,11 @@ pub mod clock;
 pub mod info;
 pub mod kern;
 pub mod memory;
+pub mod local;
 pub mod msg;
+pub mod remote;
 pub mod senders;
+pub mod service;
 pub mod space;
 pub mod sync;
 pub mod task;
@@ -152,10 +155,6 @@ exports::exports! {
         "mach_make_memory_entry_64" => memory::mach_make_memory_entry_64,
         "mach_vm_map" | "vm_map" => memory::mach_vm_map,
         "mach_vm_remap" => memory::mach_vm_remap,
-        "mach_vm_protect" | "vm_protect" => memory::mach_vm_protect,
-        "mach_vm_read" | "vm_read" => memory::mach_vm_read,
-        "mach_vm_read_overwrite" => memory::mach_vm_read_overwrite,
-        "mach_vm_write" | "vm_write" => memory::mach_vm_write,
         "mach_port_deallocate" => space::mach_port_deallocate,
         "mach_port_destroy" => space::mach_port_destroy,
         "mach_port_mod_refs" => space::mach_port_mod_refs,
@@ -173,7 +172,10 @@ exports::exports! {
         "vm_allocate" | "mach_vm_allocate" => vm::vm_allocate,
         "vm_deallocate" | "mach_vm_deallocate" => vm::vm_deallocate,
         "mach_vm_region" => vm::vm_region_64,
-        "vm_read_overwrite" => vm::vm_read_overwrite,
+        "vm_read_overwrite" | "mach_vm_read_overwrite" => vm::vm_read_overwrite,
+        "vm_read" | "mach_vm_read" => vm::vm_read,
+        "vm_write" | "mach_vm_write" => vm::vm_write,
+        "vm_protect" | "mach_vm_protect" => vm::vm_protect,
         "vm_copy" | "mach_vm_copy" => vm::vm_copy,
 
         "mach_msg" => msg::mach_msg,

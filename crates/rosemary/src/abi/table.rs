@@ -197,6 +197,7 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("getsectbyname", P, P, P),
     sig!("getsectdatafromheader_64", P, P, P, P, P),
     sig!("get_etext", U64),
+    sig!("get_edata", U64),
     sig!("get_end", U64),
     // OpenAL 1.1. Its scalar typedefs are fixed-width even on Darwin.
     sig!("alBufferData", V, U32, I32, P, I32, I32),
@@ -259,6 +260,7 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("AudioQueueStart", I32, P, P),
     sig!("AudioQueueStop", I32, P, BOOL),
     sig!("AudioUnitGetProperty", I32, P, U32, U32, U32, P, P),
+    sig!("AudioUnitGetPropertyInfo", I32, P, U32, U32, U32, P, P),
     sig!("AudioUnitInitialize", I32, P),
     sig!("AudioUnitRender", I32, P, P, P, U32, U32, P),
     sig!("AudioUnitSetProperty", I32, P, U32, U32, U32, P, U32),
@@ -318,6 +320,7 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     // `CCCrypt`: 11 integer-class arguments, within `MAX_INT_ARGS_TOTAL` - the
     // three past the eighth spill to the host stack, all doubleword-wide.
     sig!("CCCrypt", I32, U32, U32, U32, P, U64, P, P, U64, P, U64, P),
+    sig!("CCRandomGenerateBytes", I32, P, U64),
     sig!("CCCryptorCreate", I32, U32, U32, U32, P, U64, P, P),
     sig!(
         "CCCryptorCreateFromData",
@@ -667,6 +670,7 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("CFStringGetCString", BOOL, P, P, I64, U32),
     sig!("CFStringGetCStringPtr", P, P, U32),
     sig!("CFStringGetLength", I64, P),
+    sig!("CFStringIsHyphenationAvailableForLocale", U8, P),
     sig!("CFStringGetIntValue", I32, P),
     sig!("CFStringGetDoubleValue", F64, P),
     sig!("CFStringAppend", V, P, P),
@@ -1154,6 +1158,8 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     // a null allocator is the default one, which is what a game passes.
     sig!("IOHIDManagerCopyDevices", P, P),
     sig!("IOHIDManagerCreate", P, P, U32),
+    sig!("NXOpenEventStatus", U32),
+    sig!("NXCloseEventStatus", V, U32),
     sig!("IOHIDManagerOpen", I32, P, U32),
     cbsig!(
         [1],
@@ -2789,6 +2795,14 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("vm_read_overwrite", I32, U32, U64, U64, U64, P),
     sig!("vm_region_64", I32, U32, P, P, I32, P, P, P),
     sig!("vm_region_recurse_64", I32, U32, P, P, P, P, P),
+    sig!("vm_read", I32, U32, U64, U64, P, P),
+    sig!("mach_vm_write", I32, U32, U64, U64, U32),
+    sig!("vm_write", I32, U32, U64, U64, U32),
+    //
+    // These do carry a protection, and `darwin::mach::local` hands it to the
+    // same bookkeeping as the `mprotect` shim (`shims::vmmap::protect_hook`).
+    sig!("mach_vm_protect", I32, U32, U64, U64, U32, I32),
+    sig!("vm_protect", I32, U32, U64, U64, U32, I32),
     sig!("mach_thread_self", U32),
     sig!("mach_timebase_info", I32, P),
     sig!("madvise", U64, P, U64, I32),

@@ -281,6 +281,20 @@ pub fn send_to_thread(tid: i32, signo: c_int) -> std::io::Result<()> {
     sys::signal::send_to_thread(tid, signo)
 }
 
+/// Queue `signo` for process `pid` with `value` attached, which its handler
+/// reads back as [`Info::value`] under [`Code::Queue`]. A host without
+/// `sigqueue` sends a plain signal.
+pub fn queue(pid: i32, signo: c_int, value: usize) -> std::io::Result<()> {
+    sys::signal::queue(pid, signo, value)
+}
+
+/// Call `each` with every thread id of this process, async-signal-safely: no
+/// allocation and no locks, so a signal handler may walk its own threads.
+/// False where the host cannot list them that way.
+pub fn for_each_thread(each: &mut dyn FnMut(i32)) -> bool {
+    sys::signal::for_each_thread(each)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

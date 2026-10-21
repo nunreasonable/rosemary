@@ -263,6 +263,44 @@ fn error_object(description: &str) -> CFTypeRef {
     object
 }
 
+/// `CFPropertyListRef CFPropertyListCreateFromXMLData(CFAllocatorRef, CFDataRef,
+/// CFOptionFlags, CFStringRef *errorString)`
+///
+/// The deprecated spelling, which reports an error as a string rather than an
+/// error object; despite the name it reads every format.
+///
+/// # Safety
+///
+/// As [`CFPropertyListCreateWithData`].
+pub unsafe extern "C" fn CFPropertyListCreateFromXMLData(
+    allocator: CFAllocatorRef,
+    data: CFTypeRef,
+    options: u64,
+    error_string: *mut CFTypeRef,
+) -> CFTypeRef {
+    if !error_string.is_null() {
+        // SAFETY: writable, per the caller.
+        unsafe { *error_string = std::ptr::null() };
+    }
+    // SAFETY: the caller's arguments, passed through.
+    let value = unsafe {
+        CFPropertyListCreateWithData(
+            allocator,
+            data,
+            options,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    if value.is_null() && !error_string.is_null() {
+        // SAFETY: as above.
+        unsafe {
+            *error_string = crate::string::from_bytes(b"the data is not a property list", false)
+        };
+    }
+    value
+}
+
 /// `CFPropertyListRef CFPropertyListCreateWithData(CFAllocatorRef, CFDataRef,
 /// CFOptionFlags options, CFPropertyListFormat *format, CFErrorRef *error)`
 ///
@@ -323,6 +361,7 @@ pub unsafe extern "C" fn CFPropertyListCreateWithData(
 exports::exports! {
     functions {
         "CFPropertyListCreateWithData" => CFPropertyListCreateWithData,
+        "CFPropertyListCreateFromXMLData" => CFPropertyListCreateFromXMLData,
     }
 }
 

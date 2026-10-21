@@ -241,6 +241,9 @@ struct RunOptions {
     /// Enable the built-in Objective-C runtime's fail-fast checks (needs ROSEMARY_OBJC=builtin)
     #[arg(long)]
     objc_debug: bool,
+    /// Start another instance of an .app bundle that is already running, as `open -n` does
+    #[arg(short = 'n', long)]
+    new_instance: bool,
 }
 
 /// `rosemary [OPTIONS] <PATH> [ARGS]...`, the form without a subcommand.
@@ -418,6 +421,9 @@ fn launch(path: OsString, options: &RunOptions, mut args: Vec<OsString>) -> Exit
             return ExitCode::FAILURE;
         }
     };
+    if let Some(code) = claim_application(&path, &executable, options.new_instance, &args) {
+        return code;
+    }
     let Some(path) = executable.to_str() else {
         eprintln!("rosemary: the bundle executable's path is not valid UTF-8");
         return ExitCode::FAILURE;
@@ -455,6 +461,64 @@ fn launch(path: OsString, options: &RunOptions, mut args: Vec<OsString>) -> Exit
         eprintln!("rosemary: could not re-execute from the bundle mirror: {e}");
     }
     run(path, &guest, args, policy, engine)
+}
+
+/// LaunchServices' rule that an application runs once, before the program is
+/// loaded: `Some` exit status when the launch was handed to an instance that
+/// is already running, and this process has nothing left to do.
+///
+/// Naming the bundle is a launch, as `open` is; naming its executable runs it
+/// directly, which is listed as the application but never handed over. See
+/// `appkit::launch`.
+fn claim_application(
+    given: &str,
+    executable: &std::path::Path,
+    new_instance: bool,
+    args: &[OsString],
+) -> Option<ExitCode> {
+    use appkit::launch::{Launch, Outcome};
+    if !darwin::libc_backend::using_builtin() {
+        return None;
+    }
+    let given = std::path::Path::new(given);
+    let (bundle, launch) = match given.is_dir() {
+        true => (
+            given.to_path_buf(),
+            match new_instance {
+                true => Launch::NewInstance,
+                false => Launch::Open,
+            },
+        ),
+        false => (rosemary::bundle::enclosing(executable)?, Launch::Direct),
+    };
+    server_cli::configure();
+    let urls: Vec<String> = args
+        .iter()
+        .filter_map(|arg| arg.to_str())
+        .filter(|arg| appkit::launch::is_launch_url(arg))
+        .map(str::to_owned)
+        .collect();
+    match appkit::launch::launch(&bundle, launch, &urls) {
+        Ok(Outcome::Run) => None,
+        Ok(Outcome::HandedTo(pid)) => {
+            eprintln!(
+                "rosemary: {} is already running (pid {pid}) and was handed this launch; \
+                 use --new-instance to start another",
+                bundle.display()
+            );
+            if args.len() > urls.len() {
+                eprintln!(
+                    "rosemary: the arguments that are not URLs were dropped, as a Mac drops \
+                     them for a running application"
+                );
+            }
+            Some(ExitCode::SUCCESS)
+        }
+        Err(e) => {
+            eprintln!("rosemary: {e}");
+            Some(ExitCode::FAILURE)
+        }
+    }
 }
 
 /// Load `path` without running it and report what was found.

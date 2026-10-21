@@ -10,6 +10,7 @@
 //! recursive locking and unlocking from another thread are undefined, and the
 //! real implementation aborts on both.
 
+use std::cell::Cell;
 use std::ffi::c_void;
 use std::hint::spin_loop;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -42,23 +43,39 @@ impl Misuse {
     }
 }
 
+#[cold]
 fn die(misuse: Misuse) -> ! {
     eprintln!("{}", misuse.message());
     std::process::abort()
 }
 
 fn me() -> u32 {
-    // Zero would read as unlocked, and the shift must not lose the top bit.
-    (crate::pthread::id() & 0x7fff_ffff).max(1) << 1
+    // The owner only has to be unique among this process's live threads. A
+    // kernel tid costs a syscall per call, and a cached one goes stale in a
+    // fork child, where the kernel can hand it to a new thread.
+    static NEXT: AtomicU32 = AtomicU32::new(1);
+    thread_local! {
+        static ME: Cell<u32> = const { Cell::new(0) };
+    }
+    ME.with(|me| {
+        if me.get() == 0 {
+            // Zero would read as unlocked, and the shift must not lose the top bit.
+            let id = NEXT.fetch_add(1, Ordering::Relaxed) & 0x7fff_ffff;
+            me.set(id.max(1) << 1);
+        }
+        me.get()
+    })
 }
 
 /// # Safety
 ///
 /// `lock` is a writable, aligned `os_unfair_lock`.
+#[inline(always)]
 unsafe fn word<'a>(lock: *mut c_void) -> &'a AtomicU32 {
     unsafe { AtomicU32::from_ptr(lock.cast()) }
 }
 
+#[inline]
 fn try_lock(word: &AtomicU32, owner: u32) -> bool {
     word.compare_exchange(0, owner, Ordering::Acquire, Ordering::Relaxed)
         .is_ok()
@@ -130,6 +147,7 @@ fn assert_owner(word: &AtomicU32, owner: u32, held: bool) -> Result<(), Misuse> 
     }
 }
 
+#[inline]
 fn check(result: Result<(), Misuse>) {
     if let Err(misuse) = result {
         die(misuse);

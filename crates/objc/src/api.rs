@@ -259,6 +259,17 @@ pub unsafe extern "C" fn method_setImplementation(m: *const c_void, imp: Imp) ->
     unsafe { method(m) }.map_or(std::ptr::null(), |m| m.set_implementation(imp))
 }
 
+/// Swap two methods' implementations, as one step: a send racing the swap sees
+/// one implementation or the other, never the same one twice.
+pub unsafe extern "C" fn method_exchangeImplementations(a: *const c_void, b: *const c_void) {
+    let (Some(a), Some(b)) = (unsafe { method(a) }, unsafe { method(b) }) else {
+        return;
+    };
+    let first = a.implementation();
+    let second = b.set_implementation(first);
+    a.set_implementation(second);
+}
+
 pub unsafe extern "C" fn ivar_getOffset(ivar: *const c_void) -> isize {
     crate::debug::validate_handle(ivar, "ivar", "ivar_getOffset");
     // SAFETY: an `Ivar` this runtime produced, or null.
@@ -310,6 +321,26 @@ pub unsafe extern "C" fn object_getIvar(object: Id, ivar: *const c_void) -> Id {
         return std::ptr::null_mut();
     };
     unsafe { crate::object::get_ivar(object, name) }
+}
+
+/// `Ivar object_getInstanceVariable(id, const char *name, void **outValue)`:
+/// the ivar by name, and its value as a pointer-sized word.
+pub unsafe extern "C" fn object_getInstanceVariable(
+    object: Id,
+    name: *const c_char,
+    out: *mut *mut c_void,
+) -> *const c_void {
+    let Some(class) = (unsafe { crate::object::class_of(object) }) else {
+        return std::ptr::null();
+    };
+    let ivar = unsafe { class_getInstanceVariable(crate::class::ptr(class).cast(), name) };
+    if !ivar.is_null() && !out.is_null() {
+        let offset = unsafe { ivar_getOffset(ivar) };
+        // SAFETY: the ivar is inside the object, and the caller asked for its
+        // first word.
+        unsafe { *out = *((object as *const u8).offset(offset) as *const *mut c_void) };
+    }
+    ivar
 }
 
 pub unsafe extern "C" fn object_setIvar(object: Id, ivar: *const c_void, value: Id) {
@@ -423,16 +454,6 @@ pub unsafe extern "C" fn class_copyMethodList(
         .collect();
     // SAFETY: `out_count` is null or writable, as the C prototype requires.
     unsafe { copied_list(values, out_count) }
-}
-
-/// `void method_exchangeImplementations(Method, Method)`: the swizzle.
-pub unsafe extern "C" fn method_exchangeImplementations(m1: *const c_void, m2: *const c_void) {
-    let (Some(m1), Some(m2)) = (unsafe { method(m1) }, unsafe { method(m2) }) else {
-        return;
-    };
-    let first = m1.implementation();
-    let second = m2.set_implementation(first);
-    m1.set_implementation(second);
 }
 
 pub unsafe extern "C" fn class_getProperty(

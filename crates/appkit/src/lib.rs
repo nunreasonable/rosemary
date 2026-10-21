@@ -15,13 +15,18 @@ pub mod alert;
 mod animation;
 pub mod appearance;
 pub mod application;
+mod aqua;
 pub mod backing;
 mod bezier;
 pub mod button;
+mod catalog;
 mod cell;
 pub mod cgcontext;
 pub mod cgevent;
+pub mod cgfont;
 pub mod cgl;
+pub mod cgpaint;
+pub mod cgpath;
 pub mod classes;
 pub mod color;
 mod controls;
@@ -37,6 +42,10 @@ mod displaylink;
 pub mod dock;
 pub mod event;
 mod font;
+pub mod hitheme;
+pub mod launch;
+pub mod launchservices;
+pub(crate) mod quartz;
 pub use chrome::fonts;
 pub mod geometry;
 pub mod graphics;
@@ -66,7 +75,7 @@ pub mod screen;
 pub mod script;
 mod scroll;
 mod segmented;
-mod statusbar;
+mod status;
 mod tab;
 mod table;
 pub mod text;
@@ -91,7 +100,6 @@ pub fn bootstrap() {
         application::install();
         nib::install();
         dock::install();
-        statusbar::install();
         workspace::install();
         color::install();
         graphics::install();
@@ -128,6 +136,7 @@ pub fn bootstrap() {
         // Last of the controls (text fields and labels included): a cell
         // forwards what its control implements.
         cell::install();
+        hitheme::install();
         input_context::install();
         opengl::install();
         darwin::idle::on_idle(opengl::going_idle);
@@ -135,6 +144,7 @@ pub fn bootstrap() {
         pasteboard::install();
         nsevent::install();
         monitor::install();
+        status::install();
     });
 }
 
@@ -213,11 +223,17 @@ exports::exports! {
         "CGEventPost" => cgevent::CGEventPost,
         "CGGetLastMouseDelta" => cgevent::CGGetLastMouseDelta,
         "CGEventSourceFlagsState" => cgevent::CGEventSourceFlagsState,
+        "CGEventSourceCounterForEventType" => cgevent::CGEventSourceCounterForEventType,
+        "CGEventTapCreate" => cgevent::CGEventTapCreate,
         "CGDisplayModeCopyPixelEncoding" => screen::CGDisplayModeCopyPixelEncoding,
         "CGColorSpaceCreateWithName" => graphics::CGColorSpaceCreateWithName,
         "CGColorSpaceCreateDeviceRGB" => graphics::CGColorSpaceCreateDeviceRGB,
         "CGDisplayCopyColorSpace" => graphics::CGDisplayCopyColorSpace,
         "CGColorSpaceCopyICCData" => graphics::CGColorSpaceCopyICCData,
+        "CGColorSpaceCreateDeviceGray" => graphics::CGColorSpaceCreateDeviceGray,
+        "CGColorSpaceCreateWithPlatformColorSpace" => graphics::CGColorSpaceCreateWithPlatformColorSpace,
+        "CGColorSpaceCreatePattern" => graphics::CGColorSpaceCreatePattern,
+        "CGColorSpaceGetNumberOfComponents" => graphics::CGColorSpaceGetNumberOfComponents,
         "CGColorSpaceRelease" => graphics::CGColorSpaceRelease,
         "CGColorSpaceGetName" => graphics::CGColorSpaceGetName,
         "CGColorSpaceCopyName" => graphics::CGColorSpaceCopyName,
@@ -227,7 +243,6 @@ exports::exports! {
         "AXIsProcessTrusted" => accessibility::AXIsProcessTrusted,
         "UAZoomEnabled" => accessibility::UAZoomEnabled,
         "AXIsProcessTrustedWithOptions" => accessibility::AXIsProcessTrustedWithOptions,
-        "CGEventTapCreate" => accessibility::CGEventTapCreate,
         "CGEventTapEnable" => accessibility::CGEventTapEnable,
         "CGEventGetIntegerValueField" => accessibility::CGEventGetIntegerValueField,
         "CGPreflightScreenCaptureAccess" => accessibility::CGPreflightScreenCaptureAccess,
@@ -235,6 +250,9 @@ exports::exports! {
         "CGFontRenderingGetFontSmoothingDisabled" => accessibility::CGFontRenderingGetFontSmoothingDisabled,
         "CGDataProviderRelease" => graphics::CGDataProviderRelease,
         "CGImageCreate" => graphics::CGImageCreate,
+        "CGImageMaskCreate" => graphics::CGImageMaskCreate,
+        "CGImageCreateWithImageInRect" => graphics::CGImageCreateWithImageInRect,
+        "CGImageCreateWithPNGDataProvider" => graphics::CGImageCreateWithPNGDataProvider,
         "CGImageCreateCopyWithColorSpace" => graphics::CGImageCreateCopyWithColorSpace,
         "CGImageRetain" => graphics::CGImageRetain,
         "CGImageRelease" => graphics::CGImageRelease,
@@ -258,12 +276,21 @@ exports::exports! {
         "NSUnionRect" => geometry::NSUnionRect,
         "NSMouseInRect" => geometry::NSMouseInRect,
         "NSInsetRect" => geometry::NSInsetRect,
+        "NSIntersectionRect" => geometry::NSIntersectionRect,
+        "NSOffsetRect" => geometry::NSOffsetRect,
+        "CGRectInset" => geometry::CGRectInset,
+        "CGRectOffset" => geometry::CGRectOffset,
+        "CGRectIntegral" => geometry::CGRectIntegral,
+        "CGRectIsEmpty" => geometry::CGRectIsEmpty,
+        // FIXME (PORTABILITY): this needs to be ported to macOS
+        #[cfg(not(target_os = "macos"))]
+        "NSDefaultMallocZone" => darwin::malloc::malloc_default_zone,
         "NSRectFill" => color::NSRectFill,
         "NSDrawNinePartImage" => image::NSDrawNinePartImage,
         "NSDisableScreenUpdates" => geometry::NSDisableScreenUpdates,
         "NSEnableScreenUpdates" => geometry::NSEnableScreenUpdates,
         "CGRectEqualToRect" | "NSEqualRects" => geometry::CGRectEqualToRect,
-        "GetCurrentKeyModifiers" => keymap::GetCurrentKeyModifiers,
+        "GetCurrentKeyModifiers" | "GetCurrentEventKeyModifiers" => keymap::GetCurrentKeyModifiers,
         "TISCopyCurrentKeyboardInputSource" => textinput::TISCopyCurrentKeyboardInputSource,
         "TISCopyInputMethodKeyboardLayoutOverride" => textinput::TISCopyInputMethodKeyboardLayoutOverride,
         "TISCopyCurrentKeyboardLayoutInputSource" => textinput::TISCopyCurrentKeyboardLayoutInputSource,
@@ -308,7 +335,12 @@ exports::exports! {
     groups {
         pasteboard_manager,
         coretext,
+        cgfont,
+        hitheme,
+        launchservices,
         cgcontext,
+        cgpath,
+        cgpaint,
         cgl,
     }
 }
@@ -341,6 +373,10 @@ pub fn data_symbols() -> Vec<(String, u64)> {
     ]));
     out.extend(cgcontext::data_symbols());
     out.push(("_NSApp".to_string(), ns_app_cell()));
+    out.push((
+        "_CATransform3DIdentity".to_string(),
+        &coreanimation::TRANSFORM_IDENTITY as *const _ as usize as u64,
+    ));
     out.push((
         "_CGAffineTransformIdentity".to_string(),
         CG_AFFINE_TRANSFORM_IDENTITY.as_ptr() as usize as u64,
@@ -394,6 +430,14 @@ pub fn data_symbols() -> Vec<(String, u64)> {
 /// next instruction dereferences it. A name nothing posts is a gap; a name
 /// nothing defines is a segfault at address zero.
 pub const NOTIFICATION_NAMES: &[&str] = &[
+    // Names may be observed even where the corresponding host events are not
+    // yet forwarded. Data imports must still resolve to valid string cells.
+    "NSWorkspaceAccessibilityDisplayOptionsDidChangeNotification",
+    "NSWorkspaceActiveSpaceDidChangeNotification",
+    "NSWorkspaceDidActivateApplicationNotification",
+    "NSMenuDidBeginTrackingNotification",
+    "NSMenuDidEndTrackingNotification",
+    "NSApplicationDidHideNotification",
     application::WILL_FINISH_LAUNCHING,
     application::DID_FINISH_LAUNCHING,
     application::WILL_TERMINATE,
@@ -421,6 +465,10 @@ pub const NOTIFICATION_NAMES: &[&str] = &[
     text::DID_CHANGE_SELECTION,
     text::CONTROL_DID_CHANGE,
     application::DID_CHANGE_SCREEN_PARAMETERS,
+    monitor::COLOR_SPACE_DID_CHANGE,
+    workspace::WILL_POWER_OFF,
+    workspace::SESSION_DID_BECOME_ACTIVE,
+    workspace::SESSION_DID_RESIGN_ACTIVE,
     workspace::WILL_SLEEP,
     workspace::DID_WAKE,
     workspace::SCREENS_DID_SLEEP,
@@ -442,6 +490,11 @@ pub const NOTIFICATION_NAMES: &[&str] = &[
     "NSWindowWillMiniaturizeNotification",
     "NSWindowWillMoveNotification",
     "NSWindowDidChangeOcclusionStateNotification",
+    // Observed by Gecko's widget layer; no tint change, menu action broadcast
+    // or global frame tracking posts them here.
+    "NSControlTintDidChangeNotification",
+    "NSMenuWillSendActionNotification",
+    "NSViewGlobalFrameDidChangeNotification",
 ];
 
 /// The other AppKit string globals a program reads.
@@ -450,6 +503,10 @@ pub const NOTIFICATION_NAMES: &[&str] = &[
 /// space and an attribute key are compared against by string, so publishing the
 /// documented value is exact.
 pub const STRING_GLOBALS: &[(&str, &str)] = &[
+    (
+        "_NSApplicationLaunchUserNotificationKey",
+        "NSApplicationLaunchUserNotificationKey",
+    ),
     ("_kCAMediaTimingFunctionLinear", coreanimation::LINEAR),
     ("_kCAMediaTimingFunctionEaseIn", coreanimation::EASE_IN),
     ("_kCAMediaTimingFunctionEaseOut", coreanimation::EASE_OUT),
@@ -481,6 +538,29 @@ pub const STRING_GLOBALS: &[(&str, &str)] = &[
         "_NSWorkspaceLaunchConfigurationArchitecture",
         workspace::LAUNCH_ARCHITECTURE,
     ),
+    ("_NSDeviceIsScreen", "NSDeviceIsScreen"),
+    ("_NSDragPboard", "Apple CFPasteboard drag"),
+    ("_NSEventTrackingRunLoopMode", "NSEventTrackingRunLoopMode"),
+    ("_NSPrintPanelAccessorySummaryItemNameKey", "name"),
+    (
+        "_NSPrintPanelAccessorySummaryItemDescriptionKey",
+        "description",
+    ),
+    ("_kCATransactionAnimationDuration", "animationDuration"),
+    ("_kCATransactionDisableActions", "disableActions"),
+    ("_kCGColorSpaceGenericRGB", "kCGColorSpaceGenericRGB"),
+    (
+        "_kCGImageSourceShouldAllowFloat",
+        "kCGImageSourceShouldAllowFloat",
+    ),
+    (
+        "_kCGImageSourceTypeIdentifierHint",
+        "kCGImageSourceTypeIdentifierHint",
+    ),
+    ("_kUTTypeData", "public.data"),
+    ("_kUTTagClassNSPboardType", "com.apple.nspboard-type"),
+    ("_kUTTypePNG", "public.png"),
+    ("_kLSItemDisplayName", "LSItemDisplayName"),
     // Dragged files arrive as this type; the guest compares pasteboard types to it.
     ("_kUTTypeFileURL", "public.file-url"),
     // SDL's clipboard offers text under this type and maps MIME types through
@@ -678,6 +758,47 @@ mod tests {
             "{}",
             class.name_str()
         );
+    }
+
+    #[test]
+    fn transform_identity_exports_the_matrix_inline() {
+        let symbols = data_symbols();
+        let (_, address) = symbols.iter()
+            .find(|(name, _)| name == "_CATransform3DIdentity")
+            .expect("identity matrix is exported");
+        // SAFETY: the symbol points to the process-lifetime 16-double matrix.
+        let matrix = unsafe { &*(*address as *const [f64; 16]) };
+        for (index, value) in matrix.iter().enumerate() {
+            assert_eq!(*value, if index % 5 == 0 { 1.0 } else { 0.0 });
+        }
+    }
+
+    #[test]
+    fn screen_and_workspace_notifications_export_string_cells() {
+        let symbols = data_symbols();
+        for name in [
+            "NSScreenColorSpaceDidChangeNotification",
+            "NSWorkspaceAccessibilityDisplayOptionsDidChangeNotification",
+            "NSWorkspaceActiveSpaceDidChangeNotification",
+            "NSWorkspaceDidActivateApplicationNotification",
+            "NSMenuDidBeginTrackingNotification",
+            "NSMenuDidEndTrackingNotification",
+            "NSApplicationDidHideNotification",
+            "NSApplicationLaunchUserNotificationKey",
+            "NSWorkspaceWillPowerOffNotification",
+            "NSWorkspaceSessionDidBecomeActiveNotification",
+            "NSWorkspaceSessionDidResignActiveNotification",
+        ] {
+            let symbol = format!("_{name}");
+            let (_, cell) = symbols
+                .iter()
+                .find(|(n, _)| n == &symbol)
+                .expect("published");
+            // SAFETY: data_symbols publishes process-lifetime string cells.
+            let object = unsafe { *(*cell as *const objc::object::Id) };
+            assert!(!object.is_null());
+            assert_eq!(unsafe { foundation::string::bytes(object) }, name.as_bytes());
+        }
     }
 
     #[test]

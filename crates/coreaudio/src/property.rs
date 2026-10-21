@@ -449,6 +449,50 @@ unsafe fn set(
     }
 }
 
+/// Query the size and mutability of properties implemented by this unit.
+///
+/// # Safety
+/// Both output pointers may be null; otherwise they must be writable.
+pub unsafe extern "C" fn AudioUnitGetPropertyInfo(
+    handle: *mut c_void,
+    id: u32,
+    scope: u32,
+    element: u32,
+    size: *mut u32,
+    writable: *mut u8,
+) -> i32 {
+    if crate::unit_for(handle).is_none() {
+        return unsafe {
+            crate::foreign::get_property_info(handle, id, scope, element, size, writable)
+        }
+        .unwrap_or(INVALID_COMPONENT);
+    }
+    let mut bytes = 0;
+    // Use the same size query as GetProperty, preserving unsupported-property
+    // errors rather than advertising a layout the getter cannot supply.
+    let status = unsafe {
+        AudioUnitGetProperty(handle, id, scope, element, std::ptr::null_mut(), &mut bytes)
+    };
+    if status == SUCCESS {
+        unsafe {
+            if !size.is_null() {
+                size.write(bytes);
+            }
+            if !writable.is_null() {
+                writable.write(u8::from(matches!(
+                    id,
+                    STREAM_FORMAT
+                        | MAXIMUM_FRAMES_PER_SLICE
+                        | ENABLE_IO
+                        | CURRENT_DEVICE
+                        | MATRIX_LEVELS
+                )));
+            }
+        }
+    }
+    status
+}
+
 /// `OSStatus AudioUnitGetProperty(AudioUnit, AudioUnitPropertyID,
 /// AudioUnitScope, AudioUnitElement, void *outData, UInt32 *ioDataSize)`
 ///
@@ -556,6 +600,44 @@ pub unsafe extern "C" fn AudioUnitGetProperty(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn property_info_matches_reads_and_preserves_outputs_on_error() {
+        let handle = unit();
+        unsafe {
+            let mut size = 0;
+            let mut writable = 0;
+            assert_eq!(
+                AudioUnitGetPropertyInfo(handle, STREAM_FORMAT, 1, 0, &mut size, &mut writable),
+                SUCCESS
+            );
+            assert_eq!(size as usize, size_of::<Format>());
+            assert_eq!(writable, 1);
+            assert_eq!(
+                AudioUnitGetPropertyInfo(handle, HAS_IO, 2, 0, &mut size, &mut writable),
+                SUCCESS
+            );
+            assert_eq!(size, 4);
+            assert_eq!(writable, 0);
+            assert_eq!(
+                AudioUnitGetPropertyInfo(handle, u32::MAX, 0, 0, &mut size, &mut writable),
+                INVALID_PROPERTY
+            );
+            assert_eq!((size, writable), (4, 0));
+            assert_eq!(
+                AudioUnitGetPropertyInfo(
+                    handle,
+                    STREAM_FORMAT,
+                    1,
+                    0,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut()
+                ),
+                SUCCESS
+            );
+            crate::AudioComponentInstanceDispose(handle);
+        }
+    }
 
     fn unit() -> *mut c_void {
         let mut handle = std::ptr::null_mut();

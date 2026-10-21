@@ -127,6 +127,13 @@ unsafe extern "C" fn zero(_receiver: Id, _sel: Sel) -> isize {
     0
 }
 
+/// `-_eventRef`: the Carbon `EventRef` behind the event. AppKit answers NULL
+/// for an event no Carbon event backs, and none does here (`ReceiveNextEvent`
+/// never yields one), so callers get the NULL they already have to handle.
+unsafe extern "C" fn event_ref(_receiver: Id, _sel: Sel) -> *mut c_void {
+    std::ptr::null_mut()
+}
+
 unsafe extern "C" fn zero_double(_receiver: Id, _sel: Sel) -> CGFloat {
     0.0
 }
@@ -517,6 +524,7 @@ pub(crate) fn install() {
         "data2" => data2, c"q16@0:8";
         "trackingArea" => tracking_area, c"@16@0:8";
         "userData" => user_data, c"^v16@0:8";
+        "_eventRef" => event_ref, c"^v16@0:8";
         // `-magnification` is the pinch gesture's, and SDL delivers no pinch.
         "magnification" => zero_double, c"d16@0:8";
         "deltaZ" => zero_double, c"d16@0:8";
@@ -579,6 +587,26 @@ mod tests {
         assert_eq!(copy, event);
         assert_eq!(objc::arc::retain_count(event), before + 1);
         objc::arc::release(copy);
+    }
+
+    /// No Carbon event backs an event here, so `-_eventRef` is NULL for every
+    /// kind, and it is dispatched through the runtime rather than called.
+    #[test]
+    fn an_event_has_no_carbon_event_ref() {
+        crate::bootstrap();
+        for kind in [kind::KEY_DOWN, kind::LEFT_MOUSE_DOWN, kind::SCROLL_WHEEL] {
+            let event = make(Fields {
+                kind,
+                ..Fields::default()
+            });
+            // SAFETY: `-_eventRef` is `void *(id, SEL)`.
+            let reference = unsafe {
+                let f: unsafe extern "C" fn(Id, Sel) -> *mut c_void =
+                    std::mem::transmute(objc::msg::entry());
+                f(event, objc::sel::get("_eventRef"))
+            };
+            assert!(reference.is_null());
+        }
     }
 
     /// A receiver that is not an event answers zero rather than reading a field

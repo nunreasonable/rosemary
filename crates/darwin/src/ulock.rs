@@ -5,6 +5,8 @@
 use std::ffi::c_void;
 use std::sync::atomic::AtomicU32;
 
+use rustix::time::ClockId;
+
 use crate::wait_word::{self, Scope, WakeCount};
 
 /// The operation, in the low byte of the first argument. From `<sys/ulock.h>`.
@@ -225,15 +227,9 @@ pub unsafe extern "C" fn wake(operation: u32, addr: *mut c_void, _wake_value: u6
     }
 }
 
+#[inline]
 fn monotonic_nanoseconds() -> u64 {
-    let mut now = libc::timespec {
-        tv_sec: 0,
-        tv_nsec: 0,
-    };
-    // SAFETY: a live `timespec`; failure leaves the zero initialiser intact.
-    if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut now) } != 0 {
-        return 0;
-    }
+    let now = rustix::time::clock_gettime(ClockId::Monotonic);
     (now.tv_sec as u64)
         .saturating_mul(1_000_000_000)
         .saturating_add(now.tv_nsec as u64)

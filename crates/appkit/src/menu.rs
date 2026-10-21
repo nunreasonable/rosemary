@@ -601,6 +601,12 @@ unsafe extern "C" fn zero_width(_receiver: Id, _sel: Sel) -> f64 {
 unsafe extern "C" fn ignored_flag(_receiver: Id, _sel: Sel, _flag: u8) {}
 
 unsafe extern "C" fn ignored_padding(_receiver: Id, _sel: Sel, _padding: u8, _edge: u64) {}
+/// `-menuBarHeight`: zero, because menus are shown in each window's chrome and
+/// nothing is reserved across the top of the screen - which `-visibleFrame`
+/// already says by not subtracting a menu bar.
+unsafe extern "C" fn menu_bar_height(_receiver: Id, _sel: Sel) -> f64 {
+    0.0
+}
 
 pub(crate) fn install() {
     let menu = objc::class::lookup(c"NSMenu").expect("declared before its methods");
@@ -615,6 +621,7 @@ pub(crate) fn install() {
         "itemArray" => menu_items, c"@16@0:8";
         "setItemArray:" => set_menu_items, c"v24@0:8@16";
         "numberOfItems" => number_of_items, c"q16@0:8";
+        "menuBarHeight" => menu_bar_height, c"d16@0:8";
         "itemAtIndex:" => item_at_index, c"@24@0:8q16";
         "addItem:" => add_item, c"v24@0:8@16";
         "insertItem:atIndex:" => insert_item, c"v32@0:8@16q24";

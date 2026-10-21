@@ -7,7 +7,7 @@ use objc::sel::Sel;
 use crate::define::{class_methods, methods};
 
 /// Seconds between Apple's epoch, 2001-01-01, and the Unix one.
-const UNIX_TO_REFERENCE: f64 = 978_307_200.0;
+pub(crate) const UNIX_TO_REFERENCE: f64 = 978_307_200.0;
 
 #[repr(C)]
 pub struct Date {
@@ -579,6 +579,22 @@ unsafe extern "C" fn add_timer_for_mode(receiver: Id, _sel: Sel, timer: Id, _mod
     }
 }
 
+/// `-getCFRunLoop`: the loop every method here acts on.
+
+
+/// `-currentMode`: nil when the loop is not running.
+unsafe extern "C" fn current_mode(receiver: Id, _sel: Sel) -> Id {
+    // SAFETY: the main loop, which is what every method here acts on.
+    let mode = unsafe {
+        corefoundation::api::CFRunLoopCopyCurrentMode(Arc::as_ptr(&loop_of(receiver)) as _)
+    };
+    if mode.is_null() {
+        return std::ptr::null_mut();
+    }
+    // SAFETY: a fresh string this call owns.
+    unsafe { corefoundation::api::CFAutorelease(mode) as Id }
+}
+
 /// `-runMode:beforeDate:`, which is `CFRunLoopRunInMode` under another name.
 unsafe extern "C" fn run_mode_before_date(receiver: Id, _sel: Sel, _mode: Id, limit: Id) -> u8 {
     let seconds = match limit.is_null() {
@@ -672,6 +688,8 @@ pub(crate) fn install() {
         "performSelector:target:argument:order:modes:" => perform_selector_on_loop, c"v56@0:8:16@24@32Q40@48";
         "cancelPerformSelector:target:argument:" => cancel_perform_selector, c"v40@0:8:16@24@32";
         "runUntilDate:" => run_until_date, c"v24@0:8@16";
+        "getCFRunLoop" => get_cf_run_loop, c"^v16@0:8";
+        "currentMode" => current_mode, c"@16@0:8";
     });
 }
 

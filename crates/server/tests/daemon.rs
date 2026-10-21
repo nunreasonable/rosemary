@@ -7,6 +7,7 @@ use server::client::Client;
 use server::daemon::{self, Options, Outcome};
 use server::location;
 use server::protocol::{Checkin, Reply, Request, State, VERSION};
+use server::task::{CHUNK, Completion, TaskOp, TaskOutcome};
 
 /// Held by every test here. A test that forks hands its child a copy of every
 /// socket the process has open, other tests' among them, and a connection a
@@ -142,6 +143,164 @@ fn a_forked_child_is_listed_under_its_parent_and_dropped_once_collected() {
     drop(parent);
     assert!(matches!(server.join().unwrap(), Outcome::Finished));
     assert!(!socket.exists(), "the socket outlived its server");
+}
+
+/// A guest that answers its work by polling, as the signal handler in
+/// `darwin::mach::service` does when signalled: every read comes back as
+/// `fill`, until `reads` bytes have been asked for.
+fn serve_reads(socket: &Path, fill: u8, reads: u64, ready: i32, go: i32) -> bool {
+    let Ok(mut client) = Client::connect(socket) else {
+        return false;
+    };
+    let checkin = Request::Checkin(Checkin {
+        version: VERSION,
+        pid: starnix::process::me(),
+        path: "/usr/bin/target".into(),
+        serviceable: true,
+        ..Checkin::default()
+    });
+    let Ok(Reply::CheckedIn { image, .. }) = client.call(&checkin) else {
+        return false;
+    };
+    let Ok(mut service) = Client::connect(socket) else {
+        return false;
+    };
+    if !matches!(service.call(&Request::Serve { image }), Ok(Reply::Done)) {
+        return false;
+    }
+    unsafe { libc::write(ready, [1u8].as_ptr().cast(), 1) };
+    let mut served = 0;
+    while served < reads {
+        let Ok(Reply::Work(works)) = service.call(&Request::Fetch) else {
+            return false;
+        };
+        if works.is_empty() {
+            std::thread::sleep(Duration::from_millis(2));
+            continue;
+        }
+        let completions = works
+            .into_iter()
+            .map(|work| {
+                let outcome = match work.op {
+                    TaskOp::Read { size, .. } => {
+                        served += size;
+                        TaskOutcome::Data(vec![fill; size as usize])
+                    }
+                    _ => TaskOutcome::Failed(4),
+                };
+                Completion {
+                    id: work.id,
+                    outcome,
+                }
+            })
+            .collect();
+        if !matches!(
+            service.call(&Request::Complete(completions)),
+            Ok(Reply::Done)
+        ) {
+            return false;
+        }
+    }
+    let mut byte = 0u8;
+    unsafe { libc::read(go, (&raw mut byte).cast(), 1) };
+    true
+}
+
+#[test]
+fn a_task_answers_through_the_server_until_it_is_gone() {
+    let _serial = serial();
+    let directory = scratch("task");
+    let server = start(&directory, Duration::from_millis(50));
+    let socket = location::socket_in(&directory);
+
+    let mut parent = Client::connect(&socket).unwrap();
+    assert!(matches!(
+        parent.call(&checkin("/bin/parent")).unwrap(),
+        Reply::CheckedIn { .. }
+    ));
+
+    let mut go = [0i32; 2];
+    let mut ready = [0i32; 2];
+    unsafe {
+        assert_eq!(libc::pipe(go.as_mut_ptr()), 0);
+        assert_eq!(libc::pipe(ready.as_mut_ptr()), 0);
+    }
+    let size = CHUNK as u64 + 100;
+    // SAFETY: the child talks to the server and exits without unwinding.
+    let child = unsafe { libc::fork() };
+    if child == 0 {
+        // Its handler is not installed here, and the signal's default action
+        // would end it.
+        if let Some(signal) = server::task::signal() {
+            unsafe {
+                let mut set: libc::sigset_t = std::mem::zeroed();
+                libc::sigemptyset(&mut set);
+                libc::sigaddset(&mut set, signal);
+                libc::sigprocmask(libc::SIG_BLOCK, &set, std::ptr::null_mut());
+            }
+        }
+        let ok = serve_reads(&socket, 0xab, size, ready[1], go[0]);
+        unsafe { libc::_exit(if ok { 0 } else { 1 }) };
+    }
+    let mut byte = 0u8;
+    assert_eq!(
+        unsafe { libc::read(ready[0], (&raw mut byte).cast(), 1) },
+        1
+    );
+
+    let image = match parent.call(&Request::Process { pid: child }).unwrap() {
+        Reply::Process(Some(process)) => process.image,
+        other => panic!("{other:?}"),
+    };
+    // Another image of the pid is a task that no longer exists.
+    let stale = Request::Task {
+        pid: child,
+        image: image + 1000,
+        op: TaskOp::Read {
+            address: 0,
+            size: 1,
+        },
+    };
+    assert!(matches!(
+        parent.call(&stale).unwrap(),
+        Reply::Task(TaskOutcome::Gone)
+    ));
+    // A read bigger than a chunk is split, and comes back whole.
+    let read = Request::Task {
+        pid: child,
+        image,
+        op: TaskOp::Read {
+            address: 0x1000,
+            size,
+        },
+    };
+    match parent.call(&read).unwrap() {
+        Reply::Task(TaskOutcome::Data(bytes)) => {
+            assert_eq!(bytes.len() as u64, size);
+            assert!(bytes.iter().all(|byte| *byte == 0xab));
+        }
+        other => panic!("{other:?}"),
+    }
+
+    unsafe { libc::write(go[1], [1u8].as_ptr().cast(), 1) };
+    let mut status = 0;
+    unsafe { libc::waitpid(child, &mut status, 0) };
+    assert!(libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0);
+    let read = Request::Task {
+        pid: child,
+        image,
+        op: TaskOp::Read {
+            address: 0x1000,
+            size: 1,
+        },
+    };
+    assert!(matches!(
+        parent.call(&read).unwrap(),
+        Reply::Task(TaskOutcome::Gone)
+    ));
+
+    drop(parent);
+    assert!(matches!(server.join().unwrap(), Outcome::Finished));
 }
 
 #[test]

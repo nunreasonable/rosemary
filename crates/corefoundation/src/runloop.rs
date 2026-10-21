@@ -231,6 +231,10 @@ pub struct RunLoop {
     /// Set while the loop is asleep, for `CFRunLoopIsWaiting`. A caller asks it
     /// from *another* thread to decide whether it needs to wake this one.
     waiting: AtomicBool,
+    /// The modes of the runs in progress, innermost last: a modal or tracking
+    /// loop runs inside the default one, and `CFRunLoopCopyCurrentMode` names
+    /// the inner.
+    running: Mutex<Vec<String>>,
 }
 
 pub const DEFAULT_MODE: &str = "kCFRunLoopDefaultMode";
@@ -254,7 +258,18 @@ impl RunLoop {
             stopped: AtomicBool::new(false),
             waker: (Mutex::new(false), Condvar::new()),
             waiting: AtomicBool::new(false),
+            running: Mutex::new(Vec::new()),
         }
+    }
+
+    /// The mode the innermost run in progress is in, or `None` when the loop
+    /// is not running.
+    pub fn current_mode(&self) -> Option<String> {
+        self.running
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .last()
+            .cloned()
     }
 
     /// The modes a name refers to: itself, or the common set for the alias.
@@ -521,6 +536,18 @@ impl RunLoop {
 
     /// Run `mode` for at most `seconds`, as `CFRunLoopRunInMode` does.
     pub fn run_in_mode(&self, mode: &str, seconds: f64, return_after_source: bool) -> i32 {
+        /// Pops the mode [`RunLoop::run_in_mode`] pushed, on every way out.
+        struct Running<'a>(&'a Mutex<Vec<String>>);
+        impl Drop for Running<'_> {
+            fn drop(&mut self) {
+                self.0.lock().unwrap_or_else(|e| e.into_inner()).pop();
+            }
+        }
+        self.running
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(mode.to_string());
+        let _running = Running(&self.running);
         self.stopped.store(false, Ordering::Release);
         self.observe(mode, activity::ENTRY);
         let deadline = match seconds.is_finite() && seconds >= 0.0 {

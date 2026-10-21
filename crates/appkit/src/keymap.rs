@@ -228,21 +228,198 @@ static VIRTUAL_KEYS: &[(u32, u16)] = &[
 /// know it would be a bug with nothing to say so.
 pub const UNKNOWN: u16 = 0xFFFF;
 
-fn swapping() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("ROSEMARY_SWAP_CTRL_CMD").is_some_and(|v| v != "0"))
+/// `ROSEMARY_COMMAND_KEY`: `<key>[+ctrl:<keys>]`. `<key>` is the host key the
+/// guest sees as Command - `super` (the default), `ctrl` or `alt` - and Super
+/// takes over the role it had, so the guest never loses a modifier. `+ctrl:`
+/// lets Control stand in for Command in chords with `<keys>` only, which is
+/// `edit` (A, C, V, X, Y and Z) or a run of letters and digits.
+pub const COMMAND_KEY_ENV: &str = "ROSEMARY_COMMAND_KEY";
+
+/// The published spelling of `ROSEMARY_COMMAND_KEY=ctrl`, still honoured when
+/// the new variable is unset so that existing setups keep working.
+const SWAP_CTRL_CMD_ENV: &str = "ROSEMARY_SWAP_CTRL_CMD";
+
+/// `ROSEMARY_CONTROL_EDIT_KEYS=1`: shorthand for
+/// `ROSEMARY_COMMAND_KEY=super+ctrl:edit`, when that is unset.
+pub const CONTROL_EDIT_KEYS_ENV: &str = "ROSEMARY_CONTROL_EDIT_KEYS";
+
+/// A host modifier key, both sides.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HostKey {
+    Ctrl,
+    Alt,
+    Super,
 }
 
-fn swap_ctrl_cmd(sdl_modifiers: u16) -> u16 {
-    if edit_chord() != 0 {
-        return control_as_command(sdl_modifiers);
+impl HostKey {
+    const ALL: [HostKey; 3] = [HostKey::Ctrl, HostKey::Alt, HostKey::Super];
+
+    /// The `SDL_Keymod` bits of both sides.
+    fn bits(self) -> u16 {
+        match self {
+            HostKey::Ctrl => keymod::CTRL,
+            HostKey::Alt => keymod::ALT,
+            HostKey::Super => keymod::GUI,
+        }
     }
-    if !swapping() {
-        return sdl_modifiers;
+
+    fn scancodes(self) -> [u32; 2] {
+        match self {
+            HostKey::Ctrl => [scancode::LCTRL, scancode::RCTRL],
+            HostKey::Alt => [scancode::LALT, scancode::RALT],
+            HostKey::Super => [scancode::LGUI, scancode::RGUI],
+        }
     }
-    let ctrl = sdl_modifiers & keymod::CTRL;
-    let gui = sdl_modifiers & keymod::GUI;
-    (sdl_modifiers & !(ctrl | gui)) | (ctrl << 4) | (gui >> 4)
+}
+
+/// The parsed `ROSEMARY_COMMAND_KEY`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CommandKey {
+    /// The host key reported as Command.
+    pub key: HostKey,
+    /// One bit per scancode whose Control chord is reported as Command; zero
+    /// for none. Every such scancode is below 64.
+    pub control_keys: u64,
+}
+
+/// The `edit` preset's letters: select all, copy, paste, cut, redo and undo.
+const EDIT_KEYS: &str = "acvxyz";
+
+impl CommandKey {
+    pub const DEFAULT: CommandKey = CommandKey {
+        key: HostKey::Super,
+        control_keys: 0,
+    };
+
+    /// `None` for a value this does not recognise.
+    pub fn parse(value: &str) -> Option<CommandKey> {
+        let value = value.trim().to_ascii_lowercase();
+        let (key, stand_in) = match value.split_once('+') {
+            Some((key, stand_in)) => (key.trim(), Some(stand_in.trim())),
+            None => (value.as_str(), None),
+        };
+        let key = match key {
+            "super" => HostKey::Super,
+            "ctrl" => HostKey::Ctrl,
+            "alt" => HostKey::Alt,
+            _ => return None,
+        };
+        let control_keys = match stand_in {
+            None => 0,
+            // Control is Command already; standing it in again means nothing.
+            Some(_) if key == HostKey::Ctrl => return None,
+            Some(stand_in) => match stand_in.strip_prefix("ctrl:")?.trim() {
+                "edit" => edit_mask(),
+                keys => key_mask(keys)?,
+            },
+        };
+        Some(CommandKey { key, control_keys })
+    }
+
+    /// The role `host` plays for the guest, named by the host key that plays
+    /// it when nothing is remapped: Ctrl is Control, Alt Option, Super Command.
+    fn role(self, host: HostKey) -> HostKey {
+        match host {
+            _ if host == self.key => HostKey::Super,
+            HostKey::Super => self.key,
+            _ => host,
+        }
+    }
+
+    /// Host `SDL_Keymod` bits as the guest's: each modifier moved to the bits
+    /// of the role it plays, side for side.
+    fn remap(self, sdl_modifiers: u16) -> u16 {
+        let all = keymod::CTRL | keymod::ALT | keymod::GUI;
+        HostKey::ALL
+            .into_iter()
+            .fold(sdl_modifiers & !all, |out, host| {
+                let held = (sdl_modifiers & host.bits()) >> host.bits().trailing_zeros();
+                out | held << self.role(host).bits().trailing_zeros()
+            })
+    }
+
+    /// A host modifier key's scancode as the guest's: the key of its role, on
+    /// the same side.
+    fn remap_scancode(self, code: u32) -> u32 {
+        for host in HostKey::ALL {
+            if let Some(side) = host.scancodes().iter().position(|s| *s == code) {
+                return self.role(host).scancodes()[side];
+            }
+        }
+        code
+    }
+}
+
+/// One bit per scancode for a run of letters and digits; `None` for an empty
+/// run or one with anything else in it.
+fn key_mask(keys: &str) -> Option<u64> {
+    if keys.is_empty() {
+        return None;
+    }
+    keys.chars().try_fold(0u64, |mask, c| {
+        let code = match c {
+            'a'..='z' => scancode::A + (c as u32 - 'a' as u32),
+            '1'..='9' => scancode::KEY_1 + (c as u32 - '1' as u32),
+            '0' => scancode::KEY_0,
+            _ => return None,
+        };
+        Some(mask | 1 << code)
+    })
+}
+
+/// The configuration the variables ask for: `ROSEMARY_COMMAND_KEY`'s value,
+/// else the swap, else the editing preset. An unrecognised value is the
+/// default, with a warning.
+fn command_key_from(value: Option<&str>, swap: bool, edit_keys: bool) -> CommandKey {
+    if let Some(value) = value.filter(|v| !v.trim().is_empty()) {
+        return CommandKey::parse(value).unwrap_or_else(|| {
+            eprintln!(
+                "rosemary: appkit: {COMMAND_KEY_ENV}={value} is not recognised; using the default"
+            );
+            CommandKey::DEFAULT
+        });
+    }
+    match swap {
+        true => {
+            eprintln!(
+                "rosemary: appkit: {SWAP_CTRL_CMD_ENV} is deprecated; use {COMMAND_KEY_ENV}=ctrl"
+            );
+            CommandKey {
+                key: HostKey::Ctrl,
+                ..CommandKey::DEFAULT
+            }
+        }
+        false => CommandKey {
+            control_keys: if edit_keys { edit_mask() } else { 0 },
+            ..CommandKey::DEFAULT
+        },
+    }
+}
+
+fn edit_mask() -> u64 {
+    key_mask(EDIT_KEYS).unwrap_or_default()
+}
+
+pub fn command_key() -> CommandKey {
+    static KEY: std::sync::OnceLock<CommandKey> = std::sync::OnceLock::new();
+    *KEY.get_or_init(|| {
+        command_key_from(
+            std::env::var(COMMAND_KEY_ENV).ok().as_deref(),
+            std::env::var_os(SWAP_CTRL_CMD_ENV).is_some_and(|v| v != "0"),
+            std::env::var_os(CONTROL_EDIT_KEYS_ENV).is_some_and(|v| v != "0"),
+        )
+    })
+}
+
+/// The modifiers the guest sees held, from the host's: the command key's
+/// remap, then an editing chord's Control as Command. A chord never runs
+/// with Control as the command key, so the remap leaves Control where it was.
+fn guest_modifiers(sdl_modifiers: u16) -> u16 {
+    let remapped = command_key().remap(sdl_modifiers);
+    match edit_chord() {
+        0 => remapped,
+        _ => control_as_command(remapped),
+    }
 }
 
 /// Each held Control reported as the Command on the same side.
@@ -251,36 +428,11 @@ fn control_as_command(sdl_modifiers: u16) -> u16 {
     (sdl_modifiers & !ctrl) | (ctrl << 4)
 }
 
-/// `ROSEMARY_CONTROL_EDIT_KEYS=1`: Control with A, C, V, X, Y or Z acts as
-/// Command, and Control stays Control everywhere else.
-///
-/// The narrow form of `ROSEMARY_SWAP_CTRL_CMD`, for a program that edits text
-/// with Command and also reads Control as a key of its own - a game that
-/// crouches on it, say. On a desktop that keeps Super's letter chords for
-/// itself, Command-V is otherwise unreachable.
-pub const CONTROL_EDIT_KEYS_ENV: &str = "ROSEMARY_CONTROL_EDIT_KEYS";
-
-fn control_edit_keys() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os(CONTROL_EDIT_KEYS_ENV).is_some_and(|v| v != "0"))
-}
-
-/// The letters whose Command chords are editing: select all, copy, paste, cut,
-/// redo and undo.
-const EDIT_KEYS: [u32; 6] = [
-    scancode::A,
-    scancode::C,
-    scancode::V,
-    scancode::X,
-    scancode::Y,
-    scancode::Z,
-];
-
 /// The Control sides (`SDL_Keymod` bits) being reported as Command, from the
-/// editing key that started the chord until Control is let go; zero outside
-/// one. Held across the chord rather than the one key, so that Control-A then
-/// Control-C is one selection and copy and not two Command presses with a
-/// Control press between them.
+/// key that started the chord until Control is let go; zero outside one. Held
+/// across the chord rather than the one key, so that Control-A then Control-C
+/// is one selection and copy and not two Command presses with a Control press
+/// between them.
 static EDIT_CHORD: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
 
 pub fn edit_chord() -> u16 {
@@ -291,9 +443,10 @@ pub fn set_edit_chord(sides: u16) {
     EDIT_CHORD.store(sides & keymod::CTRL, std::sync::atomic::Ordering::Relaxed);
 }
 
-/// An editing letter with Control and no other modifier but Shift.
-fn is_edit_chord_key(scancode: u32, sdl_modifiers: u16) -> bool {
-    EDIT_KEYS.contains(&scancode)
+/// A key from `keys` with Control and no other modifier but Shift.
+fn is_edit_chord_key(keys: u64, scancode: u32, sdl_modifiers: u16) -> bool {
+    scancode < 64
+        && keys & 1 << scancode != 0
         && sdl_modifiers & keymod::CTRL != 0
         && sdl_modifiers & (keymod::ALT | keymod::GUI) == 0
 }
@@ -304,9 +457,9 @@ fn is_edit_chord_key(scancode: u32, sdl_modifiers: u16) -> bool {
 pub enum ChordStep {
     /// Nothing: the event goes out as the chord already has it.
     Keep,
-    /// An editing key outside a chord: Control becomes Command first.
+    /// A chord key outside a chord: Control becomes Command first.
     Begin,
-    /// A key that is not an editing chord, pressed during one, or an event that
+    /// A key that is not a chord key, pressed during one, or an event that
     /// shows no Control held: Command goes back to Control (or is let go)
     /// first, so every other Control chord is left alone.
     Leave,
@@ -315,13 +468,13 @@ pub enum ChordStep {
     EndAfter,
 }
 
-/// [`ChordStep`] for a key event, given the chord's current sides. Pure, so
-/// the rules can be tested without the global state.
-fn chord_step(chord: u16, scancode: u32, sdl_modifiers: u16, down: bool) -> ChordStep {
+/// [`ChordStep`] for a key event, given the chord keys and the chord's
+/// current sides. Pure, so the rules can be tested without the global state.
+fn chord_step(keys: u64, chord: u16, scancode: u32, sdl_modifiers: u16, down: bool) -> ChordStep {
     let control_key = matches!(scancode, scancode::LCTRL | scancode::RCTRL);
     let control_held = sdl_modifiers & keymod::CTRL != 0;
     if chord == 0 {
-        return match down && is_edit_chord_key(scancode, sdl_modifiers) {
+        return match down && is_edit_chord_key(keys, scancode, sdl_modifiers) {
             true => ChordStep::Begin,
             false => ChordStep::Keep,
         };
@@ -333,7 +486,7 @@ fn chord_step(chord: u16, scancode: u32, sdl_modifiers: u16, down: bool) -> Chor
         // dialog, say - must not leave the next Control press as Command.
         (false, false) => ChordStep::Leave,
         (false, true) if down && !is_modifier(scancode) => {
-            match is_edit_chord_key(scancode, sdl_modifiers) {
+            match is_edit_chord_key(keys, scancode, sdl_modifiers) {
                 true => ChordStep::Keep,
                 false => ChordStep::Leave,
             }
@@ -343,12 +496,19 @@ fn chord_step(chord: u16, scancode: u32, sdl_modifiers: u16, down: bool) -> Chor
 }
 
 /// [`chord_step`] for this key event, or [`ChordStep::Keep`] when
-/// `ROSEMARY_CONTROL_EDIT_KEYS` is off.
+/// `ROSEMARY_COMMAND_KEY` names no Control chords.
 pub fn edit_chord_step(scancode: u32, sdl_modifiers: u16, down: bool) -> ChordStep {
-    if !control_edit_keys() || swapping() {
-        return ChordStep::Keep;
+    match command_key().control_keys {
+        0 => ChordStep::Keep,
+        keys => chord_step(keys, edit_chord(), scancode, sdl_modifiers, down),
     }
-    chord_step(edit_chord(), scancode, sdl_modifiers, down)
+}
+
+/// The flags of a chord's `-flagsChanged:`: `rest` held as the host reports
+/// it, with the Control sides `control` held as Control and `command` held as
+/// Command, whatever the chord's state.
+pub fn chord_flags(rest: u16, control: u16, command: u16) -> u64 {
+    flags_of(command_key().remap(rest) | control | control_as_command(command))
 }
 
 /// The Command an editing chord reports in place of Control on `side`.
@@ -368,21 +528,20 @@ pub fn chord_control(side: u16) -> u16 {
 }
 
 pub fn virtual_key(scancode: u32) -> u16 {
+    let scancode = guest_scancode(command_key(), edit_chord() != 0, scancode);
     VIRTUAL_KEYS
         .iter()
-        .find(|(sdl, _)| *sdl == chord_scancode(edit_chord() != 0, scancode))
+        .find(|(sdl, _)| *sdl == scancode)
         .map_or(UNKNOWN, |(_, vk)| *vk)
 }
 
 /// The scancode whose key code `scancode` is reported as. A chord moves only
 /// Control: Super stays Command, as its flags do.
-fn chord_scancode(chord: bool, scancode: u32) -> u32 {
-    match (swapping(), chord, scancode) {
-        (true, _, scancode::LCTRL) | (false, true, scancode::LCTRL) => scancode::LGUI,
-        (true, _, scancode::RCTRL) | (false, true, scancode::RCTRL) => scancode::RGUI,
-        (true, _, scancode::LGUI) => scancode::LCTRL,
-        (true, _, scancode::RGUI) => scancode::RCTRL,
-        _ => scancode,
+fn guest_scancode(key: CommandKey, chord: bool, scancode: u32) -> u32 {
+    match (chord, scancode) {
+        (true, scancode::LCTRL) => scancode::LGUI,
+        (true, scancode::RCTRL) => scancode::RGUI,
+        _ => key.remap_scancode(scancode),
     }
 }
 
@@ -408,8 +567,13 @@ pub mod flags {
     pub const DEVICE_RCTL: u64 = 0x2000;
 }
 
+/// The guest's `NSEventModifierFlags` for the host's held modifiers.
 pub fn modifiers(sdl_modifiers: u16) -> u64 {
-    let sdl_modifiers = swap_ctrl_cmd(sdl_modifiers);
+    flags_of(guest_modifiers(sdl_modifiers))
+}
+
+/// `SDL_Keymod` bits already in the guest's terms, as AppKit flags.
+fn flags_of(sdl_modifiers: u16) -> u64 {
     let mut out = 0;
     for (from, to) in [
         (keymod::SHIFT, flags::SHIFT),
@@ -476,7 +640,7 @@ mod carbon {
 /// Carbon's bits. Qt's key mapper asks this rather than `+[NSEvent modifierFlags]`.]
 #[allow(non_snake_case)]
 pub unsafe extern "C" fn GetCurrentKeyModifiers() -> u32 {
-    let held = swap_ctrl_cmd(sdl3::video::keyboard_modifiers());
+    let held = guest_modifiers(sdl3::video::keyboard_modifiers());
     [
         (keymod::GUI, carbon::CMD_KEY),
         (keymod::SHIFT, carbon::SHIFT_KEY),
@@ -546,23 +710,36 @@ pub fn characters(code: u32, keycode: u32) -> String {
 mod tests {
     use super::*;
 
+    fn edit() -> u64 {
+        edit_mask()
+    }
+
     #[test]
     fn an_editing_letter_with_control_begins_a_chord() {
         let ctrl = keymod::LCTRL;
-        assert_eq!(chord_step(0, scancode::V, ctrl, true), ChordStep::Begin);
         assert_eq!(
-            chord_step(0, scancode::Z, ctrl | keymod::LSHIFT, true),
+            chord_step(edit(), 0, scancode::V, ctrl, true),
             ChordStep::Begin
         );
-        assert_eq!(chord_step(0, scancode::V, ctrl, false), ChordStep::Keep);
-        assert_eq!(chord_step(0, scancode::S, ctrl, true), ChordStep::Keep);
-        assert_eq!(chord_step(0, scancode::V, 0, true), ChordStep::Keep);
         assert_eq!(
-            chord_step(0, scancode::V, ctrl | keymod::LALT, true),
+            chord_step(edit(), 0, scancode::Z, ctrl | keymod::LSHIFT, true),
+            ChordStep::Begin
+        );
+        assert_eq!(
+            chord_step(edit(), 0, scancode::V, ctrl, false),
             ChordStep::Keep
         );
         assert_eq!(
-            chord_step(0, scancode::V, ctrl | keymod::LGUI, true),
+            chord_step(edit(), 0, scancode::S, ctrl, true),
+            ChordStep::Keep
+        );
+        assert_eq!(chord_step(edit(), 0, scancode::V, 0, true), ChordStep::Keep);
+        assert_eq!(
+            chord_step(edit(), 0, scancode::V, ctrl | keymod::LALT, true),
+            ChordStep::Keep
+        );
+        assert_eq!(
+            chord_step(edit(), 0, scancode::V, ctrl | keymod::LGUI, true),
             ChordStep::Keep
         );
     }
@@ -570,10 +747,16 @@ mod tests {
     #[test]
     fn another_editing_letter_stays_in_the_chord() {
         let (chord, ctrl) = (keymod::LCTRL, keymod::LCTRL);
-        assert_eq!(chord_step(chord, scancode::C, ctrl, true), ChordStep::Keep);
-        assert_eq!(chord_step(chord, scancode::A, ctrl, false), ChordStep::Keep);
         assert_eq!(
-            chord_step(chord, scancode::LSHIFT, ctrl | keymod::LSHIFT, true),
+            chord_step(edit(), chord, scancode::C, ctrl, true),
+            ChordStep::Keep
+        );
+        assert_eq!(
+            chord_step(edit(), chord, scancode::A, ctrl, false),
+            ChordStep::Keep
+        );
+        assert_eq!(
+            chord_step(edit(), chord, scancode::LSHIFT, ctrl | keymod::LSHIFT, true),
             ChordStep::Keep
         );
     }
@@ -581,9 +764,12 @@ mod tests {
     #[test]
     fn any_other_control_chord_leaves_the_edit_chord() {
         let (chord, ctrl) = (keymod::LCTRL, keymod::LCTRL);
-        assert_eq!(chord_step(chord, scancode::S, ctrl, true), ChordStep::Leave);
         assert_eq!(
-            chord_step(chord, scancode::V, ctrl | keymod::LALT, true),
+            chord_step(edit(), chord, scancode::S, ctrl, true),
+            ChordStep::Leave
+        );
+        assert_eq!(
+            chord_step(edit(), chord, scancode::V, ctrl | keymod::LALT, true),
             ChordStep::Leave
         );
     }
@@ -592,11 +778,11 @@ mod tests {
     fn the_chord_ends_only_when_the_last_control_is_let_go() {
         let chord = keymod::LCTRL | keymod::RCTRL;
         assert_eq!(
-            chord_step(chord, scancode::LCTRL, keymod::RCTRL, false),
+            chord_step(edit(), chord, scancode::LCTRL, keymod::RCTRL, false),
             ChordStep::Keep
         );
         assert_eq!(
-            chord_step(chord, scancode::RCTRL, 0, false),
+            chord_step(edit(), chord, scancode::RCTRL, 0, false),
             ChordStep::EndAfter
         );
     }
@@ -604,11 +790,17 @@ mod tests {
     #[test]
     fn a_key_without_control_leaves_a_stale_chord() {
         assert_eq!(
-            chord_step(keymod::LCTRL, scancode::W, 0, true),
+            chord_step(edit(), keymod::LCTRL, scancode::W, 0, true),
             ChordStep::Leave
         );
         assert_eq!(
-            chord_step(keymod::LCTRL, scancode::LSHIFT, keymod::LSHIFT, true),
+            chord_step(
+                edit(),
+                keymod::LCTRL,
+                scancode::LSHIFT,
+                keymod::LSHIFT,
+                true
+            ),
             ChordStep::Leave
         );
     }
@@ -628,13 +820,118 @@ mod tests {
 
     #[test]
     fn a_chord_moves_control_and_leaves_super() {
-        if swapping() {
-            return;
+        let key = CommandKey::DEFAULT;
+        assert_eq!(guest_scancode(key, true, scancode::LCTRL), scancode::LGUI);
+        assert_eq!(guest_scancode(key, true, scancode::RCTRL), scancode::RGUI);
+        assert_eq!(guest_scancode(key, true, scancode::LGUI), scancode::LGUI);
+        assert_eq!(guest_scancode(key, false, scancode::LCTRL), scancode::LCTRL);
+    }
+
+    fn command(key: HostKey) -> CommandKey {
+        CommandKey {
+            key,
+            ..CommandKey::DEFAULT
         }
-        assert_eq!(chord_scancode(true, scancode::LCTRL), scancode::LGUI);
-        assert_eq!(chord_scancode(true, scancode::RCTRL), scancode::RGUI);
-        assert_eq!(chord_scancode(true, scancode::LGUI), scancode::LGUI);
-        assert_eq!(chord_scancode(false, scancode::LCTRL), scancode::LCTRL);
+    }
+
+    #[test]
+    fn super_is_command_by_default() {
+        assert_eq!(command_key_from(None, false, false), CommandKey::DEFAULT);
+        assert_eq!(
+            command_key_from(Some(" "), false, false),
+            CommandKey::DEFAULT
+        );
+        assert_eq!(CommandKey::parse("super"), Some(CommandKey::DEFAULT));
+        let key = CommandKey::DEFAULT;
+        assert_eq!(
+            key.remap(keymod::LCTRL | keymod::RGUI),
+            keymod::LCTRL | keymod::RGUI
+        );
+        assert_eq!(key.remap_scancode(scancode::LGUI), scancode::LGUI);
+    }
+
+    #[test]
+    fn ctrl_as_command_hands_super_the_control_role() {
+        let key = CommandKey::parse("Ctrl").unwrap();
+        assert_eq!(key, command(HostKey::Ctrl));
+        assert_eq!(
+            key.remap(keymod::LCTRL | keymod::LSHIFT),
+            keymod::LGUI | keymod::LSHIFT
+        );
+        assert_eq!(key.remap(keymod::RGUI), keymod::RCTRL);
+        assert_eq!(key.remap(keymod::LALT), keymod::LALT);
+        assert_eq!(key.remap_scancode(scancode::RCTRL), scancode::RGUI);
+        assert_eq!(key.remap_scancode(scancode::LGUI), scancode::LCTRL);
+        assert_eq!(key.remap_scancode(scancode::A), scancode::A);
+    }
+
+    #[test]
+    fn alt_as_command_hands_super_the_option_role() {
+        let key = CommandKey::parse("alt").unwrap();
+        assert_eq!(key.remap(keymod::RALT), keymod::RGUI);
+        assert_eq!(key.remap(keymod::LGUI), keymod::LALT);
+        assert_eq!(key.remap(keymod::LCTRL), keymod::LCTRL);
+        assert_eq!(key.remap_scancode(scancode::LALT), scancode::LGUI);
+        assert_eq!(key.remap_scancode(scancode::RGUI), scancode::RALT);
+    }
+
+    #[test]
+    fn the_swap_variable_still_means_ctrl() {
+        assert_eq!(command_key_from(None, true, false), command(HostKey::Ctrl));
+        assert_eq!(
+            command_key_from(Some("alt"), true, false),
+            command(HostKey::Alt)
+        );
+    }
+
+    #[test]
+    fn control_chords_take_the_edit_preset_or_named_keys() {
+        let edit = CommandKey::parse("super+ctrl:edit").unwrap();
+        assert_eq!(edit.key, HostKey::Super);
+        assert_eq!(edit.control_keys, key_mask("acvxyz").unwrap());
+        let named = CommandKey::parse(" alt + ctrl:S1 ").unwrap();
+        assert_eq!(named.key, HostKey::Alt);
+        assert_eq!(named.control_keys, 1 << scancode::S | 1 << scancode::KEY_1);
+        assert!(is_edit_chord_key(
+            named.control_keys,
+            scancode::KEY_1,
+            keymod::LCTRL
+        ));
+        assert!(!is_edit_chord_key(
+            named.control_keys,
+            scancode::V,
+            keymod::LCTRL
+        ));
+    }
+
+    #[test]
+    fn the_edit_keys_variable_is_the_edit_preset() {
+        let preset = CommandKey::parse("super+ctrl:edit").unwrap();
+        assert_eq!(command_key_from(None, false, true), preset);
+        assert_eq!(
+            command_key_from(Some("alt"), false, true),
+            command(HostKey::Alt)
+        );
+        // As before, the full swap wins over the narrow one.
+        assert_eq!(command_key_from(None, true, true), command(HostKey::Ctrl));
+    }
+
+    #[test]
+    fn a_malformed_command_key_is_rejected() {
+        for value in [
+            "meta",
+            "ctrl+ctrl:edit",
+            "super+alt:edit",
+            "super+ctrl:",
+            "super+ctrl:s-v",
+            "super+edit",
+        ] {
+            assert_eq!(CommandKey::parse(value), None, "{value}");
+        }
+        assert_eq!(
+            command_key_from(Some("meta"), true, true),
+            CommandKey::DEFAULT
+        );
     }
 
     /// Two keys with the same virtual code would be one key as far as a guest's

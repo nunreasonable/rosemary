@@ -407,6 +407,9 @@ unsafe extern "C" {
 /// `answer` is a `hostent` a resolver returned, or null.
 unsafe fn in_darwins_shape(answer: *mut libc::hostent) -> *mut c_void {
     if answer.is_null() {
+        // FIXME (ACCURACY): the host's own reason is per-thread and spelled
+        // differently on each host, so every failure reads as not found.
+        H_ERRNO.store(HOST_NOT_FOUND, core::sync::atomic::Ordering::Relaxed);
         return core::ptr::null_mut();
     }
     let mut copy = unsafe { answer.read() };
@@ -431,6 +434,13 @@ unsafe fn in_darwins_shape(answer: *mut libc::hostent) -> *mut c_void {
         slot.get().cast()
     })
 }
+
+/// `<netdb.h>`'s `HOST_NOT_FOUND`, the same number on every platform.
+const HOST_NOT_FOUND: i32 = 1;
+
+/// `int h_errno`, which Darwin's libSystem exports as a plain variable rather
+/// than a per-thread accessor, so a guest reads it by address.
+static H_ERRNO: core::sync::atomic::AtomicI32 = core::sync::atomic::AtomicI32::new(0);
 
 /// `struct hostent *gethostbyname(const char *)`
 ///
@@ -480,6 +490,9 @@ exports::exports! {
         "gethostbyname" => gethostbyname,
         "gethostbyname2" => gethostbyname2,
         "gethostbyaddr" => gethostbyaddr,
+    }
+    constants {
+        "h_errno" => H_ERRNO.as_ptr() as usize as u64,
     }
 }
 

@@ -181,8 +181,63 @@ pub unsafe extern "C" fn SetSystemUIMode(_mode: u32, _options: u32) -> OSStatus 
     NO_ERR
 }
 
+/// `UInt32 GetEventKind(EventRef)`
+///
+/// Zero: nothing here makes an `EventRef` (see [`ReceiveNextEvent`]), so there
+/// is no event whose kind could be asked for.
+pub unsafe extern "C" fn GetEventKind(_event: *const c_void) -> u32 {
+    0
+}
+
+/// `OSStatus EnableSecureEventInput(void)` and its pair.
+///
+/// Secure input keeps other processes from reading keystrokes; no process
+/// here can, so there is nothing to turn on.
+pub unsafe extern "C" fn EnableSecureEventInput() -> OSStatus {
+    NO_ERR
+}
+
+pub unsafe extern "C" fn DisableSecureEventInput() -> OSStatus {
+    NO_ERR
+}
+
+/// `TSMDocumentID TSMGetActiveDocument(void)`
+///
+/// NULL: Cocoa text input goes through `NSTextInputContext`, and no Carbon
+/// text services document is ever activated.
+pub unsafe extern "C" fn TSMGetActiveDocument() -> *mut c_void {
+    std::ptr::null_mut()
+}
+
+/// `OSStatus TSMSetDocumentProperty(TSMDocumentID, OSType, UInt32, void *)`
+/// and `TSMRemoveDocumentProperty(TSMDocumentID, OSType)`.
+///
+/// `tsmInvalidDocIDErr` for the NULL document, which is the only one
+/// [`TSMGetActiveDocument`] answers.
+pub unsafe extern "C" fn TSMSetDocumentProperty(
+    _document: *mut c_void,
+    _tag: u32,
+    _size: u32,
+    _data: *const c_void,
+) -> OSStatus {
+    TSM_INVALID_DOC_ID_ERR
+}
+
+pub unsafe extern "C" fn TSMRemoveDocumentProperty(_document: *mut c_void, _tag: u32) -> OSStatus {
+    TSM_INVALID_DOC_ID_ERR
+}
+
+/// `tsmInvalidDocIDErr`.
+const TSM_INVALID_DOC_ID_ERR: OSStatus = -2507;
+
 exports::exports! {
     functions {
+        "GetEventKind" => GetEventKind,
+        "EnableSecureEventInput" => EnableSecureEventInput,
+        "DisableSecureEventInput" => DisableSecureEventInput,
+        "TSMGetActiveDocument" => TSMGetActiveDocument,
+        "TSMSetDocumentProperty" => TSMSetDocumentProperty,
+        "TSMRemoveDocumentProperty" => TSMRemoveDocumentProperty,
         "GetApplicationEventTarget" => GetApplicationEventTarget,
         "GetEventDispatcherTarget" => GetEventDispatcherTarget,
         "GetMainEventLoop" => GetMainEventLoop,

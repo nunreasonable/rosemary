@@ -41,6 +41,7 @@ pub const KEYS: &[(&str, &str)] = &[
     ("_kSecMatchLimitOne", "m_LimitOne"),
     ("_kSecMatchLimitAll", "m_LimitAll"),
     ("_kSecMatchTrustedOnly", "m_TrustedOnly"),
+    ("_kSecMatchSearchList", "m_SearchList"),
     ("_kSecClassCertificate", "cert"),
     ("_kSecReturnRef", "r_Ref"),
 ];
@@ -187,7 +188,12 @@ pub(crate) fn store_key(tag: &[u8], pkcs8: &[u8]) {
 /// # Safety
 ///
 /// `query` is a `CFDictionary`; `result` is writable.
-unsafe fn key_result(query: CFTypeRef, identity: &Identity, pkcs8: Vec<u8>, result: *mut CFTypeRef) -> OSStatus {
+unsafe fn key_result(
+    query: CFTypeRef,
+    identity: &Identity,
+    pkcs8: Vec<u8>,
+    result: *mut CFTypeRef,
+) -> OSStatus {
     let tag = from_hex(&identity.account);
     let key = crate::key::from_stored(pkcs8, tag);
     if key.is_null() {
@@ -294,6 +300,25 @@ pub unsafe extern "C" fn SecItemCopyMatching(query: CFTypeRef, result: *mut CFTy
     }
     if query.is_null() {
         return PARAM;
+    }
+    let key = foundation::string::from_str("m_SearchList");
+    // SAFETY: query is a dictionary, and key is a live string.
+    let search_list = unsafe { corefoundation::api::CFDictionaryGetValue(query, key as _) };
+    unsafe { corefoundation::api::CFRelease(key as _) };
+    if !search_list.is_null() {
+        let Some(list) = (unsafe { corefoundation::collections::array(search_list) }) else {
+            return PARAM;
+        };
+        if list
+            .values
+            .iter()
+            .any(|item| !unsafe { corefoundation::base::is_kind_of(*item, keychain_class()) })
+        {
+            return PARAM;
+        }
+        // Keychain handles currently have no item store. An explicit search
+        // must not silently widen to the process store or host trust anchors.
+        return ITEM_NOT_FOUND;
     }
     let identity = unsafe { identity_of(query) };
     if identity.class == "cert" {
@@ -444,7 +469,9 @@ fn keychain_class() -> &'static objc::class::Class {
         objc::class::ptr(class) as usize
     });
     // SAFETY: a class registered above and kept for the process.
-    unsafe { objc::class::from_ptr(pointer as *const objc::class::Class).expect("a keychain class") }
+    unsafe {
+        objc::class::from_ptr(pointer as *const objc::class::Class).expect("a keychain class")
+    }
 }
 
 /// `OSStatus SecKeychainOpen(const char *path, SecKeychainRef *)`: a handle
@@ -454,7 +481,10 @@ fn keychain_class() -> &'static objc::class::Class {
 /// # Safety
 ///
 /// `out` is null or writable.
-pub unsafe extern "C" fn SecKeychainOpen(_path: *const std::ffi::c_char, out: *mut CFTypeRef) -> i32 {
+pub unsafe extern "C" fn SecKeychainOpen(
+    _path: *const std::ffi::c_char,
+    out: *mut CFTypeRef,
+) -> i32 {
     if out.is_null() {
         return -50;
     }
@@ -529,6 +559,33 @@ exports::exports! {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explicit_search_lists_do_not_fall_back_to_host_anchors() {
+        use corefoundation::{api, callbacks::Policy, collections};
+        let key = foundation::string::from_str("m_SearchList") as CFTypeRef;
+        let class = foundation::string::from_str("class") as CFTypeRef;
+        let certificate = foundation::string::from_str("cert") as CFTypeRef;
+        let empty = collections::new_array(&[], Policy::from_type_callbacks(), false);
+        for (value, expected) in [(empty, ITEM_NOT_FOUND), (certificate, PARAM)] {
+            let query = collections::new_dictionary(
+                &[(class, certificate), (key, value)],
+                Policy::from_type_callbacks(),
+                Policy::from_type_callbacks(),
+                false,
+            );
+            let mut result = certificate;
+            // SAFETY: live query and writable result; the query retains its values.
+            unsafe {
+                assert_eq!(SecItemCopyMatching(query, &mut result), expected);
+                assert!(result.is_null());
+                api::CFRelease(query);
+            }
+        }
+        for object in [key, class, certificate, empty] {
+            unsafe { api::CFRelease(object) };
+        }
+    }
 
     #[test]
     fn hex_round_trips_every_byte() {

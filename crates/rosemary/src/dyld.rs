@@ -326,6 +326,19 @@ pub fn register_mapped_images(report: &LinkReport) {
     let _ = PROGRAM_IMAGES.set(LinkedImage::of(report));
 }
 
+/// The slide of the first image the executable was linked against whose
+/// install name satisfies `is_image`.
+///
+/// A `dlopen`ed image binds to the program's copy of a runtime library rather
+/// than mapping its own, so that library is in no report but the program's.
+pub fn program_image_slide(is_image: &dyn Fn(&str) -> bool) -> Option<u64> {
+    PROGRAM_IMAGES
+        .get()?
+        .iter()
+        .find(|image| is_image(&image.name))
+        .map(|image| image.slide)
+}
+
 /// The main executable's export table, parsed once, on first use.
 static MAIN_EXPORTS: Mutex<Option<&'static MainExports>> = Mutex::new(None);
 
@@ -2080,6 +2093,21 @@ fn load_command_in(header: u64, segment: &[u8], section: Option<&[u8]>) -> u64 {
     0
 }
 
+fn data_section_end(header: u64, slide: u64) -> u64 {
+    let section = load_command_in(header, b"__DATA", Some(b"__data")) as *const u8;
+    if section.is_null() {
+        return 0;
+    }
+    // SAFETY: load_command_in found a section_64 in the mapped image header.
+    let (address, size) = unsafe {
+        (
+            section.add(32).cast::<u64>().read_unaligned(),
+            section.add(40).cast::<u64>().read_unaligned(),
+        )
+    };
+    address.wrapping_add(size).wrapping_add(slide)
+}
+
 /// The main image's slide, which libmacho's unslid answers have to be moved by.
 fn main_slide() -> u64 {
     EXECUTABLE
@@ -2497,6 +2525,15 @@ pub(crate) mod entry {
         (addr + size).wrapping_add(super::main_slide())
     }
 
+    /// `unsigned long get_edata(void)`: first address after __DATA,__data,
+    /// not the end of the segment (which can also contain zero-fill sections).
+    pub extern "C" fn get_edata() -> u64 {
+        super::data_section_end(
+            super::MAIN_HEADER.load(Ordering::Acquire),
+            super::main_slide(),
+        )
+    }
+
     /// `unsigned long get_end(void)`: the end of the main image, slid.
     pub extern "C" fn get_end() -> u64 {
         super::main_image_end()
@@ -2821,7 +2858,7 @@ pub(crate) mod entry {
 }
 
 /// Every name [`provider`] defines, and the function it binds to.
-fn entries() -> [(&'static str, *const ()); 25] {
+fn entries() -> [(&'static str, *const ()); 26] {
     [
         ("_NSAddImage", entry::ns_add_image as *const ()),
         (
@@ -2886,6 +2923,7 @@ fn entries() -> [(&'static str, *const ()); 25] {
             entry::getsectdatafromheader_64 as *const (),
         ),
         ("_get_etext", entry::get_etext as *const ()),
+        ("_get_edata", entry::get_edata as *const ()),
         ("_get_end", entry::get_end as *const ()),
     ]
 }
@@ -2906,6 +2944,26 @@ pub fn provider() -> SyntheticDylib {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn edata_uses_data_section_end_and_slide() {
+        let mut header = vec![0u8; 32 + 72 + 80];
+        header[0..4].copy_from_slice(&0xfeed_facfu32.to_le_bytes());
+        header[16..20].copy_from_slice(&1u32.to_le_bytes());
+        header[32..36].copy_from_slice(&0x19u32.to_le_bytes());
+        header[36..40].copy_from_slice(&152u32.to_le_bytes());
+        header[40..46].copy_from_slice(b"__DATA");
+        header[64..72].copy_from_slice(&0x9000u64.to_le_bytes());
+        header[96..100].copy_from_slice(&1u32.to_le_bytes());
+        header[104..110].copy_from_slice(b"__data");
+        header[136..144].copy_from_slice(&0x2000u64.to_le_bytes());
+        header[144..152].copy_from_slice(&0x180u64.to_le_bytes());
+        let address = header.as_ptr() as u64;
+        assert_eq!(super::data_section_end(address, 0x10000), 0x12180);
+        header[104..110].copy_from_slice(b"__bss\0");
+        assert_eq!(super::data_section_end(address, 0x10000), 0);
+        assert_eq!(super::data_section_end(0, 0x10000), 0);
+    }
+
     use super::*;
     use crate::abi::{Classification, Lookup};
 

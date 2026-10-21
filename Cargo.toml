@@ -51,6 +51,7 @@ webpki-roots = "1"
 ureq = { version = "3", default-features = false, features = ["rustls", "gzip", "cookies"] }
 static_init = "1.0.4"
 owned_ttf_parser = "0.25"
+tiny-skia = { version = "0.11.4", default-features = false, features = ["std", "simd"] }
 ab_glyph_rasterizer = "0.1.9"
 rust-fontconfig = { version = "5.0.1", default-features = false, features = ["std", "parsing", "multithreading"] }
 llvm-bitcode = "0.4.0"

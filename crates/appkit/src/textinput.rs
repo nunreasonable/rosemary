@@ -451,6 +451,8 @@ pub const STRING_GLOBALS: &[(&str, &str)] = &[
         CATEGORY_KEYBOARD_INPUT_SOURCE,
     ),
     ("_kTISTypeKeyboardLayout", TYPE_KEYBOARD_LAYOUT),
+    // No source here is of this type; compared against only.
+    ("_kTISTypeKeyboardInputMode", "TISTypeKeyboardInputMode"),
 ];
 
 #[cfg(test)]

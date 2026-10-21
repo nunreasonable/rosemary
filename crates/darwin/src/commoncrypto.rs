@@ -132,9 +132,25 @@ digest_api!(
     Sha224
 );
 
+/// `CCRandomGenerateBytes`: fill the supplied buffer from the OS CSPRNG.
+unsafe extern "C" fn cc_random_generate_bytes(bytes: *mut u8, count: usize) -> i32 {
+    if count == 0 {
+        return KCC_SUCCESS;
+    }
+    if bytes.is_null() {
+        return KCC_PARAM_ERROR;
+    }
+    let dest = unsafe { std::slice::from_raw_parts_mut(bytes, count) };
+    match getrandom::fill(dest) {
+        Ok(()) => KCC_SUCCESS,
+        Err(_) => KCC_RNG_FAILURE,
+    }
+}
+
 // CommonCrypto/CommonCryptor.h
 const KCC_SUCCESS: i32 = 0;
 const KCC_PARAM_ERROR: i32 = -4300;
+const KCC_RNG_FAILURE: i32 = -4307;
 const KCC_BUFFER_TOO_SMALL: i32 = -4301;
 const KCC_ALIGNMENT_ERROR: i32 = -4303;
 const KCC_DECODE_ERROR: i32 = -4304;
@@ -744,12 +760,30 @@ exports::exports! {
         "CCCryptorGetOutputLength"=>cryptor_get_output_length,
         "CCCryptorReset"=>cryptor_reset,
         "CCCrypt"=>crypt,
+        "CCRandomGenerateBytes"=>cc_random_generate_bytes,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// Mirrors Apple's CommonRandom.c zero-size and invalid pointer cases.
+    #[test]
+    fn common_random_rejects_invalid_buffers_and_fills_valid_buffers() {
+        let null = std::ptr::null_mut();
+        assert_eq!(unsafe { cc_random_generate_bytes(null, 0) }, KCC_SUCCESS);
+        assert_eq!(
+            unsafe { cc_random_generate_bytes(null, 1) },
+            KCC_PARAM_ERROR
+        );
+        let mut bytes = [0xA5u8; 32];
+        assert_eq!(
+            unsafe { cc_random_generate_bytes(bytes.as_mut_ptr(), bytes.len()) },
+            KCC_SUCCESS
+        );
+        assert_ne!(bytes, [0xA5; 32]);
+    }
+
     #[test]
     fn sha256_streaming_matches_known_digest() {
         let mut c = [0u8; 104];

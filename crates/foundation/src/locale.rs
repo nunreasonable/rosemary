@@ -173,17 +173,21 @@ unsafe extern "C" fn current_locale(_class: Id, _sel: Sel) -> Id {
 /// list looking for a localisation it has, and an invented second entry would
 /// send it to a language the user never asked for.
 unsafe extern "C" fn preferred_languages(_class: Id, _sel: Sel) -> Id {
+    // SAFETY: a fresh object this call owns.
+    unsafe { corefoundation::api::CFAutorelease(preferred_languages_array()) as Id }
+}
+
+/// The array [`preferred_languages`] answers, with one reference the caller owns.
+fn preferred_languages_array() -> corefoundation::base::CFTypeRef {
     let tag = crate::string::from_str(&tag());
     let array = corefoundation::collections::new_array(
         &[tag as corefoundation::base::CFTypeRef],
         corefoundation::callbacks::Policy::from_type_callbacks(),
         false,
     );
-    // SAFETY: both are fresh objects this call owns.
-    unsafe {
-        corefoundation::api::CFRelease(tag as corefoundation::base::CFTypeRef);
-        corefoundation::api::CFAutorelease(array) as Id
-    }
+    // SAFETY: a fresh object this call owns, now held by the array.
+    unsafe { corefoundation::api::CFRelease(tag as corefoundation::base::CFTypeRef) };
+    array
 }
 
 /// ISO 639-1, which `+ISOLanguageCodes` lists.
@@ -387,22 +391,25 @@ pub mod cf {
         super::shared()
     }
 
-    /// `CFArrayRef CFLocaleCopyPreferredLanguages(void)`: the languages
-    /// `+[NSLocale preferredLanguages]` answers, owned by the caller.
-    unsafe extern "C" fn CFLocaleCopyPreferredLanguages() -> Id {
-        // SAFETY: a class method that ignores its receiver and selector, and
-        // answers an autoreleased array this call takes a reference to.
-        unsafe {
-            let array = super::preferred_languages(
-                std::ptr::null_mut(),
-                objc::sel::get("preferredLanguages"),
-            );
-            objc::arc::retain(array)
+    /// `CFLocaleRef CFLocaleCreate(CFAllocatorRef, CFStringRef identifier)`.
+    ///
+    /// FIXME (ACCURACY): there is one locale object, so every identifier is
+    /// answered with it rather than with the locale it names.
+    unsafe extern "C" fn CFLocaleCreate(_allocator: Id, identifier: Id) -> Id {
+        if identifier.is_null() {
+            return std::ptr::null_mut();
         }
+        unsafe { CFLocaleCopyCurrent() }
+    }
+
+    /// `CFArrayRef CFLocaleCopyPreferredLanguages(void)`.
+    unsafe extern "C" fn CFLocaleCopyPreferredLanguages() -> Id {
+        super::preferred_languages_array() as Id
     }
 
     exports::exports! {
         functions {
+            "CFLocaleCreate" => CFLocaleCreate,
             "CFLocaleCopyPreferredLanguages" => CFLocaleCopyPreferredLanguages,
             "CFLocaleGetSystem" => CFLocaleGetSystem,
             "CFLocaleCopyCurrent" => CFLocaleCopyCurrent,

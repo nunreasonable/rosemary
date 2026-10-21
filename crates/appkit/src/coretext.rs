@@ -38,6 +38,7 @@ const ATTRIBUTE_GLOBALS: &[(&str, &str)] = &[
     ("_kCTFontURLAttribute", "CTFontURLAttribute"),
     ("_kCTFontUniqueNameKey", "CTFontUniqueNameKey"),
     ("_kCTFontWeightTrait", "CTFontWeightTrait"),
+    ("_kCTFontWidthTrait", "CTFontWidthTrait"),
     (
         "_kCTForegroundColorAttributeName",
         "CTForegroundColorAttributeName",
@@ -184,7 +185,7 @@ fn languages(face: &LoadedFace) -> Vec<&'static str> {
 }
 
 /// The attributes of `info` at `size`, as a font or descriptor.
-fn face_attributes(info: &FaceInfo, size: f64) -> CFTypeRef {
+pub(crate) fn face_attributes(info: &FaceInfo, size: f64) -> CFTypeRef {
     let mut owned = Vec::new();
     let mut own = |object: CFTypeRef| {
         owned.push(object);
@@ -333,7 +334,7 @@ fn merged_attributes(base: CFTypeRef, overrides: CFTypeRef) -> CFTypeRef {
     new_dictionary(&pairs)
 }
 
-fn loaded(font: CFTypeRef) -> Option<Arc<LoadedFace>> {
+pub(crate) fn loaded(font: CFTypeRef) -> Option<Arc<LoadedFace>> {
     let path = get_string(font, PATH_KEY)?;
     let index = get_number(font, INDEX_KEY).unwrap_or(0.0) as u32;
     fonts::load(&path, index)
@@ -780,29 +781,18 @@ pub unsafe extern "C" fn CTFontDrawGlyphs(
     let Some(face) = loaded(font) else {
         return;
     };
-    let Some(device) = crate::cgcontext::text_to_device(context) else {
+    if glyphs.is_null() || positions.is_null() || count == 0 {
         return;
+    }
+    // SAFETY: the caller supplies `count` glyphs and positions.
+    let (glyphs, positions) = unsafe {
+        (
+            std::slice::from_raw_parts(glyphs, count),
+            std::slice::from_raw_parts(positions, count),
+        )
     };
-    if glyphs.is_null() || positions.is_null() {
-        return;
-    }
-    let s = scale(font, &face);
-    for at in 0..count {
-        // SAFETY: the caller supplies `count` glyphs and positions.
-        let (glyph, position) = unsafe { (*glyphs.add(at), *positions.add(at)) };
-        let segments = fonts::outline(face.face(), glyph);
-        if segments.is_empty() {
-            continue;
-        }
-        let map = |x: f32, y: f32| {
-            let (dx, dy) =
-                device.apply(f64::from(x) * s + position.x, f64::from(y) * s + position.y);
-            (dx as f32, dy as f32)
-        };
-        if let Some((left, top, width, coverage)) = fonts::rasterize(&segments, map) {
-            crate::cgcontext::fill_coverage(context, left, top, width, &coverage);
-        }
-    }
+    let positions: Vec<(f64, f64)> = positions.iter().map(|p| (p.x, p.y)).collect();
+    crate::quartz::draw_glyphs(context, &face, font_size(font), glyphs, &positions);
 }
 
 pub unsafe extern "C" fn CTFontCreatePathForGlyph(
@@ -810,15 +800,23 @@ pub unsafe extern "C" fn CTFontCreatePathForGlyph(
     glyph: u16,
     transform: *const crate::cgcontext::CGAffineTransform,
 ) -> CFTypeRef {
-    let mut bounds = NSRect::default();
-    // SAFETY: one glyph and one rectangle.
-    unsafe { CTFontGetBoundingRectsForGlyphs(font, 0, &glyph, &mut bounds, 1) };
-    // SAFETY: a fresh path, with the caller's optional transform.
-    unsafe {
-        let path = crate::cgcontext::CGPathCreateMutable();
-        crate::cgcontext::CGPathAddRect(path, transform, bounds);
-        path
-    }
+    let Some(face) = loaded(font) else {
+        return std::ptr::null();
+    };
+    let s = scale(font, &face);
+    let to_font = crate::cgcontext::CGAffineTransform {
+        a: s,
+        d: s,
+        ..crate::cgcontext::IDENTITY
+    };
+    let m = match transform.is_null() {
+        true => to_font,
+        // SAFETY: the caller's transform.
+        false => to_font.then(unsafe { *transform }),
+    };
+    let mut outline = crate::cgpath::Elements::default();
+    crate::cgpath::glyph_outline(face.face(), glyph, m, &mut outline);
+    crate::cgpath::path_from(outline)
 }
 
 pub unsafe extern "C" fn CTFontDescriptorCopyAttribute(
@@ -1131,6 +1129,29 @@ pub unsafe extern "C" fn CTFontManagerCreateFontDescriptorsFromURL(url: CFTypeRe
     descriptors_for(&fonts::register_file(&path.to_string_lossy()))
 }
 
+/// Write a font held in memory where the face database can read it, named by
+/// its contents so the same font is written once. The path, or `None` when it
+/// cannot be written.
+pub(crate) fn spill_font(bytes: &[u8]) -> Option<String> {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    let directory = std::env::temp_dir().join("rosemary-fonts");
+    let _ = std::fs::create_dir_all(&directory);
+    let path = directory.join(format!("{:016x}.ttf", hasher.finish()));
+    if !path.exists() && std::fs::write(&path, bytes).is_err() {
+        return None;
+    }
+    Some(path.to_string_lossy().into_owned())
+}
+
+/// The file and face index a font draws with.
+pub(crate) fn face_location(font: CFTypeRef) -> Option<(String, u32)> {
+    let path = get_string(font, PATH_KEY)?;
+    let index = get_number(font, INDEX_KEY).unwrap_or(0.0) as u32;
+    Some((path, index))
+}
+
 /// As [`CTFontManagerCreateFontDescriptorsFromURL`], for font bytes in memory,
 /// which are written to a file so that they load like every other face.
 pub unsafe extern "C" fn CTFontManagerCreateFontDescriptorFromData(data: CFTypeRef) -> CFTypeRef {
@@ -1138,16 +1159,10 @@ pub unsafe extern "C" fn CTFontManagerCreateFontDescriptorFromData(data: CFTypeR
     let Some(bytes) = (unsafe { collections::data(data) }) else {
         return std::ptr::null();
     };
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    bytes.hash(&mut hasher);
-    let directory = std::env::temp_dir().join("rosemary-fonts");
-    let _ = std::fs::create_dir_all(&directory);
-    let path = directory.join(format!("{:016x}.ttf", hasher.finish()));
-    if !path.exists() && std::fs::write(&path, bytes.as_slice()).is_err() {
+    let Some(path) = spill_font(bytes) else {
         return std::ptr::null();
-    }
-    let faces = fonts::register_file(&path.to_string_lossy());
+    };
+    let faces = fonts::register_file(&path);
     let Some(first) = faces.first() else {
         return std::ptr::null();
     };
@@ -1165,7 +1180,7 @@ pub unsafe extern "C" fn CTFontManagerCreateFontDescriptorFromData(data: CFTypeR
 /// `provider` is null or a live object.
 pub unsafe extern "C" fn CGFontCreateWithDataProvider(provider: CFTypeRef) -> CFTypeRef {
     // SAFETY: the caller's guarantee.
-    let Some(bytes) = (unsafe { crate::graphics::provider_bytes(provider) }) else {
+    let Some(bytes) = crate::graphics::provider_bytes(provider) else {
         return std::ptr::null();
     };
     let data = collections::new_data(bytes.to_vec());
@@ -1275,12 +1290,47 @@ exports::exports! {
 }
 
 pub fn data_symbols() -> Vec<(String, u64)> {
-    corefoundation::base::string_globals(ATTRIBUTE_GLOBALS)
+    let mut symbols = corefoundation::base::string_globals(ATTRIBUTE_GLOBALS);
+    // Publish the observer name even though host font-registry changes are
+    // not currently forwarded to the notification centers.
+    symbols.extend(corefoundation::base::string_globals(&[(
+        "_kCTFontManagerRegisteredFontsChangedNotification",
+        "CTFontManagerFontChangedNotification",
+    )]));
+    symbols
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn font_registry_notification_exports_a_string_cell() {
+        let symbols = data_symbols();
+        let (_, cell) = symbols
+            .iter()
+            .find(|(name, _)| name == "_kCTFontManagerRegisteredFontsChangedNotification")
+            .expect("font registry notification is exported");
+        // SAFETY: data_symbols returns process-lifetime string cells.
+        let object = unsafe { *(*cell as *const objc::object::Id) };
+        assert!(!object.is_null());
+        assert_eq!(
+            unsafe { foundation::string::bytes(object) },
+            b"CTFontManagerFontChangedNotification"
+        );
+    }
+
+    #[test]
+    fn font_width_trait_exports_a_string_cell() {
+        let symbols = data_symbols();
+        let (_, cell) = symbols.iter()
+            .find(|(name, _)| name == "_kCTFontWidthTrait")
+            .expect("font width trait is exported");
+        // SAFETY: data_symbols returns process-lifetime string cells.
+        let object = unsafe { *(*cell as *const objc::object::Id) };
+        assert!(!object.is_null());
+        assert_eq!(unsafe { foundation::string::bytes(object) }, b"CTFontWidthTrait");
+    }
 
     /// The host's default sans-serif font, or `None` on a host with no
     /// fontconfig, where these tests have nothing to read.

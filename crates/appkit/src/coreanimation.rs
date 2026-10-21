@@ -1,12 +1,14 @@
 //! Core Animation's layer tree and basic animations, drawn by the compositor.
 //!
-//! A layer here has geometry, a background colour, `contents` (an
-//! `IOSurfaceRef`, a `CGImageRef` or an `NSImage`) placed by
+//! A layer here has geometry, a background colour with rounded corners,
+//! `contents` (an `IOSurfaceRef`, a `CGImageRef` or an `NSImage`) placed by
 //! `contentsGravity`, sublayers, `masksToBounds`, opacity and running
-//! animations. That is what a program builds a progress bar, a spinner or a
-//! highlight out of, and what a layer-backed view's content arrives as. Borders,
-//! corner radii, shadows, `contentsRect` and transforms are not drawn; a program
-//! that relies on them gets its layer's background and contents and no more.
+//! animations. That is what a program builds a progress bar, a spinner, a badge
+//! or a highlight out of, and what a layer-backed view's content arrives as.
+//! Borders, shadows, `contentsRect` and transforms are not drawn, and
+//! `masksToBounds` clips to the square bounds whatever the corner radius; a
+//! program that relies on them gets its layer's background and contents and
+//! no more.
 //!
 //! The state lives in side tables keyed by object address rather than in
 //! `crate::layer::Layer`, whose layout a `CAMetalLayer` extends.
@@ -116,6 +118,8 @@ struct Node {
     masks_to_bounds: bool,
     hidden: bool,
     opacity: f64,
+    /// `-cornerRadius`, in points.
+    corner_radius: f64,
     animations: Vec<(String, Running)>,
     /// `-contents`, retained. A surface also holds a use count while it is
     /// here, which is what tells its owner it is on screen.
@@ -129,7 +133,6 @@ struct Node {
     /// FIXME (ACCURACY): kept for the getters only; sublayers are drawn as if
     /// it were the identity, and corners square.
     sublayer_transform: Transform3D,
-    corner_radius: f64,
     edge_antialiasing: u32,
 }
 
@@ -143,6 +146,9 @@ impl Transform3D {
         1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
     ]);
 }
+
+/// QuartzCore exports the matrix itself, not a pointer-valued cell.
+pub(crate) static TRANSFORM_IDENTITY: Transform3D = Transform3D::IDENTITY;
 
 const UNIT_RECT: NSRect = NSRect {
     origin: NSPoint { x: 0.0, y: 0.0 },
@@ -164,13 +170,13 @@ impl Default for Node {
             masks_to_bounds: false,
             hidden: false,
             opacity: 1.0,
+            corner_radius: 0.0,
             animations: Vec::new(),
             contents: 0,
             gravity: Gravity::Resize,
             decoded: None,
             contents_rect: UNIT_RECT,
             sublayer_transform: Transform3D::IDENTITY,
-            corner_radius: 0.0,
             // `kCALayerLeftEdge | ...TopEdge`: every edge, as a new layer has.
             edge_antialiasing: 0xf,
         }
@@ -425,6 +431,15 @@ pub(crate) fn set_masks(layer: Id, masks: bool) {
 
 unsafe extern "C" fn set_masks_to_bounds(receiver: Id, _sel: Sel, value: u8) {
     set_masks(receiver, value != 0);
+}
+
+unsafe extern "C" fn corner_radius(receiver: Id, _sel: Sel) -> f64 {
+    read_node(receiver, |node| node.map_or(0.0, |node| node.corner_radius))
+}
+
+unsafe extern "C" fn set_corner_radius(receiver: Id, _sel: Sel, value: f64) {
+    with_node(receiver, |node| node.corner_radius = value.max(0.0));
+    changed(receiver);
 }
 
 unsafe extern "C" fn is_hidden(receiver: Id, _sel: Sel) -> u8 {
@@ -1215,6 +1230,7 @@ struct Presented {
     opacity: f64,
     hidden: bool,
     masks_to_bounds: bool,
+    corner_radius: f64,
     sublayers: Vec<usize>,
 }
 
@@ -1241,6 +1257,7 @@ fn presentation(layer: Id, now: f64) -> Presented {
             opacity: presented(animations, "opacity", node.opacity, now).clamp(0.0, 1.0),
             hidden: node.hidden,
             masks_to_bounds: node.masks_to_bounds,
+            corner_radius: node.corner_radius,
             sublayers: node.sublayers.clone(),
         }
     })
@@ -1310,6 +1327,75 @@ fn fill(store: &mut Store, rect: Rect, color: [f64; 4], opacity: f64) {
                 pixel[channel] = (source[channel] + (u32::from(pixel[channel]) * keep + 127) / 255) as u8;
             }
             pixel[3] = (a + (u32::from(pixel[3]) * keep + 127) / 255) as u8;
+        }
+    }
+}
+
+/// [`fill`] `shape` with its corners rounded to `radius` pixels, within `clip`.
+fn fill_rounded(
+    store: &mut Store,
+    shape: Rect,
+    clip: Rect,
+    color: [f64; 4],
+    opacity: f64,
+    radius: f64,
+) {
+    let radius = radius
+        .min(shape.width as f64 / 2.0)
+        .min(shape.height as f64 / 2.0);
+    if radius < 0.5 {
+        fill(store, shape.intersection(&clip), color, opacity);
+        return;
+    }
+    let bounds = Rect {
+        x: 0,
+        y: 0,
+        width: i64::from(store.width),
+        height: i64::from(store.height),
+    };
+    let area = shape.intersection(&clip).intersection(&bounds);
+    if area.is_empty() {
+        return;
+    }
+    let (left, top) = (shape.x as f64, shape.y as f64);
+    let (right, bottom) = (left + shape.width as f64, top + shape.height as f64);
+    for row in area.y..area.y + area.height {
+        let cy = row as f64 + 0.5;
+        // How far into a corner's square this row is, if it is in one.
+        let dy = (top + radius - cy).max(cy - (bottom - radius)).max(0.0);
+        if dy <= 0.0 {
+            fill(
+                store,
+                Rect {
+                    x: area.x,
+                    y: row,
+                    width: area.width,
+                    height: 1,
+                },
+                color,
+                opacity,
+            );
+            continue;
+        }
+        for column in area.x..area.x + area.width {
+            let cx = column as f64 + 0.5;
+            let dx = (left + radius - cx).max(cx - (right - radius)).max(0.0);
+            // Coverage from the distance to the corner's circle, one pixel of
+            // anti-aliasing wide.
+            let coverage = (radius - (dx * dx + dy * dy).sqrt() + 0.5).clamp(0.0, 1.0);
+            if coverage > 0.0 {
+                fill(
+                    store,
+                    Rect {
+                        x: column,
+                        y: row,
+                        width: 1,
+                        height: 1,
+                    },
+                    color,
+                    opacity * coverage,
+                );
+            }
         }
     }
 }
@@ -1607,11 +1693,13 @@ pub(crate) fn render(view: Id, store: &mut Store, rect: Rect, clip: Rect, pass: 
         Pass::Background => {
             let whole = mapping.to_pixels(view_bounds);
             if let Some(color) = root_presented.background {
-                fill(
+                fill_rounded(
                     store,
-                    whole.intersection(&clip),
+                    whole,
+                    clip,
                     color,
                     root_presented.opacity,
+                    root_presented.corner_radius * mapping.scale_x.min(mapping.scale_y),
                 );
             }
             draw_contents(
@@ -1683,7 +1771,8 @@ fn draw_layer(
     let pixels = mapping.to_pixels(frame);
     let opacity = opacity * presented.opacity;
     if let Some(color) = presented.background {
-        fill(store, pixels.intersection(&clip), color, opacity);
+        let radius = presented.corner_radius * mapping.scale_x.min(mapping.scale_y);
+        fill_rounded(store, pixels, clip, color, opacity, radius);
     }
     draw_contents(
         store,
@@ -1762,13 +1851,9 @@ unsafe extern "C" fn set_sublayer_transform(receiver: Id, _sel: Sel, transform: 
     with_node(receiver, |node| node.sublayer_transform = transform);
 }
 
-unsafe extern "C" fn corner_radius(receiver: Id, _sel: Sel) -> f64 {
-    read_node(receiver, |node| node.map_or(0.0, |node| node.corner_radius))
-}
 
-unsafe extern "C" fn set_corner_radius(receiver: Id, _sel: Sel, radius: f64) {
-    with_node(receiver, |node| node.corner_radius = radius);
-}
+
+
 
 unsafe extern "C" fn edge_antialiasing_mask(receiver: Id, _sel: Sel) -> u32 {
     read_node(receiver, |node| node.map_or(0xf, |node| node.edge_antialiasing))
@@ -1801,6 +1886,8 @@ pub(crate) fn install() {
         "geometryFlipped" => layer_no, c"c16@0:8";
         "setAutoresizingMask:" => ignored_layer_mask, c"v20@0:8I16";
         "autoresizingMask" => layer_zero_mask, c"I16@0:8";
+        "cornerRadius" => corner_radius, c"d16@0:8";
+        "setCornerRadius:" => set_corner_radius, c"v24@0:8d16";
         "isHidden" => is_hidden, c"c16@0:8";
         "setHidden:" => set_hidden, c"v20@0:8c16";
         "opacity" => opacity, c"f16@0:8";
@@ -1819,8 +1906,6 @@ pub(crate) fn install() {
         "sublayerTransform" => sublayer_transform, c"{CATransform3D=dddddddddddddddd}16@0:8";
         "setSublayerTransform:" => set_sublayer_transform,
             c"v144@0:8{CATransform3D=dddddddddddddddd}16";
-        "cornerRadius" => corner_radius, c"d16@0:8";
-        "setCornerRadius:" => set_corner_radius, c"v24@0:8d16";
         "edgeAntialiasingMask" => edge_antialiasing_mask, c"I16@0:8";
         "setEdgeAntialiasingMask:" => set_edge_antialiasing_mask, c"v20@0:8I16";
     });

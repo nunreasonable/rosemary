@@ -208,6 +208,28 @@ pub fn requeue(ranges: &[std::ops::Range<u64>]) {
     }
 }
 
+/// Make the page table now, so nothing that may run in a signal handler -
+/// [`before_write`] - is first to allocate it.
+pub fn warm() {
+    init();
+}
+
+/// `darwin::mach::local`'s write barrier: a write about to be made to
+/// `[address, address + len)` on another task's behalf, through the kernel,
+/// which a guarded page would refuse with `EFAULT` rather than fault on. Each
+/// guarded page is unguarded and queued for a drain, as a faulting store
+/// would have it. Async-signal-safe.
+pub fn before_write(address: u64, len: u64) {
+    let Some(table) = table() else {
+        return;
+    };
+    for page in pages_of(address, address.saturating_add(len)) {
+        if find(table, page).is_some() {
+            on_fault(page << PAGE_SHIFT.load(Ordering::Relaxed));
+        }
+    }
+}
+
 /// Whether any page is waiting for a drain. One relaxed load, for the run loop.
 #[inline(always)]
 pub fn dirty() -> bool {

@@ -6,6 +6,9 @@ use crate::define::{class_methods, methods};
 static SHARED: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
 static CURRENT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
 
+pub const WILL_POWER_OFF: &str = "NSWorkspaceWillPowerOffNotification";
+pub const SESSION_DID_BECOME_ACTIVE: &str = "NSWorkspaceSessionDidBecomeActiveNotification";
+pub const SESSION_DID_RESIGN_ACTIVE: &str = "NSWorkspaceSessionDidResignActiveNotification";
 pub const WILL_SLEEP: &str = "NSWorkspaceWillSleepNotification";
 pub const DID_WAKE: &str = "NSWorkspaceDidWakeNotification";
 pub const SCREENS_DID_SLEEP: &str = "NSWorkspaceScreensDidSleepNotification";
@@ -68,11 +71,16 @@ unsafe extern "C" fn application_url_for_url(_receiver: Id, _sel: Sel, _url: Id)
     std::ptr::null_mut()
 }
 
-/// `-[NSWorkspace openURL:]`: hand a URL to the host's registered handler.
+/// `-[NSWorkspace openURL:]`: to this application when it is the scheme's
+/// handler, as LaunchServices sends a running handler the URL, and to the
+/// host's registered handler otherwise.
 unsafe extern "C" fn open_url(_receiver: Id, _sel: Sel, url: Id) -> u8 {
     let Some(url) = (unsafe { corefoundation::url::as_url(url as *const std::ffi::c_void) }) else {
         return 0;
     };
+    if crate::launchservices::handled_here(url) {
+        return 1;
+    }
     let Some(target) = open_target(url) else {
         return 0;
     };
@@ -99,7 +107,7 @@ unsafe extern "C" fn open_file_with(receiver: Id, sel: Sel, path: Id, _applicati
     unsafe { open_file(receiver, sel, path) }
 }
 
-fn open_target(url: &corefoundation::url::Contents) -> Option<String> {
+pub(crate) fn open_target(url: &corefoundation::url::Contents) -> Option<String> {
     if url.scheme().is_empty() {
         return None;
     }
@@ -134,16 +142,54 @@ unsafe extern "C" fn frontmost_application(_receiver: Id, _sel: Sel) -> Id {
     current()
 }
 
-/// `-[NSWorkspace runningApplications]`: this process alone, for the reason
-/// given at [`running_applications`].
+/// `-[NSWorkspace runningApplications]`: this process, and every other
+/// application running in the prefix.
 unsafe extern "C" fn workspace_running_applications(_receiver: Id, _sel: Sel) -> Id {
+    let mut objects = vec![current()];
+    for application in server::client::applications(None).unwrap_or_default() {
+        let object = object_for(&application);
+        if !objects.contains(&object) {
+            objects.push(object);
+        }
+    }
+    autoreleased_array(&objects)
+}
+
+fn autoreleased_array(objects: &[Id]) -> Id {
+    let values: Vec<*const std::ffi::c_void> = objects.iter().map(|o| *o as _).collect();
     let array = corefoundation::collections::new_array(
-        &[current() as *const std::ffi::c_void],
+        &values,
         corefoundation::callbacks::Policy::from_type_callbacks(),
         false,
     );
     // SAFETY: a fresh CFArray, toll-free bridged to NSArray.
     unsafe { corefoundation::api::CFAutorelease(array) as Id }
+}
+
+/// The `NSRunningApplication` for a running application: this process's own,
+/// or one kept for the pid, so a program comparing them finds one object.
+fn object_for(application: &server::protocol::Application) -> Id {
+    if application.pid == std::process::id() as i32 {
+        return current();
+    }
+    let mut launched = LAUNCHED.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((object, _)) = launched.iter().find(|(_, app)| app.pid == application.pid) {
+        return *object as Id;
+    }
+    let class = objc::class::lookup(c"NSRunningApplication").expect("declared before its methods");
+    let object = objc::object::create_instance(class, 0);
+    // The table outlives the object's address only as long as the object is
+    // kept, which is for the process: applications are few.
+    objc::arc::retain(object);
+    launched.push((
+        object as usize,
+        Launched {
+            pid: application.pid,
+            identifier: application.identifier.clone(),
+            name: application.name.clone(),
+        },
+    ));
+    object
 }
 
 /// `-[NSWorkspace iconForFileType:]` and `-iconForFile:`: a blank 32x32 image.
@@ -224,9 +270,13 @@ unsafe extern "C" fn running_is_active(receiver: Id, _sel: Sel) -> u8 {
     u8::from(launched(receiver, |_| ()).is_none())
 }
 
-/// `-activateWithOptions:`: already active, which Apple reports as success.
-unsafe extern "C" fn activate_with_options(_receiver: Id, _sel: Sel, _options: usize) -> u8 {
-    1
+/// `-activateWithOptions:`: this process is already active, which Apple
+/// reports as success; another application is asked to come forward.
+unsafe extern "C" fn activate_with_options(receiver: Id, _sel: Sel, _options: usize) -> u8 {
+    match launched(receiver, |app| app.pid) {
+        Some(pid) => u8::from(crate::launch::activate(pid)),
+        None => 1,
+    }
 }
 
 /// The strings of an `NSArray`, or nothing for nil.
@@ -268,18 +318,25 @@ fn launch_error(error: *mut Id, message: &str) -> Id {
     std::ptr::null_mut()
 }
 
-/// `-launchApplicationAtURL:options:configuration:error:`: start the bundle's
-/// executable as the guest's own `posix_spawn` would, so a Mach-O runs through
-/// this runtime, and answer an `NSRunningApplication` for it.
+/// `NSWorkspaceLaunchNewInstance`, which is `kLSLaunchNewInstance`.
+pub(crate) const LAUNCH_NEW_INSTANCE: usize = 0x0008_0000;
+
+/// `-launchApplicationAtURL:options:configuration:error:`: LaunchServices'
+/// launch of a bundle, answered with its `NSRunningApplication`.
 ///
-/// The launch options are about activation and Dock behaviour, which have no
-/// meaning here. Of the configuration only the arguments are applied; another
-/// key is named, not silently dropped.
+/// An instance already running is the application (see [`crate::launch`]): it
+/// is reopened and brought forward, and the arguments are dropped, as they are
+/// on a Mac. Otherwise this runtime runs the bundle, which claims the
+/// application itself, so two launches at once still make one instance.
+///
+/// The other launch options are about activation and Dock behaviour, which
+/// have no meaning here. Of the configuration only the arguments are applied;
+/// another key is named, not silently dropped.
 unsafe extern "C" fn launch_application(
     _receiver: Id,
     _sel: Sel,
     url: Id,
-    _options: usize,
+    options: usize,
     configuration: Id,
     error: *mut Id,
 ) -> Id {
@@ -289,12 +346,19 @@ unsafe extern "C" fn launch_application(
     else {
         return launch_error(error, "the application URL is not a file URL");
     };
-    let Some(bundle) = foundation::bundle::Layout::at(&prefix::ns::host_path(&path)) else {
+    let host = prefix::ns::host_path(&path);
+    if foundation::bundle::Layout::at(&host).is_none() {
         return launch_error(error, &format!("{path} is not an application bundle"));
+    }
+    let new_instance = options & LAUNCH_NEW_INSTANCE != 0;
+    let mode = match new_instance {
+        true => crate::launch::Launch::NewInstance,
+        false => crate::launch::Launch::Open,
     };
-    let Some(executable) = prefix::ns::to_guest(&bundle.executable) else {
-        return launch_error(error, &format!("{path} has no executable"));
-    };
+    if let Some(running) = crate::launch::running_instance(&host, mode) {
+        crate::launch::hand_over(running.pid, &[]);
+        return objc::arc::autorelease(objc::arc::retain(object_for(&running)));
+    }
 
     let mut arguments = Vec::new();
     // SAFETY: an `NSDictionary`, or nil.
@@ -312,39 +376,41 @@ unsafe extern "C" fn launch_application(
             }
         }
     }
+    match spawn_application(&path, &arguments, new_instance) {
+        Ok(running) => objc::arc::autorelease(objc::arc::retain(object_for(&running))),
+        Err(why) => launch_error(error, &format!("could not launch {path}: {why}")),
+    }
+}
+
+/// Run the bundle at the guest path `bundle` through this runtime, which
+/// claims the application or hands the launch over; see
+/// `darwin::spawn::spawn_application`.
+pub(crate) fn spawn_application(
+    bundle: &str,
+    arguments: &[String],
+    new_instance: bool,
+) -> Result<server::protocol::Application, std::io::Error> {
     let cstring = |text: &str| std::ffi::CString::new(text).unwrap_or_default();
-    let program = cstring(&executable.to_string_lossy());
-    let argv: Vec<std::ffi::CString> = std::iter::once(program.clone())
-        .chain(arguments.iter().map(|argument| cstring(argument)))
-        .collect();
-    let pid = match darwin::spawn::spawn_child(&program, &argv, None, None, [None; 3]) {
-        Ok(pid) => pid,
-        Err(errno) => {
-            let why = std::io::Error::from_raw_os_error(errno);
-            return launch_error(error, &format!("could not launch {path}: {why}"));
-        }
-    };
+    let argv: Vec<std::ffi::CString> = arguments.iter().map(|a| cstring(a)).collect();
+    let pid = darwin::spawn::spawn_application(&cstring(bundle), &argv, new_instance)
+        .map_err(std::io::Error::from_raw_os_error)?;
     // An application is not the launcher's to wait for, but its exit status
     // still has to be collected by somebody.
     std::thread::spawn(move || darwin::spawn::wait_child(pid, true));
-
-    let class = objc::class::lookup(c"NSRunningApplication").expect("declared before its methods");
-    let object = objc::object::create_instance(class, 0);
-    LAUNCHED.lock().unwrap_or_else(|e| e.into_inner()).push((
-        object as usize,
-        Launched {
-            pid,
-            identifier: bundle.identifier().map(str::to_owned),
-            name: bundle
-                .display_name()
+    let layout = foundation::bundle::Layout::at(&prefix::ns::host_path(bundle));
+    Ok(server::protocol::Application {
+        pid,
+        bundle: bundle.to_owned(),
+        identifier: layout
+            .as_ref()
+            .and_then(|l| l.identifier().map(str::to_owned)),
+        name: layout.as_ref().and_then(|l| {
+            l.display_name()
                 .map(str::to_owned)
-                .or_else(|| Some(bundle.root.file_stem()?.to_string_lossy().into_owned())),
-        },
-    ));
-    // The table outlives the object's address only as long as the object is
-    // kept, which is for the process: applications launched here are few.
-    objc::arc::retain(object);
-    objc::arc::autorelease(object)
+                .or_else(|| Some(l.root.file_stem()?.to_string_lossy().into_owned()))
+        }),
+        prohibited: false,
+    })
 }
 
 /// `+[NSRunningApplication runningApplicationWithProcessIdentifier:]`: an
@@ -400,15 +466,24 @@ unsafe extern "C" fn force_terminate(receiver: Id, _sel: Sel) -> u8 {
 
 /// `+[NSRunningApplication runningApplicationsWithBundleIdentifier:]`.
 ///
-/// Host processes are not registered applications in this Darwin workspace.
-unsafe extern "C" fn running_applications(_class: Id, _sel: Sel, _identifier: Id) -> Id {
-    let array = corefoundation::collections::new_array(
-        &[],
-        corefoundation::callbacks::Policy::from_type_callbacks(),
-        false,
-    );
-    // SAFETY: a fresh CFArray, toll-free bridged to NSArray.
-    unsafe { corefoundation::api::CFAutorelease(array) as Id }
+/// What a program that keeps itself to one instance asks: finding another, it
+/// activates that one and quits.
+unsafe extern "C" fn running_applications(_class: Id, _sel: Sel, identifier: Id) -> Id {
+    if identifier.is_null() {
+        return autoreleased_array(&[]);
+    }
+    // SAFETY: an `NSString`.
+    let wanted = unsafe { text(identifier) };
+    let mut objects: Vec<Id> = server::client::applications(Some(&wanted))
+        .unwrap_or_default()
+        .iter()
+        .map(object_for)
+        .collect();
+    let mine = foundation::bundle::main().and_then(|b| b.identifier()) == Some(wanted.as_str());
+    if mine && !objects.contains(&current()) {
+        objects.push(current());
+    }
+    autoreleased_array(&objects)
 }
 
 unsafe extern "C" fn is_file_package(_receiver: Id, _sel: Sel, path: Id) -> u8 {

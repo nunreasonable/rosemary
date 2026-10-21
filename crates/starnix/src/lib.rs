@@ -18,9 +18,11 @@
 //! * [`xattr`] - extended attributes by descriptor or path.
 //! * [`fd`] - a path that reaches what a descriptor has open.
 //! * [`signal`] - what the kernel hands a signal handler.
+//! * [`memory`] - copies of this process's memory that fail instead of faulting.
 
 pub mod errno;
 pub mod fd;
+pub mod memory;
 pub mod net;
 pub mod process;
 pub mod signal;

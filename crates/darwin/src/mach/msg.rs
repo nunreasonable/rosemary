@@ -62,14 +62,14 @@ const TRAILER_FORMAT_0: u32 = 0;
 /// The envelope that crosses the socket, in front of the message's own bytes.
 mod envelope {
     pub const MAGIC: u32 = 0x3372_4d43;
-    pub const VERSION: u32 = 1;
+    pub const VERSION: u32 = 2;
     /// Fixed part: magic, version, bits, id, descriptor count, payload length,
     /// then the reply reference.
     pub const FIXED: usize = 24 + super::REFERENCE;
 }
 
-/// A port reference as it crosses: 16 bytes, never a name.
-const REFERENCE: usize = 16;
+/// A port reference as it crosses: 24 bytes, never a name.
+const REFERENCE: usize = 24;
 
 /// What a [`Reference`] refers to.
 mod refkind {
@@ -109,6 +109,7 @@ struct Reference {
     claims: u16,
     complete: bool,
     address: u64,
+    image: u64,
 }
 
 impl Reference {
@@ -120,6 +121,7 @@ impl Reference {
         claims: 0,
         complete: false,
         address: 0,
+        image: 0,
     };
 
     fn encode(&self, out: &mut Vec<u8>) {
@@ -131,6 +133,7 @@ impl Reference {
             | u32::from(self.complete) << 17;
         out.extend_from_slice(&extra.to_le_bytes());
         out.extend_from_slice(&self.address.to_le_bytes());
+        out.extend_from_slice(&self.image.to_le_bytes());
     }
 
     fn decode(bytes: &[u8]) -> Option<Reference> {
@@ -144,6 +147,7 @@ impl Reference {
             claims: (extra & 0xffff) as u16,
             complete: extra & 1 << 17 != 0,
             address: u64::from_le_bytes(bytes[8..16].try_into().ok()?),
+            image: u64::from_le_bytes(bytes[16..24].try_into().ok()?),
         })
     }
 
@@ -217,7 +221,7 @@ impl Reference {
                 None => MACH_PORT_DEAD,
             },
             refkind::DEAD => MACH_PORT_DEAD,
-            refkind::TASK => space::insert_task(self.address as i32),
+            refkind::TASK => space::insert_task(self.address as i32, self.image),
             refkind::MEMORY | refkind::FILE => {
                 let Some(fd) = usize::try_from(self.fd_index).ok().and_then(|i| message.take_fd(i))
                 else {
@@ -358,6 +362,7 @@ fn export(name: Name, disposition: u32) -> Result<(Reference, Option<Pending>), 
                 claims: (offset / 4096) as u16,
                 complete: false,
                 address: size,
+                image: 0,
             },
             Some(Pending::Backed {
                 file,
@@ -367,7 +372,11 @@ fn export(name: Name, disposition: u32) -> Result<(Reference, Option<Pending>), 
     }
     // A task port has no queue here either: the receiver gets its own name
     // for the same pid, as `task_for_pid` would have given it.
-    if let Some(pid) = space::task_pid(name) {
+    if let Ok(target) = space::target(name) {
+        let (pid, image) = match target {
+            space::Target::Local => (crate::process::guest_pid(std::process::id() as i32), server::client::image()),
+            space::Target::Remote { pid, image } => (pid, image),
+        };
         if !matches!(disposition, MAKE_SEND | COPY_SEND | MOVE_SEND) {
             return Err(MACH_SEND_INVALID_RIGHT);
         }
@@ -376,6 +385,7 @@ fn export(name: Name, disposition: u32) -> Result<(Reference, Option<Pending>), 
                 kind: refkind::TASK,
                 disposition: MOVE_SEND as u8,
                 address: pid as u64,
+                image,
                 ..Reference::NONE
             },
             Some(match disposition {
@@ -398,6 +408,7 @@ fn export(name: Name, disposition: u32) -> Result<(Reference, Option<Pending>), 
                     claims: 0,
                     complete: moved.complete,
                     address,
+                    image: 0,
                 },
                 Some(Pending::Receive { moved, address }),
             ))
@@ -417,6 +428,7 @@ fn export(name: Name, disposition: u32) -> Result<(Reference, Option<Pending>), 
                     claims: 0,
                     complete: false,
                     address,
+                    image: 0,
                 },
                 Some(held),
             ))
@@ -436,6 +448,7 @@ fn export(name: Name, disposition: u32) -> Result<(Reference, Option<Pending>), 
                     claims: 0,
                     complete: false,
                     address,
+                    image: 0,
                 },
                 Some(held),
             ))
@@ -1126,8 +1139,8 @@ pub unsafe extern "C" fn mach_msg(
     MACH_MSG_SUCCESS
 }
 
-/// `ROSEMARY_TRACE_MACH_MSG`: one line per message sent or received, with the
-/// header and the type of each descriptor.
+/// `ROSEMARY_TRACE_MACH_MSG`: at most 4096 message headers per process,
+/// including descriptor types but never their payloads.
 ///
 /// # Safety
 ///
@@ -1135,6 +1148,17 @@ pub unsafe extern "C" fn mach_msg(
 unsafe fn trace(what: &str, msg: *const u8, rc: i32) {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if !*ON.get_or_init(|| std::env::var_os("ROSEMARY_TRACE_MACH_MSG").is_some()) {
+        return;
+    }
+    static COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    if COUNT
+        .fetch_update(
+            std::sync::atomic::Ordering::Relaxed,
+            std::sync::atomic::Ordering::Relaxed,
+            |count| (count < 4096).then_some(count + 1),
+        )
+        .is_err()
+    {
         return;
     }
     // SAFETY: the caller's header.
@@ -1162,8 +1186,8 @@ unsafe fn trace(what: &str, msg: *const u8, rc: i32) {
             }
         }
     }
-    eprintln!(
-        "rosemary: mach_msg[{}] {what} rc={rc:#x} bits={:#x} size={} remote={:#x} local={:#x} id={}{kinds}",
+    let line = format!(
+        "rosemary: mach_msg[{}] {what} rc={rc:#x} bits={:#x} size={} remote={:#x} local={:#x} id={}{kinds}\n",
         std::process::id(),
         header[0],
         header[1],
@@ -1171,6 +1195,10 @@ unsafe fn trace(what: &str, msg: *const u8, rc: i32) {
         header[3],
         header[5] as i32,
     );
+    // Format before writing so separate processes sharing stderr do not
+    // interleave individual formatting arguments within a diagnostic line.
+    use std::io::Write;
+    let _ = std::io::stderr().lock().write_all(line.as_bytes());
 }
 
 /// `mach_msg_return_t mach_msg_overwrite(...)` - `mach_msg` with a separate
@@ -1357,6 +1385,19 @@ pub use reply::{mig_dealloc_reply_port, mig_get_reply_port, mig_put_reply_port};
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn task_reference_preserves_process_image_identity() {
+        let reference = Reference { address: 42, image: 0xfedc_ba98_7654_3210, ..Reference::NONE };
+        let mut bytes = Vec::new();
+        reference.encode(&mut bytes);
+        assert_eq!(bytes.len(), REFERENCE);
+        let decoded = Reference::decode(&bytes).unwrap();
+        assert_eq!(decoded.address, 42);
+        assert_eq!(decoded.image, reference.image);
+        assert!(Reference::decode(&bytes[..16]).is_none());
+    }
+
 
     /// Build a `mach_msg_header_t` plus `extra` bytes of payload.
     fn message(bits: u32, remote: Name, local: Name, id: i32, extra: &[u8]) -> Vec<u8> {

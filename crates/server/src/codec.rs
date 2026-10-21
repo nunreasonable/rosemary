@@ -63,6 +63,13 @@ impl<'a> Decoder<'a> {
         Ok(head)
     }
 
+    /// A length-prefixed byte string, as `Vec<u8>` encodes one, borrowed from
+    /// the message rather than copied out of it.
+    pub fn bytes(&mut self) -> Result<&'a [u8], Malformed> {
+        let len = take_len(self)?;
+        self.raw(len)
+    }
+
     /// Whether every byte was consumed. A message with bytes left over was
     /// encoded from a different shape than it is being decoded into.
     pub fn finished(&self) -> bool {

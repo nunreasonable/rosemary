@@ -718,6 +718,37 @@ const KEY_STRINGS: &[(&str, &str)] = &[
     ("_kSCPropNetInterfaceType", "Type"),
     ("_kSCNetworkInterfaceTypeEthernet", "Ethernet"),
     ("_kSCNetworkInterfaceTypeIEEE80211", "IEEE80211"),
+    // The keys of the proxies entity, which a browser reads at startup.
+    ("_kSCEntNetProxies", "Proxies"),
+    ("_kSCPropNetProxiesExceptionsList", "ExceptionsList"),
+    (
+        "_kSCPropNetProxiesExcludeSimpleHostnames",
+        "ExcludeSimpleHostnames",
+    ),
+    (
+        "_kSCPropNetProxiesProxyAutoDiscoveryEnable",
+        "ProxyAutoDiscoveryEnable",
+    ),
+    ("_kSCPropNetProxiesFTPEnable", "FTPEnable"),
+    ("_kSCPropNetProxiesFTPPort", "FTPPort"),
+    ("_kSCPropNetProxiesFTPProxy", "FTPProxy"),
+    ("_kSCPropNetProxiesHTTPEnable", "HTTPEnable"),
+    ("_kSCPropNetProxiesHTTPPort", "HTTPPort"),
+    ("_kSCPropNetProxiesHTTPProxy", "HTTPProxy"),
+    ("_kSCPropNetProxiesHTTPSEnable", "HTTPSEnable"),
+    ("_kSCPropNetProxiesHTTPSPort", "HTTPSPort"),
+    ("_kSCPropNetProxiesHTTPSProxy", "HTTPSProxy"),
+    (
+        "_kSCPropNetProxiesProxyAutoConfigEnable",
+        "ProxyAutoConfigEnable",
+    ),
+    (
+        "_kSCPropNetProxiesProxyAutoConfigURLString",
+        "ProxyAutoConfigURLString",
+    ),
+    ("_kSCPropNetProxiesSOCKSEnable", "SOCKSEnable"),
+    ("_kSCPropNetProxiesSOCKSPort", "SOCKSPort"),
+    ("_kSCPropNetProxiesSOCKSProxy", "SOCKSProxy"),
 ];
 
 /// The `kSC*` globals, as `(Mach-O name, address)`.

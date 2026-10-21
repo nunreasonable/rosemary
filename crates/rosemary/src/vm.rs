@@ -1580,6 +1580,12 @@ impl crate::exec::Execution for Vm {
     }
 
     fn prepare(&self) -> Result<(), VmError> {
+        // Another task's `vm_protect` and `vm_write` reach this one's memory
+        // from the service handler, past the shims: they keep the code cache's
+        // books through these instead.
+        crate::smc::warm();
+        darwin::mach::local::set_protect_hook(crate::shims::vmmap::protect_hook);
+        darwin::mach::local::set_write_hook(crate::smc::before_write);
         // The sampler and the overlay, neither of which a host without Mach and
         // Metal has. See the module list in `lib.rs`.
         #[cfg(target_os = "macos")]

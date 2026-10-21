@@ -169,7 +169,7 @@ pub fn post(name: &str, object: Id, user_info: Id) {
 /// Each block is copied *under the lock*: a `-removeObserver:` between the scan
 /// and the call would otherwise free a block this is about to invoke, and a
 /// queued delivery outlives the scan by definition.
-fn post_to_blocks(name: &str, object: Id, notification: Id) {
+pub(crate) fn post_to_blocks(name: &str, object: Id, notification: Id) {
     let targets: Vec<(usize, Id)> = BLOCK_OBSERVERS
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -199,7 +199,7 @@ unsafe impl Send for Delivery {}
 /// argument: a program observes on the main queue so that its handler can touch
 /// the UI, and running it wherever the post happened to come from would be the
 /// race it registered that way to avoid.
-fn deliver(block: usize, queue: Id, notification: Id) {
+pub(crate) fn deliver(block: usize, queue: Id, notification: Id) {
     if queue.is_null() {
         // SAFETY: a handler is `void (^)(NSNotification *)`.
         unsafe { block::call_with(block as Id, notification) };
@@ -225,7 +225,7 @@ fn deliver(block: usize, queue: Id, notification: Id) {
 ///
 /// Copied out under the lock for the reason the selector observers are: a
 /// callback may add or remove one.
-fn post_to_callbacks(center: Id, name: &str, object: *const c_void, user_info: Id) {
+pub(crate) fn post_to_callbacks(center: Id, name: &str, object: *const c_void, user_info: Id) {
     let name_object = crate::string::from_str(name);
     let targets: Vec<(Callback, *const c_void)> = CALLBACK_OBSERVERS
         .lock()
@@ -246,7 +246,7 @@ fn post_to_callbacks(center: Id, name: &str, object: *const c_void, user_info: I
 /// # Safety
 ///
 /// `observer` must be live and `selector` must name a method taking one object.
-unsafe fn send_notification(observer: Id, selector: Sel, notification: Id) {
+pub(crate) unsafe fn send_notification(observer: Id, selector: Sel, notification: Id) {
     let Some(method) =
         (unsafe { objc::object::class_of(observer) }).and_then(|c| c.method(selector))
     else {
@@ -264,6 +264,29 @@ unsafe fn send_notification(observer: Id, selector: Sel, notification: Id) {
         )
     };
     unsafe { f(observer, selector, notification) };
+}
+
+/// A notification's name, object and user info.
+///
+/// # Safety
+///
+/// `notification` must be one of this crate's.
+pub(crate) unsafe fn name_of(notification: Id) -> Id {
+    unsafe { (*(notification as *const Notification)).name }
+}
+
+/// # Safety
+///
+/// As [`name_of`].
+pub(crate) unsafe fn object_of(notification: Id) -> Id {
+    unsafe { (*(notification as *const Notification)).object }
+}
+
+/// # Safety
+///
+/// As [`name_of`].
+pub(crate) unsafe fn user_info_of(notification: Id) -> Id {
+    unsafe { (*(notification as *const Notification)).user_info }
 }
 
 unsafe extern "C" fn name(receiver: Id, _sel: Sel) -> Id {
@@ -377,7 +400,7 @@ unsafe extern "C" fn add_observer_for_name(
 ///
 /// Apple's is `__NSObserver`, and a guest has no business doing anything with it
 /// but handing it back, so the name is the only thing about it that matters.
-fn token_class() -> &'static Class {
+pub(crate) fn token_class() -> &'static Class {
     corefoundation::base::abstract_class(c"__NSObserver", None)
 }
 
@@ -469,7 +492,7 @@ unsafe extern "C" fn post_name_user_info(
 /// # Safety
 ///
 /// `string` must be null or a string object.
-unsafe fn text_of(string: Id) -> String {
+pub(crate) unsafe fn text_of(string: Id) -> String {
     if string.is_null() {
         return String::new();
     }
@@ -511,30 +534,18 @@ pub mod cf {
         local_center()
     }
 
-    /// The center for notifications from *other* processes.
-    ///
-    /// A center of its own, and one nothing ever posts to: there is no
-    /// distributed notification daemon behind this runtime, so no other process
-    /// is talking to the guest. Distinct from the local center rather than
-    /// aliased onto it, because a guest's own local posts must not arrive at an
-    /// observer that asked to hear only what another process said.
+    /// The center for notifications between processes, which is
+    /// `+[NSDistributedNotificationCenter defaultCenter]`; see
+    /// [`crate::distributed`].
     unsafe extern "C" fn CFNotificationCenterGetDistributedCenter() -> Id {
-        static CENTER: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-        *CENTER.get_or_init(|| {
-            let class = corefoundation::base::abstract_class(c"CFNotificationCenter", None);
-            let center = objc::object::create_instance(class, 0);
-            // Retained forever, as every singleton here is.
-            objc::arc::make_immortal(center);
-            center as usize
-        }) as Id
+        crate::distributed::center()
     }
 
     /// `CFNotificationCenterAddObserver(center, observer, callback, name,
     /// object, suspensionBehavior)`
     ///
-    /// The suspension behaviour is ignored: it says what a *distributed* center
-    /// should do with notifications that arrive while the process is suspended,
-    /// and nothing posts to the distributed center here.
+    /// The suspension behaviour is ignored: a suspended process holds every
+    /// distributed notification until it resumes; see [`crate::distributed`].
     unsafe extern "C" fn CFNotificationCenterAddObserver(
         center: Id,
         observer: *const c_void,
@@ -558,6 +569,9 @@ pub mod cf {
                 name,
                 object,
             });
+        if center == crate::distributed::center() {
+            crate::distributed::listen_now();
+        }
     }
 
     unsafe extern "C" fn CFNotificationCenterRemoveEveryObserver(
@@ -570,8 +584,37 @@ pub mod cf {
             .retain(|o| o.center != center || o.observer != observer);
     }
 
+    /// `CFNotificationCenterPostNotification(center, name, object, userInfo,
+    /// deliverImmediately)`
+    ///
+    /// The local center is the class above's, so a post reaches every kind of
+    /// observer. A post to the distributed center goes to every process in
+    /// the prefix, this one included.
+    unsafe extern "C" fn CFNotificationCenterPostNotification(
+        center: Id,
+        name: Id,
+        object: *const c_void,
+        user_info: Id,
+        _immediately: u8,
+    ) {
+        if name.is_null() {
+            return;
+        }
+        // SAFETY: a string.
+        let text = unsafe { super::text_of(name) };
+        if center == crate::distributed::center() {
+            // The callbacks hear it when it arrives, as every process does.
+            crate::distributed::post(&text, object as Id, user_info);
+        } else if center == local_center() {
+            super::post(&text, object as Id, user_info);
+        } else {
+            super::post_to_callbacks(center, &text, object, user_info);
+        }
+    }
+
     exports::exports! {
         functions {
+            "CFNotificationCenterPostNotification" => CFNotificationCenterPostNotification,
             "CFNotificationCenterGetLocalCenter" => CFNotificationCenterGetLocalCenter,
             "CFNotificationCenterGetDistributedCenter" => CFNotificationCenterGetDistributedCenter,
             "CFNotificationCenterAddObserver" => CFNotificationCenterAddObserver,

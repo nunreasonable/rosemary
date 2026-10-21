@@ -7,7 +7,7 @@ use corefoundation::base::CFTypeRef;
 #[repr(C)]
 pub struct Body<T> {
     isa: *const Class,
-    contents: *mut T,
+    pub(crate) contents: *mut T,
 }
 
 pub fn register<T: 'static>(

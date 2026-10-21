@@ -820,10 +820,39 @@ unsafe extern "C" fn init_with_content_rect(
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .push((sdl as usize, receiver as usize));
+    // AppKit gives every window a plain content view, and a toolkit adds its
+    // own view to it rather than replacing it - Gecko does.
     if window.content_view.is_null() {
         install_default_content_view(receiver, content_size);
     }
     receiver
+}
+
+/// An `NSView` the size of the content rectangle, as the window's content view.
+fn install_default_content_view(window: Id, size: NSSize) {
+    let Some(class) = objc::class::lookup(c"NSView") else {
+        return;
+    };
+    let frame = NSRect {
+        origin: NSPoint::default(),
+        size,
+    };
+    // SAFETY: `-initWithFrame:` is `id (id, SEL, NSRect)` and `-setContentView:`
+    // takes the view, which it retains; this call's reference is then spent.
+    unsafe {
+        let init: unsafe extern "C" fn(Id, Sel, NSRect) -> Id =
+            std::mem::transmute(objc::msg::entry());
+        let view = init(
+            objc::object::create_instance(class, 0),
+            objc::sel::get("initWithFrame:"),
+            frame,
+        );
+        if view.is_null() {
+            return;
+        }
+        set_content_view(window, objc::sel::get("setContentView:"), view);
+        objc::arc::release(view);
+    }
 }
 
 /// The designated initializer's screen-aware spelling. SDL chooses the host
@@ -1403,29 +1432,7 @@ unsafe extern "C" fn content_view(receiver: Id, sel: Sel) -> Id {
 
 // Adapted from upstream 565e7340: a window owns a correctly sized root view
 // before a toolkit attaches children or performs its first layout pass.
-fn install_default_content_view(window: Id, size: NSSize) {
-    let Some(class) = objc::class::lookup(c"NSView") else {
-        return;
-    };
-    let frame = NSRect {
-        origin: NSPoint::default(),
-        size,
-    };
-    unsafe {
-        let init: unsafe extern "C" fn(Id, Sel, NSRect) -> Id =
-            std::mem::transmute(objc::msg::entry());
-        let view = init(
-            objc::object::create_instance(class, 0),
-            objc::sel::get("initWithFrame:"),
-            frame,
-        );
-        if view.is_null() {
-            return;
-        }
-        set_content_view(window, objc::sel::get("setContentView:"), view);
-        objc::arc::release(view);
-    }
-}
+
 
 /// `-setContentView:`, which **resizes the view to the window**.
 ///
@@ -1601,6 +1608,7 @@ fn order_front(receiver: Id, make_key: bool) {
     );
     if make_key && want != Presentation::Tooltip {
         KEY.store(receiver as usize, std::sync::atomic::Ordering::Release);
+        crate::event::announce_key(receiver);
     }
     let window = window_of(receiver);
     if window.first_responder.is_null() && !window.initial_first_responder.is_null() {
@@ -1645,6 +1653,7 @@ unsafe extern "C" fn order_out(receiver: Id, _sel: Sel, _sender: Id) {
         std::sync::atomic::Ordering::AcqRel,
         std::sync::atomic::Ordering::Acquire,
     );
+    crate::event::announce_resign(receiver);
 }
 
 /// `-dealloc`. The content view is told it has no window before it is released,
@@ -1654,6 +1663,11 @@ unsafe extern "C" fn order_out(receiver: Id, _sel: Sel, _sender: Id) {
 /// The SDL window is hidden rather than destroyed: a Metal swapchain may still
 /// be keyed by it, and that table is not this crate's to clear.
 pub(crate) unsafe extern "C" fn dealloc(receiver: Id, sel: Sel) {
+    crate::event::forget_announced(receiver);
+    children()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .retain(|(p, c)| *p != receiver as usize && *c != receiver as usize);
     let window = window_of(receiver);
     objc::arc::release(std::mem::replace(
         &mut window.appearance,
@@ -1972,6 +1986,13 @@ unsafe extern "C" fn screen(receiver: Id, _sel: Sel) -> Id {
     }
 }
 
+/// `-userSpaceScaleFactor`: the backing factor, as `NSScreen`'s answers, so a
+/// window and its screen agree.
+unsafe extern "C" fn user_space_scale_factor(receiver: Id, sel: Sel) -> f64 {
+    // SAFETY: `-backingScaleFactor` is `CGFloat (id, SEL)`.
+    unsafe { backing_scale_factor(receiver, sel) }
+}
+
 unsafe extern "C" fn backing_scale_factor(receiver: Id, _sel: Sel) -> CGFloat {
     let sdl = window_of(receiver).sdl;
     match sdl.is_null() {
@@ -2002,6 +2023,12 @@ unsafe extern "C" fn convert_rect_to_backing(receiver: Id, sel: Sel, rect: NSRec
 unsafe extern "C" fn convert_rect_from_backing(receiver: Id, sel: Sel, rect: NSRect) -> NSRect {
     // SAFETY: the receiver is a window.
     scale_rect(rect, 1.0 / unsafe { backing_scale_factor(receiver, sel) })
+}
+
+/// `-animator`: the window itself, as a view's is, so what a program animates
+/// is set at once, which is where the animation would have ended.
+unsafe extern "C" fn animator(receiver: Id, _sel: Sel) -> Id {
+    receiver
 }
 
 unsafe extern "C" fn set_background_color(receiver: Id, _sel: Sel, color: Id) {
@@ -2525,6 +2552,87 @@ unsafe extern "C" fn window_number(receiver: Id, _sel: Sel) -> isize {
 /// default or cannot be told. Present rather than absent because a program calls
 /// them in a row while setting a window up, and a refusal on any would stop it
 /// on a line that changes nothing about whether it can draw.
+/// `-setFrameTopLeftPoint:`: the origin that puts the top-left corner there,
+/// keeping the height.
+unsafe extern "C" fn set_frame_top_left_point(receiver: Id, sel: Sel, point: NSPoint) {
+    // SAFETY: `-frame` and `-setFrameOrigin:` of the same window.
+    unsafe {
+        let height = frame(receiver, sel).size.height;
+        set_frame_origin(
+            receiver,
+            sel,
+            NSPoint {
+                x: point.x,
+                y: point.y - height,
+            },
+        );
+    }
+}
+
+/// `-hasShadow`: AppKit's default, which is a shadow on every window with a
+/// title bar. `-setHasShadow:` is not kept, as the compositor draws shadows.
+unsafe extern "C" fn has_shadow(receiver: Id, _sel: Sel) -> u8 {
+    u8::from(window_of(receiver).style_mask & style::TITLED != 0)
+}
+
+/// `-showsResizeIndicator`: whether the window can be resized, which is when
+/// AppKit draws one.
+unsafe extern "C" fn shows_resize_indicator(receiver: Id, _sel: Sel) -> u8 {
+    u8::from(window_of(receiver).style_mask & style::RESIZABLE != 0)
+}
+
+/// Child windows by parent, and each child's parent.
+///
+/// FIXME (ACCURACY): the relation is kept and answered, but a child does not
+/// move with its parent or stay ordered above it; each is its own toplevel to
+/// the compositor.
+fn children() -> &'static std::sync::Mutex<Vec<(usize, usize)>> {
+    static TABLE: std::sync::Mutex<Vec<(usize, usize)>> = std::sync::Mutex::new(Vec::new());
+    &TABLE
+}
+
+unsafe extern "C" fn add_child_window(receiver: Id, _sel: Sel, child: Id, _ordered: isize) {
+    if child.is_null() {
+        return;
+    }
+    let mut table = children().lock().unwrap_or_else(|e| e.into_inner());
+    table.retain(|(_, c)| *c != child as usize);
+    table.push((receiver as usize, child as usize));
+    objc::arc::store_weak(&mut window_of(child).parent_window, receiver);
+}
+
+unsafe extern "C" fn remove_child_window(receiver: Id, _sel: Sel, child: Id) {
+    if !child.is_null() && window_of(child).parent_window == receiver {
+        objc::arc::store_weak(&mut window_of(child).parent_window, std::ptr::null_mut());
+    }
+    children()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .retain(|(p, c)| !(*p == receiver as usize && *c == child as usize));
+}
+
+unsafe extern "C" fn child_windows(receiver: Id, _sel: Sel) -> Id {
+    let list: Vec<corefoundation::base::CFTypeRef> = children()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .filter(|(p, _)| *p == receiver as usize)
+        .map(|(_, c)| *c as corefoundation::base::CFTypeRef)
+        .collect();
+    if list.is_empty() {
+        return std::ptr::null_mut();
+    }
+    let array = corefoundation::collections::new_array(
+        &list,
+        corefoundation::callbacks::Policy::from_type_callbacks(),
+        false,
+    );
+    // SAFETY: a fresh array this call owns.
+    unsafe { corefoundation::api::CFAutorelease(array) as Id }
+}
+
+
+
 unsafe extern "C" fn ignored_flag(_receiver: Id, _sel: Sel, _flag: u8) {}
 
 unsafe extern "C" fn ignored_object(_receiver: Id, _sel: Sel, _object: Id) {}
@@ -2709,6 +2817,12 @@ pub(crate) fn install() {
         "setFrame:display:" => set_frame_display, c"v52@0:8{CGRect={CGPoint=dd}{CGSize=dd}}16c48";
         "setFrame:display:animate:" => set_frame_display_animate, c"v52@0:8{CGRect={CGPoint=dd}{CGSize=dd}}16c48c49";
         "setFrameOrigin:" => set_frame_origin, c"v32@0:8{CGPoint=dd}16";
+        "setFrameTopLeftPoint:" => set_frame_top_left_point, c"v32@0:8{CGPoint=dd}16";
+        "hasShadow" => has_shadow, c"c16@0:8";
+        "showsResizeIndicator" => shows_resize_indicator, c"c16@0:8";
+        "addChildWindow:ordered:" => add_child_window, c"v32@0:8@16q24";
+        "removeChildWindow:" => remove_child_window, c"v24@0:8@16";
+        "childWindows" => child_windows, c"@16@0:8";
         "convertBaseToScreen:" => convert_base_to_screen, c"{CGPoint=dd}32@0:8{CGPoint=dd}16";
         "convertScreenToBase:" => convert_screen_to_base, c"{CGPoint=dd}32@0:8{CGPoint=dd}16";
         "convertPointFromScreen:" => convert_screen_to_base, c"{CGPoint=dd}32@0:8{CGPoint=dd}16";
@@ -2732,6 +2846,10 @@ pub(crate) fn install() {
         "makeKeyAndOrderFront:" => make_key_and_order_front, c"v24@0:8@16";
         "makeKeyWindow" => ignored, c"v16@0:8";
         "makeMainWindow" => ignored, c"v16@0:8";
+        // Private. The number is SDL's window id and cannot be reassigned;
+        // Gecko sets -1 then the old number back to reset a reshown popup in
+        // the window server's cache, which this runtime has no counterpart of.
+        "_setWindowNumber:" => ignored_integer, c"v24@0:8q16";
         "orderFront:" => make_key_and_order_front, c"v24@0:8@16";
         "orderFrontRegardless" => order_front_regardless, c"v16@0:8";
         "orderOut:" => order_out, c"v24@0:8@16";
@@ -2752,6 +2870,7 @@ pub(crate) fn install() {
         "attachedSheet" => nil, c"@16@0:8";
         "screen" => screen, c"@16@0:8";
         "backingScaleFactor" => backing_scale_factor, c"d16@0:8";
+        "userSpaceScaleFactor" => user_space_scale_factor, c"d16@0:8";
         "convertRectToBacking:" => convert_rect_to_backing,
             c"{CGRect={CGPoint=dd}{CGSize=dd}}48@0:8{CGRect={CGPoint=dd}{CGSize=dd}}16";
         "convertRectFromBacking:" => convert_rect_from_backing,
@@ -2820,6 +2939,7 @@ pub(crate) fn install() {
         "setDynamicDepthLimit:" => ignored_flag, c"v20@0:8c16";
         "setMovableByWindowBackground:" => ignored_flag, c"v20@0:8c16";
         "setAlphaValue:" => set_alpha_value, c"v24@0:8d16";
+        "animator" => animator, c"@16@0:8";
         "alphaValue" => alpha_value, c"d16@0:8";
         "setShowsToolbarButton:" => set_shows_toolbar_button, c"v20@0:8c16";
         "showsToolbarButton" => shows_toolbar_button, c"c16@0:8";

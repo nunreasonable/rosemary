@@ -826,6 +826,9 @@ extern "C" fn entry(raw: *mut c_void) -> *mut c_void {
     // `sigaltstack` is per thread. Without one here, a fault whose cause has
     // already made this thread's stack unusable takes the report with it.
     crate::fault::install_alternate_stack();
+    // The server may ask this task for something at any moment, and this
+    // thread may be the one its signal lands on.
+    darwin::mach::service::prepare_thread();
 
     if let Err(e) = adopt(stack) {
         // No error channel.

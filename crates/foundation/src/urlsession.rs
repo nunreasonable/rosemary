@@ -1,4 +1,5 @@
 use std::sync::OnceLock;
+use std::sync::atomic::Ordering;
 
 use objc::class::Class;
 use objc::object::Id;
@@ -491,6 +492,7 @@ fn perform(request: &Request) -> Result<(Response, Vec<u8>), String> {
         .limit(u64::MAX)
         .read_to_vec()
         .map_err(|e| format!("the response body could not be read: {e}"))?;
+    crate::urlsession_trace::response(&request.url, status, &bytes);
     Ok((
         Response {
             url: request.url.clone(),
@@ -523,24 +525,6 @@ fn objects(result: Result<(Response, Vec<u8>), String>) -> (Id, Id, Id) {
     }
 }
 
-/// `-getTasksWithCompletionHandler:`: three empty arrays. Tasks here are not
-/// tracked by session once started, and a caller asks to cancel or resume what
-/// it finds - nothing, which is the answer it handles for an idle session.
-unsafe extern "C" fn get_tasks(_receiver: Id, _sel: Sel, block: Id) {
-    let empty = || {
-        let array = corefoundation::collections::new_array(
-            &[],
-            corefoundation::callbacks::Policy::from_type_callbacks(),
-            false,
-        );
-        // SAFETY: a fresh array, handed on autoreleased.
-        unsafe { corefoundation::api::CFAutorelease(array) as Id }
-    };
-    // SAFETY: a `void (^)(NSArray *, NSArray *, NSArray *)` block, the same
-    // shape as a completion handler's three objects.
-    unsafe { call_completion(block, empty(), empty(), empty()) };
-}
-
 /// Call a `void (^)(NSData *, NSURLResponse *, NSError *)` block.
 ///
 /// # Safety
@@ -566,48 +550,46 @@ unsafe fn call_completion(block: Id, data: Id, response: Id, error: Id) {
 
 //
 
-/// A data task: the request it will make, and the handler it will call.
+/// A task belongs to its session until its final callback has returned.
 struct Task {
     request: Request,
-    /// A heap copy, because `-resume` may be sent long after the block's own
-    /// scope ended. Released once the handler has run.
     completion: usize,
-    delegate: usize,
-    session: usize,
+    session: std::sync::atomic::AtomicUsize,
+    owner: std::sync::Arc<SessionState>,
     download: bool,
-    description: usize,
+    description: std::sync::Mutex<usize>,
     response: std::sync::atomic::AtomicUsize,
-    /// Whether `-resume` has already been sent, so a second one does nothing -
-    /// which is what Apple's does for a task that is no longer suspended.
-    started: bool,
-    canceled: bool,
+    started: std::sync::atomic::AtomicBool,
+    /// NSURLSessionTaskState: 0 running, 1 suspended, 2 canceling, 3 completed.
+    state: std::sync::atomic::AtomicUsize,
+    completion_claimed: std::sync::atomic::AtomicBool,
 }
 
 impl Drop for Task {
     fn drop(&mut self) {
-        objc::arc::release(self.description as Id);
-        objc::arc::release(self.response.load(std::sync::atomic::Ordering::Relaxed) as Id);
-        if !self.started {
-            objc::block::release(self.completion as Id);
-            objc::arc::release(self.delegate as Id);
-            objc::arc::release(self.session as Id);
-        }
+        objc::arc::release(
+            *self
+                .description
+                .get_mut()
+                .unwrap_or_else(|e| e.into_inner()) as Id,
+        );
+        objc::arc::release(self.response.load(Ordering::Relaxed) as Id);
+        objc::block::release(self.completion as Id);
+        objc::arc::release(self.session.load(Ordering::Relaxed) as Id);
     }
 }
 
-// SAFETY: the block is a heap copy the task owns until its handler has run, and
-// the runtime it belongs to is shared across threads already.
+// Only immutable data and synchronized ownership cross the worker boundary.
 unsafe impl Send for Task {}
+unsafe impl Sync for Task {}
 
 fn task_class() -> &'static Class {
     static CLASS: OnceLock<usize> = OnceLock::new();
     let ptr = *CLASS.get_or_init(|| {
         let base = corefoundation::base::abstract_class(c"NSURLSessionTask", None);
-        let task = register::<Task>(c"NSURLSessionDataTask", Some(base));
-        objc::class::ptr(task) as usize
+        objc::class::ptr(register::<Task>(c"NSURLSessionDataTask", Some(base))) as usize
     });
-    // SAFETY: the cell holds a class this function registered.
-    unsafe { objc::class::from_ptr(ptr as *const Class).expect("a class") }
+    unsafe { objc::class::from_ptr(ptr as *const Class).expect("registered") }
 }
 
 fn download_task_class() -> &'static Class {
@@ -619,270 +601,453 @@ fn download_task_class() -> &'static Class {
     )
 }
 
-/// `-resume`: run the request on a thread of its own and call the handler there.
-///
-/// A thread rather than the caller's, because that is what a caller of an
-/// asynchronous API is entitled to.
+/// Borrow shared state without manufacturing aliased mutable references.
+unsafe fn shared_contents<'a, T>(object: Id, class: &'static Class) -> Option<&'a T> {
+    if !unsafe { corefoundation::base::is_kind_of(object as CFTypeRef, class) } {
+        return None;
+    }
+    unsafe { (*(object as *const Body<T>)).contents.as_ref() }
+}
+
+unsafe fn task_of<'a>(object: Id) -> Option<&'a Task> {
+    unsafe { shared_contents(object, task_class()) }
+}
+
+fn enqueue(queue: usize, work: impl FnOnce() + Send + 'static) {
+    let op = crate::operation::with_work(work);
+    crate::operation::add_to_queue(queue as Id, op);
+    objc::arc::release(op);
+}
+
 unsafe extern "C" fn resume(receiver: Id, _sel: Sel) {
-    // SAFETY: the receiver is a task this module made.
-    let Some(task) = (unsafe { contents::<Task>(receiver, task_class()) }) else {
+    let Some(task) = (unsafe { task_of(receiver) }) else {
         return;
     };
-    if task.started || task.canceled {
+    if task.completion_claimed.load(Ordering::Acquire) || task.started.swap(true, Ordering::AcqRel)
+    {
         return;
     }
-    task.started = true;
+    if task
+        .state
+        .compare_exchange(1, 0, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return;
+    }
     let request = task.request.clone();
-    let completion = task.completion;
-    let delegate = task.delegate;
-    let session = task.session;
-    let download = task.download;
     let task_id = objc::arc::retain(receiver) as usize;
-    std::thread::spawn(move || {
-        // A thread of this runtime's making needs a pool of its own: everything
-        // handed to the completion handler is autoreleased into it.
+    // The synchronous transport can finish after cancellation. Its result is
+    // discarded if cancellation already queued the one terminal callback.
+    let spawned = std::thread::Builder::new()
+        .name("urlsession".into())
+        .spawn(move || {
+            let result = perform(&request);
+            complete_task(task_id, Some(result));
+            objc::arc::release(task_id as Id);
+        });
+    if spawned.is_err() {
+        complete_task(task_id, Some(Err("could not start network worker".into())));
+        objc::arc::release(task_id as Id);
+    }
+}
+
+unsafe extern "C" fn cancel(receiver: Id, _sel: Sel) {
+    complete_task(receiver as usize, None);
+}
+
+/// Claim the final callback once, including cancellation before first resume.
+fn complete_task(id: usize, result: Option<Result<(Response, Vec<u8>), String>>) {
+    let Some(task) = (unsafe { task_of(id as Id) }) else {
+        return;
+    };
+    if task.completion_claimed.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    if result.is_none() {
+        task.state.store(2, Ordering::Release);
+    }
+    objc::arc::retain(id as Id);
+    enqueue(task.owner.queue, move || {
         let pool = objc::arc::pool_push();
-        if download {
-            let result = perform(&request).and_then(|(response, bytes)| {
-                // SAFETY: the task is retained for the duration of this worker.
-                if let Some(task) = unsafe { contents::<Task>(task_id as Id, task_class()) } {
-                    let object = make(response_class(), response);
-                    task.response
-                        .store(object as usize, std::sync::atomic::Ordering::Release);
-                }
-                static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-                let path = format!(
-                    "/tmp/rosemary-download-{}-{}",
-                    std::process::id(),
-                    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                );
-                let host = prefix::ns::host_path(&path);
-                std::fs::write(host, bytes).map_err(|e| e.to_string())?;
-                Ok(path)
-            });
-            if completion != 0 {
-                // The handler form: no delegate callbacks. Apple removes the
-                // file once the handler returns, so the handler must move it.
-                let response = unsafe { contents::<Task>(task_id as Id, task_class()) }
-                    .map_or(0, |t| t.response.load(std::sync::atomic::Ordering::Acquire));
-                let (url, error) = match &result {
-                    Ok(path) => (
-                        objc::arc::autorelease(corefoundation::url::new_file_url(path, false) as Id),
-                        std::ptr::null_mut(),
-                    ),
-                    Err(message) => (
-                        std::ptr::null_mut(),
-                        crate::error::make(
-                            crate::error::NSURL_ERROR_DOMAIN,
-                            crate::error::NSURL_ERROR_UNKNOWN,
-                            message,
-                        ),
-                    ),
-                };
-                // SAFETY: the block was retained when the task was made, and
-                // takes (NSURL *, NSURLResponse *, NSError *) like the data one.
-                unsafe { call_completion(completion as Id, url, response as Id, error) };
-                if let Ok(path) = &result {
-                    let _ = std::fs::remove_file(prefix::ns::host_path(path));
-                }
-            } else {
-                let error = match result {
-                    Ok(path) => {
-                        let url = corefoundation::url::new_file_url(&path, false) as Id;
-                        // SAFETY: the delegate implements this optional method, and
-                        // the task retains it until the callback returns.
-                        unsafe {
-                            let f: unsafe extern "C" fn(Id, Sel, Id, Id, Id) =
-                                std::mem::transmute(objc::msg::entry());
-                            f(
-                                delegate as Id,
-                                objc::sel::get(
-                                    "URLSession:downloadTask:didFinishDownloadingToURL:",
-                                ),
-                                session as Id,
-                                task_id as Id,
-                                url,
-                            );
-                            corefoundation::api::CFRelease(url as CFTypeRef);
-                        }
-                        std::ptr::null_mut()
-                    }
-                    Err(message) => crate::error::make(
-                        crate::error::NSURL_ERROR_DOMAIN,
-                        crate::error::NSURL_ERROR_UNKNOWN,
-                        &message,
-                    ),
-                };
-                // SAFETY: the delegate and session are retained by this task.
-                unsafe {
-                    let f: unsafe extern "C" fn(Id, Sel, Id, Id, Id) =
-                        std::mem::transmute(objc::msg::entry());
-                    f(
-                        delegate as Id,
-                        objc::sel::get("URLSession:task:didCompleteWithError:"),
-                        session as Id,
-                        task_id as Id,
-                        error,
+        let task = unsafe { task_of(id as Id) }.expect("retained task");
+        let session = task.session.load(Ordering::Acquire);
+        let mut temporary = None;
+        let (data, response, error) = match result {
+            None => (
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                crate::error::make(crate::error::NSURL_ERROR_DOMAIN, -999, "cancelled"),
+            ),
+            Some(Err(message)) => objects(Err(message)),
+            Some(Ok((response, bytes))) => {
+                let response = objc::arc::autorelease(make(response_class(), response));
+                if task.download {
+                    static NEXT: std::sync::atomic::AtomicU64 =
+                        std::sync::atomic::AtomicU64::new(0);
+                    let path = format!(
+                        "/tmp/rosemary-download-{}-{}",
+                        std::process::id(),
+                        NEXT.fetch_add(1, Ordering::Relaxed)
                     );
+                    match std::fs::write(prefix::ns::host_path(&path), bytes) {
+                        Ok(()) => {
+                            let url = objc::arc::autorelease(corefoundation::url::new_file_url(
+                                &path, false,
+                            ) as Id);
+                            temporary = Some(path);
+                            (url, response, std::ptr::null_mut())
+                        }
+                        Err(e) => (
+                            std::ptr::null_mut(),
+                            response,
+                            crate::error::make(
+                                crate::error::NSURL_ERROR_DOMAIN,
+                                -1,
+                                &e.to_string(),
+                            ),
+                        ),
+                    }
+                } else {
+                    let data = corefoundation::collections::new_data(bytes);
+                    (
+                        unsafe { corefoundation::api::CFAutorelease(data) as Id },
+                        response,
+                        std::ptr::null_mut(),
+                    )
                 }
             }
+        };
+        task.response
+            .store(objc::arc::retain(response) as usize, Ordering::Release);
+        task.state.store(3, Ordering::Release);
+        if task.completion != 0 {
+            unsafe { call_completion(task.completion as Id, data, response, error) };
         } else {
-            let (data, response, error) = objects(perform(&request));
-            // SAFETY: the block was retained when the task was made.
-            unsafe { call_completion(completion as Id, data, response, error) };
+            let delegate = task.owner.delegate.load(Ordering::Acquire) as Id;
+            if task.download && error.is_null() {
+                send_optional(
+                    delegate,
+                    "URLSession:downloadTask:didFinishDownloadingToURL:",
+                    session as Id,
+                    id as Id,
+                    data,
+                );
+            }
+            send_optional(
+                delegate,
+                "URLSession:task:didCompleteWithError:",
+                session as Id,
+                id as Id,
+                error,
+            );
         }
-        objc::arc::pool_pop(pool);
-        objc::block::release(completion as Id);
-        objc::arc::release(delegate as Id);
+        if let Some(path) = temporary {
+            let _ = std::fs::remove_file(prefix::ns::host_path(&path));
+        }
+        let owner = task.owner.clone();
+        let held = {
+            let mut progress = owner.progress.lock().unwrap_or_else(|e| e.into_inner());
+            progress.tasks.remove(&id)
+        };
+        if held.is_some() {
+            objc::arc::release(id as Id);
+        }
+        maybe_invalidated(session, &owner);
+        let session = task.session.swap(0, Ordering::AcqRel);
         objc::arc::release(session as Id);
-        objc::arc::release(task_id as Id);
+        objc::arc::pool_pop(pool);
+        objc::arc::release(id as Id);
     });
 }
 
-/// `-cancel`, which cannot stop a request already in flight.
-///
-/// The task is marked canceled so a later `-resume` does nothing, and a request
-/// already running is left to finish - its handler still runs, which is what a
-/// caller waiting on one needs. Apple's calls the handler with
-/// `NSURLErrorCancelled` instead; matching that would need the transport to be
-/// interruptible, and claiming it without being able to is worse than saying so
-/// here.
-unsafe extern "C" fn cancel(receiver: Id, _sel: Sel) {
-    // SAFETY: the receiver is a task this module made.
-    if let Some(task) = unsafe { contents::<Task>(receiver, task_class()) } {
-        task.canceled = true;
+fn send_optional(delegate: Id, name: &str, session: Id, task: Id, value: Id) {
+    let sel = objc::sel::get(name);
+    if unsafe { objc::object::class_of(delegate) }
+        .and_then(|c| c.method(sel))
+        .is_some()
+    {
+        unsafe {
+            let f: unsafe extern "C" fn(Id, Sel, Id, Id, Id) =
+                std::mem::transmute(objc::msg::entry());
+            f(delegate, sel, session, task, value);
+        }
     }
 }
 
+unsafe extern "C" fn task_state(receiver: Id, _sel: Sel) -> usize {
+    unsafe { task_of(receiver) }.map_or(3, |t| t.state.load(Ordering::Acquire))
+}
+
 unsafe extern "C" fn set_task_description(receiver: Id, _sel: Sel, description: Id) {
-    // SAFETY: the receiver is a task this module made.
-    let Some(task) = (unsafe { contents::<Task>(receiver, task_class()) }) else {
-        return;
-    };
-    let old = std::mem::replace(
-        &mut task.description,
-        objc::arc::retain(description) as usize,
-    );
-    objc::arc::release(old as Id);
+    if let Some(task) = unsafe { task_of(receiver) } {
+        let old = std::mem::replace(
+            &mut *task.description.lock().unwrap_or_else(|e| e.into_inner()),
+            objc::arc::retain(description) as usize,
+        );
+        objc::arc::release(old as Id);
+    }
 }
 
 unsafe extern "C" fn task_description(receiver: Id, _sel: Sel) -> Id {
-    // SAFETY: the receiver is a task this module made.
-    unsafe { contents::<Task>(receiver, task_class()) }
-        .map_or(std::ptr::null_mut(), |task| task.description as Id)
-}
-
-unsafe extern "C" fn task_current_request(receiver: Id, _sel: Sel) -> Id {
-    // SAFETY: the receiver is a task this module made.
-    let Some(task) = (unsafe { contents::<Task>(receiver, task_class()) }) else {
-        return std::ptr::null_mut();
-    };
-    objc::arc::autorelease(make(immutable_request_class(), task.request.clone()))
-}
-
-unsafe extern "C" fn task_response(receiver: Id, _sel: Sel) -> Id {
-    // SAFETY: the receiver is a task this module made.
-    unsafe { contents::<Task>(receiver, task_class()) }.map_or(std::ptr::null_mut(), |task| {
-        task.response.load(std::sync::atomic::Ordering::Acquire) as Id
+    unsafe { task_of(receiver) }.map_or(std::ptr::null_mut(), |task| {
+        let value = task.description.lock().unwrap_or_else(|e| e.into_inner());
+        objc::arc::autorelease(objc::arc::retain(*value as Id))
     })
 }
 
-//
+unsafe extern "C" fn task_current_request(receiver: Id, _sel: Sel) -> Id {
+    unsafe { task_of(receiver) }.map_or(std::ptr::null_mut(), |task| {
+        objc::arc::autorelease(make(immutable_request_class(), task.request.clone()))
+    })
+}
+
+unsafe extern "C" fn task_response(receiver: Id, _sel: Sel) -> Id {
+    unsafe { task_of(receiver) }.map_or(std::ptr::null_mut(), |task| {
+        task.response.load(Ordering::Acquire) as Id
+    })
+}
 
 fn session_class() -> &'static Class {
     register::<Session>(c"NSURLSession", None)
 }
-
 struct Session {
-    delegate: usize,
+    state: std::sync::Arc<SessionState>,
 }
-
-impl Drop for Session {
+struct SessionState {
+    delegate: std::sync::atomic::AtomicUsize,
+    queue: usize,
+    shared: bool,
+    progress: std::sync::Mutex<SessionProgress>,
+}
+#[derive(Default)]
+struct SessionProgress {
+    tasks: std::collections::HashMap<usize, bool>,
+    invalidating: bool,
+    notified: bool,
+}
+impl Drop for SessionState {
     fn drop(&mut self) {
-        objc::arc::release(self.delegate as Id);
+        objc::arc::release(self.delegate.load(Ordering::Relaxed) as Id);
+        objc::arc::release(self.queue as Id);
     }
 }
+unsafe fn session_of<'a>(receiver: Id) -> Option<&'a Session> {
+    unsafe { shared_contents(receiver, session_class()) }
+}
 
-/// `+sharedSession`, and `+sessionWithConfiguration:` - which is the same
-/// session, because there is one connection pool and no configuration this
-/// runtime reads.
+fn new_session(delegate: Id, queue: Id, shared: bool) -> Id {
+    let queue = if queue.is_null() {
+        crate::operation::serial_queue()
+    } else {
+        objc::arc::retain(queue)
+    };
+    make(
+        session_class(),
+        Session {
+            state: std::sync::Arc::new(SessionState {
+                delegate: std::sync::atomic::AtomicUsize::new(objc::arc::retain(delegate) as usize),
+                queue: queue as usize,
+                shared,
+                progress: Default::default(),
+            }),
+        },
+    )
+}
 unsafe extern "C" fn shared_session(_class: Id, _sel: Sel) -> Id {
     static SESSION: OnceLock<usize> = OnceLock::new();
     *SESSION.get_or_init(|| {
-        let session = make(session_class(), Session { delegate: 0 });
-        // Retained forever: a singleton a guest can release is one it can make
-        // dangle by releasing what it never owned.
+        let session = new_session(std::ptr::null_mut(), std::ptr::null_mut(), true);
         objc::arc::make_immortal(session);
         session as usize
     }) as Id
 }
-
-unsafe extern "C" fn session_with_configuration(class: Id, sel: Sel, _configuration: Id) -> Id {
-    // SAFETY: `+sharedSession` reads neither argument.
-    unsafe { shared_session(class, sel) }
-}
-
-unsafe extern "C" fn session_with_configuration_delegate_queue(
-    class: Id,
-    sel: Sel,
-    configuration: Id,
-    delegate: Id,
-    _queue: Id,
-) -> Id {
-    let _ = (class, sel, configuration);
-    objc::arc::autorelease(make(
-        session_class(),
-        Session {
-            delegate: objc::arc::retain(delegate) as usize,
-        },
+unsafe extern "C" fn session_with_configuration(_class: Id, _sel: Sel, _configuration: Id) -> Id {
+    objc::arc::autorelease(new_session(
+        std::ptr::null_mut(),
+        std::ptr::null_mut(),
+        false,
     ))
 }
+unsafe extern "C" fn session_with_configuration_delegate_queue(
+    _class: Id,
+    _sel: Sel,
+    _configuration: Id,
+    delegate: Id,
+    queue: Id,
+) -> Id {
+    objc::arc::autorelease(new_session(delegate, queue, false))
+}
+unsafe extern "C" fn delegate_queue(receiver: Id, _sel: Sel) -> Id {
+    unsafe { session_of(receiver) }.map_or(std::ptr::null_mut(), |s| s.state.queue as Id)
+}
 
-unsafe extern "C" fn invalidate_session(_receiver: Id, _sel: Sel) {}
+fn maybe_invalidated(receiver: usize, state: &std::sync::Arc<SessionState>) {
+    let notify = {
+        let mut p = state.progress.lock().unwrap_or_else(|e| e.into_inner());
+        if !p.invalidating || !p.tasks.is_empty() || p.notified {
+            false
+        } else {
+            p.notified = true;
+            true
+        }
+    };
+    if !notify {
+        return;
+    }
+    let state = state.clone();
+    objc::arc::retain(receiver as Id);
+    enqueue(state.queue, move || {
+        let pool = objc::arc::pool_push();
+        let delegate = state.delegate.swap(0, Ordering::AcqRel) as Id;
+        let sel = objc::sel::get("URLSession:didBecomeInvalidWithError:");
+        if unsafe { objc::object::class_of(delegate) }
+            .and_then(|c| c.method(sel))
+            .is_some()
+        {
+            unsafe {
+                let f: unsafe extern "C" fn(Id, Sel, Id, Id) =
+                    std::mem::transmute(objc::msg::entry());
+                f(delegate, sel, receiver as Id, std::ptr::null_mut());
+            }
+        }
+        objc::arc::release(delegate);
+        objc::arc::release(receiver as Id);
+        objc::arc::pool_pop(pool);
+    });
+}
+unsafe extern "C" fn invalidate_session(receiver: Id, sel: Sel) {
+    let Some(session) = (unsafe { session_of(receiver) }) else {
+        return;
+    };
+    let state = session.state.clone();
+    if state.shared {
+        return;
+    }
+    let tasks = {
+        let mut p = state.progress.lock().unwrap_or_else(|e| e.into_inner());
+        p.invalidating = true;
+        if sel == objc::sel::get("invalidateAndCancel") {
+            p.tasks
+                .keys()
+                .map(|id| objc::arc::retain(*id as Id) as usize)
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        }
+    };
+    for id in tasks {
+        complete_task(id, None);
+        objc::arc::release(id as Id);
+    }
+    maybe_invalidated(receiver as usize, &state);
+}
 
+unsafe extern "C" fn get_tasks(receiver: Id, _sel: Sel, block: Id) {
+    let Some(session) = (unsafe { session_of(receiver) }) else {
+        return;
+    };
+    let block = objc::block::copy(block) as usize;
+    let tasks: Vec<_> = session
+        .state
+        .progress
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .tasks
+        .iter()
+        .map(|(&id, &download)| (objc::arc::retain(id as Id) as usize, download))
+        .collect();
+    enqueue(session.state.queue, move || {
+        let pool = objc::arc::pool_push();
+        let array = |download: Option<bool>| {
+            let values: Vec<_> = tasks
+                .iter()
+                .filter(|(_, d)| download == Some(*d))
+                .map(|(id, _)| *id as CFTypeRef)
+                .collect();
+            let a = corefoundation::collections::new_array(
+                &values,
+                corefoundation::callbacks::Policy::from_type_callbacks(),
+                false,
+            );
+            unsafe { corefoundation::api::CFAutorelease(a) as Id }
+        };
+        unsafe {
+            call_completion(
+                block as Id,
+                array(Some(false)),
+                array(None),
+                array(Some(true)),
+            )
+        };
+        for (id, _) in tasks {
+            objc::arc::release(id as Id);
+        }
+        objc::block::release(block as Id);
+        objc::arc::pool_pop(pool);
+    });
+}
+
+fn make_task(receiver: Id, request: Request, completion: Id, download: bool) -> Id {
+    let Some(session) = (unsafe { session_of(receiver) }) else {
+        return std::ptr::null_mut();
+    };
+    let mut progress = session
+        .state
+        .progress
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if progress.invalidating {
+        return std::ptr::null_mut();
+    }
+    let task = make(
+        if download {
+            download_task_class()
+        } else {
+            task_class()
+        },
+        Task {
+            request,
+            completion: objc::block::copy(completion) as usize,
+            session: std::sync::atomic::AtomicUsize::new(objc::arc::retain(receiver) as usize),
+            owner: session.state.clone(),
+            download,
+            description: Default::default(),
+            response: Default::default(),
+            started: Default::default(),
+            state: std::sync::atomic::AtomicUsize::new(1),
+            completion_claimed: Default::default(),
+        },
+    );
+    progress
+        .tasks
+        .insert(objc::arc::retain(task) as usize, download);
+    objc::arc::autorelease(task)
+}
 unsafe extern "C" fn data_task_with_request(
-    _receiver: Id,
+    receiver: Id,
     _sel: Sel,
     request: Id,
     completion: Id,
 ) -> Id {
-    // SAFETY: a request this module made, or nil.
     let Some(request) = (unsafe { request_of(request) }) else {
         return std::ptr::null_mut();
     };
-    autoreleased_task(request.clone(), completion)
+    make_task(receiver, request.clone(), completion, false)
 }
-
-unsafe extern "C" fn data_task_with_url(_receiver: Id, _sel: Sel, url: Id, completion: Id) -> Id {
-    // SAFETY: an `NSURL`, or nil.
+unsafe extern "C" fn data_task_with_url(receiver: Id, _sel: Sel, url: Id, completion: Id) -> Id {
     let Some(text) = (unsafe { crate::url::text_of(url) }) else {
         return std::ptr::null_mut();
     };
-    autoreleased_task(Request::new(text, DEFAULT_TIMEOUT_SECONDS), completion)
+    make_task(
+        receiver,
+        Request::new(text, DEFAULT_TIMEOUT_SECONDS),
+        completion,
+        false,
+    )
 }
-
-fn autoreleased_task(request: Request, completion: Id) -> Id {
-    let task = Task {
-        request,
-        // Copied here and released once the handler has run, because the block
-        // a guest passes inline is stack-allocated and its scope ends the moment
-        // this method returns.
-        completion: objc::block::copy(completion) as usize,
-        delegate: 0,
-        session: 0,
-        download: false,
-        description: 0,
-        response: std::sync::atomic::AtomicUsize::new(0),
-        started: false,
-        canceled: false,
-    };
-    objc::arc::autorelease(make(task_class(), task))
-}
-
 unsafe extern "C" fn download_task_with_request(receiver: Id, _sel: Sel, request: Id) -> Id {
     download_task(receiver, request, std::ptr::null_mut())
 }
-
 unsafe extern "C" fn download_task_with_request_handler(
     receiver: Id,
     _sel: Sel,
@@ -891,32 +1056,12 @@ unsafe extern "C" fn download_task_with_request_handler(
 ) -> Id {
     download_task(receiver, request, completion)
 }
-
 fn download_task(receiver: Id, request: Id, completion: Id) -> Id {
-    // SAFETY: a request and a session this module made.
     let Some(request) = (unsafe { request_of(request) }) else {
         return std::ptr::null_mut();
     };
-    let Some(session) = (unsafe { contents::<Session>(receiver, session_class()) }) else {
-        return std::ptr::null_mut();
-    };
-    objc::arc::autorelease(make(
-        download_task_class(),
-        Task {
-            request: request.clone(),
-            completion: objc::block::copy(completion) as usize,
-            delegate: objc::arc::retain(session.delegate as Id) as usize,
-            session: objc::arc::retain(receiver) as usize,
-            download: true,
-            description: 0,
-            response: std::sync::atomic::AtomicUsize::new(0),
-            started: false,
-            canceled: false,
-        },
-    ))
+    make_task(receiver, request.clone(), completion, true)
 }
-
-//
 
 /// `+[NSURLConnection sendSynchronousRequest:returningResponse:error:]`, which
 /// is the whole of `NSURLConnection` a program still uses.
@@ -1026,6 +1171,7 @@ pub(crate) fn install() {
     let task = task_class();
     download_task_class();
     methods!(task, {
+        "state" => task_state, c"Q16@0:8";
         "resume" => resume, c"v16@0:8";
         "cancel" => cancel, c"v16@0:8";
         "setTaskDescription:" => set_task_description, c"v24@0:8@16";
@@ -1050,6 +1196,7 @@ pub(crate) fn install() {
         "downloadTaskWithRequest:" => download_task_with_request, c"@24@0:8@16";
         "downloadTaskWithRequest:completionHandler:"
             => download_task_with_request_handler, c"@32@0:8@16@?24";
+        "delegateQueue" => delegate_queue, c"@16@0:8";
         "getTasksWithCompletionHandler:" => get_tasks, c"v24@0:8@?16";
         "invalidateAndCancel" => invalidate_session, c"v16@0:8";
         "finishTasksAndInvalidate" => invalidate_session, c"v16@0:8";
@@ -1145,5 +1292,197 @@ mod tests {
             f(error, sel)
         };
         assert_eq!(code, crate::error::NSURL_ERROR_UNKNOWN);
+    }
+    static LIFECYCLE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    static EVENTS: std::sync::Mutex<Vec<(usize, i64, usize)>> = std::sync::Mutex::new(Vec::new());
+    unsafe extern "C" fn record_completion(_block: Id, data: Id, response: Id, error: Id) {
+        let code = if error.is_null() {
+            0
+        } else {
+            unsafe {
+                let f: unsafe extern "C" fn(Id, Sel) -> i64 =
+                    std::mem::transmute(objc::msg::entry());
+                f(error, objc::sel::get("code"))
+            }
+        };
+        let queue = unsafe {
+            let class = objc::class::lookup(c"NSOperationQueue").unwrap();
+            let f: unsafe extern "C" fn(Id, Sel) -> Id = std::mem::transmute(objc::msg::entry());
+            f(
+                objc::class::ptr(class) as Id,
+                objc::sel::get("currentQueue"),
+            )
+        };
+        let status = if response.is_null() {
+            0
+        } else {
+            (unsafe { status_code(response, objc::sel::get("statusCode")) }) as usize
+        };
+        let _ = data;
+        EVENTS.lock().unwrap().push((status, code, queue as usize));
+    }
+    unsafe extern "C" fn record_invalidation(_delegate: Id, _sel: Sel, _session: Id, _error: Id) {
+        EVENTS.lock().unwrap().push((999, 0, 0));
+    }
+    unsafe extern "C" fn record_tasks(_block: Id, data: Id, _upload: Id, download: Id) {
+        let n = unsafe {
+            corefoundation::api::CFArrayGetCount(data as CFTypeRef)
+                + corefoundation::api::CFArrayGetCount(download as CFTypeRef)
+        };
+        EVENTS.lock().unwrap().push((998, n as i64, 0));
+    }
+    fn wait_events(n: usize) {
+        for _ in 0..500 {
+            if EVENTS.lock().unwrap().len() >= n {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!("callback deadline expired");
+    }
+    fn suspend_queue(queue: Id, suspended: bool) {
+        unsafe {
+            let f: unsafe extern "C" fn(Id, Sel, u8) = std::mem::transmute(objc::msg::entry());
+            f(queue, objc::sel::get("setSuspended:"), suspended as u8);
+        }
+    }
+    fn test_session() -> Id {
+        let class = corefoundation::base::register(c"RosemarySessionTestDelegate", None, 0, false);
+        class.replace_method(
+            objc::sel::get("URLSession:didBecomeInvalidWithError:"),
+            record_invalidation as *const _,
+            c"v32@0:8@16@24",
+        );
+        let delegate = objc::object::create_instance(class, 0);
+        let session = new_session(delegate, std::ptr::null_mut(), false);
+        objc::arc::release(delegate);
+        session
+    }
+
+    #[test]
+    fn cancellation_before_resume_uses_delegate_queue_and_precedes_invalidation() {
+        let _lock = LIFECYCLE_LOCK.lock().unwrap();
+        crate::bootstrap();
+        EVENTS.lock().unwrap().clear();
+        let pool = objc::arc::pool_push();
+        let session = test_session();
+        let queue = unsafe { delegate_queue(session, objc::sel::get("delegateQueue")) };
+        suspend_queue(queue, true);
+        let block = crate::block::fake::block(record_completion as *const _);
+        let task = make_task(
+            session,
+            Request::new("http://127.0.0.1:1/".into(), 1.0),
+            block.id(),
+            false,
+        );
+        assert_eq!(unsafe { task_state(task, objc::sel::get("state")) }, 1);
+        unsafe {
+            cancel(task, objc::sel::get("cancel"));
+            resume(task, objc::sel::get("resume"));
+            invalidate_session(session, objc::sel::get("invalidateAndCancel"));
+        }
+        assert!(EVENTS.lock().unwrap().is_empty());
+        suspend_queue(queue, false);
+        wait_events(2);
+        assert_eq!(
+            *EVENTS.lock().unwrap(),
+            vec![(0, -999, queue as usize), (999, 0, 0)]
+        );
+        assert_eq!(unsafe { task_state(task, objc::sel::get("state")) }, 3);
+        assert!(make_task(session, Request::default(), block.id(), false).is_null());
+        objc::arc::release(session);
+        objc::arc::pool_pop(pool);
+    }
+
+    #[test]
+    fn an_http_error_keeps_its_response_and_finishes_before_invalidation() {
+        use std::io::{Read, Write};
+        let _lock = LIFECYCLE_LOCK.lock().unwrap();
+        crate::bootstrap();
+        EVENTS.lock().unwrap().clear();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("loopback required");
+        let url = format!("http://{}/test", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            let mut b = [0; 4096];
+            let _ = stream.read(&mut b).unwrap();
+            stream
+                .write_all(
+                    b"HTTP/1.1 400 Bad Request\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+                )
+                .unwrap();
+        });
+        let pool = objc::arc::pool_push();
+        let session = test_session();
+        let queue = unsafe { delegate_queue(session, objc::sel::get("delegateQueue")) };
+        let block = crate::block::fake::block(record_completion as *const _);
+        let enumeration = crate::block::fake::block(record_tasks as *const _);
+        let task = make_task(session, Request::new(url, 5.0), block.id(), false);
+        unsafe {
+            get_tasks(
+                session,
+                objc::sel::get("getTasksWithCompletionHandler:"),
+                enumeration.id(),
+            );
+        }
+        wait_events(1);
+        assert_eq!(EVENTS.lock().unwrap()[0], (998, 1, 0));
+        unsafe {
+            resume(task, objc::sel::get("resume"));
+            invalidate_session(session, objc::sel::get("finishTasksAndInvalidate"));
+        }
+        wait_events(3);
+        server.join().unwrap();
+        assert_eq!(
+            *EVENTS.lock().unwrap(),
+            vec![(998, 1, 0), (400, 0, queue as usize), (999, 0, 0)]
+        );
+        let response = unsafe { task_response(task, objc::sel::get("response")) };
+        assert_eq!(
+            unsafe { status_code(response, objc::sel::get("statusCode")) },
+            400
+        );
+        assert!(
+            unsafe { session_of(session) }
+                .unwrap()
+                .state
+                .progress
+                .lock()
+                .unwrap()
+                .tasks
+                .is_empty()
+        );
+        objc::arc::release(session);
+        objc::arc::pool_pop(pool);
+    }
+
+    #[test]
+    fn shared_session_cannot_be_invalidated_and_configured_sessions_are_distinct() {
+        crate::bootstrap();
+        let pool = objc::arc::pool_push();
+        let sel = objc::sel::get("sharedSession");
+        let shared = unsafe { shared_session(std::ptr::null_mut(), sel) };
+        unsafe {
+            invalidate_session(shared, objc::sel::get("invalidateAndCancel"));
+        }
+        assert!(
+            !unsafe { session_of(shared) }
+                .unwrap()
+                .state
+                .progress
+                .lock()
+                .unwrap()
+                .invalidating
+        );
+        let a =
+            unsafe { session_with_configuration(std::ptr::null_mut(), sel, std::ptr::null_mut()) };
+        let b =
+            unsafe { session_with_configuration(std::ptr::null_mut(), sel, std::ptr::null_mut()) };
+        assert_ne!(a, b);
+        assert_ne!(a, shared);
+        objc::arc::pool_pop(pool);
     }
 }

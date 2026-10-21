@@ -125,6 +125,9 @@
               pkgs.webkitgtk_6_0
               # webkit: the compositor WebKitGTK's windows are shown in.
               pkgs.libxkbcommon
+              # NSStatusItem: SDL's tray dlopens an AppIndicator and GTK 3.
+              pkgs.libayatana-appindicator
+              pkgs.gtk3
             ];
         in {
           default = pkgs.mkShell {

@@ -426,6 +426,22 @@ unsafe extern "C" fn compat_mode(
     libc::c_int::from(mode.eq_ignore_ascii_case(b"legacy") && legacy)
 }
 
+/// `gestaltSystemVersion`'s `0x10MB` word.
+///
+/// Gestalt.h caps each of the minor and bug-fix digits at 9 rather than the
+/// whole word - 10.3.15 is 0x1039 and 10.10.0 is 0x1090 - so a program that
+/// requires 10.5 as 0x1050 still passes on a later release. A major release past
+/// 10 has no spelling in the word; it saturates both digits, which keeps it
+/// ordered after every 10.x a program could compare it with.
+fn system_version_bcd(major: i32, minor: i32, patch: i32) -> i32 {
+    let digit = |n: i32| n.clamp(0, 9);
+    match major {
+        10 => 0x1000 | digit(minor) << 4 | digit(patch),
+        _ if major > 10 => 0x1099,
+        _ => 0x1000,
+    }
+}
+
 /// `OSErr Gestalt(OSType selector, SInt32 *response)`, the Carbon question a
 /// program still asks about the OS version.
 ///
@@ -458,11 +474,8 @@ unsafe extern "C" fn gestalt(selector: u32, response: *mut i32) -> i16 {
         b"sys1" => major,
         b"sys2" => minor,
         b"sys3" => patch,
-        // `gestaltSystemVersion`, a BCD word. Apple caps it at 0x1039 for every
-        // release after 10.3.9 precisely so that old code comparing it does not
-        // read 11.0 as older than 10.9, and a runtime that reported the true
-        // number would reintroduce the bug the cap exists for.
-        b"sysv" => 0x1039,
+        // `gestaltSystemVersion`, a BCD word.
+        b"sysv" => system_version_bcd(major, minor, patch),
         // `gestaltSysArchitecture`. Only Intel has a constant; Python 2's
         // `platform.mac_ver` fails outright when this selector does.
         b"sysa" => match crate::sysctl::guest_arch() {
@@ -626,7 +639,17 @@ mod tests {
             (ask(b"sys1"), ask(b"sys2"), ask(b"sys3")),
             (major, minor, patch)
         );
-        assert_eq!(ask(b"sysv"), 0x1039);
+        assert_eq!(ask(b"sysv"), system_version_bcd(major, minor, patch));
+    }
+
+    /// Each digit is capped on its own, so a program's 10.5 floor (0x1050)
+    /// passes on every later release.
+    #[test]
+    fn gestalt_system_version_caps_each_digit() {
+        assert_eq!(system_version_bcd(10, 3, 15), 0x1039);
+        assert_eq!(system_version_bcd(10, 10, 0), 0x1090);
+        assert_eq!(system_version_bcd(10, 6, 8), 0x1068);
+        assert!(system_version_bcd(26, 0, 0) >= 0x1050);
     }
 
     #[test]

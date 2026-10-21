@@ -405,8 +405,11 @@ pub fn bind_objc_exceptions_to_the_runtime_cxxabi<M: machish::memory::Regions>(
     memory: &mut M,
     flavor: Flavor,
 ) -> Result<usize> {
-    // No C++ runtime in the link is nothing to bind, and nothing to read.
-    if !report.images.iter().any(|i| is_libcxxabi(&i.name)) {
+    // No C++ runtime in the link is nothing to bind, and nothing to read. A
+    // `dlopen`ed image uses the program's runtime, which is not in its link.
+    if !report.images.iter().any(|i| is_libcxxabi(&i.name))
+        && crate::dyld::program_image_slide(&is_libcxxabi).is_none()
+    {
         return Ok(0);
     }
     crate::objcexc::bind(

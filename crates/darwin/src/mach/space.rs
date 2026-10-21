@@ -72,10 +72,14 @@ pub enum Right {
     Dead { refs: u32 },
     /// A Mach semaphore, which is named out of the same space and is not a port.
     Semaphore(Arc<super::sync::Semaphore>),
-    /// A send right to a task: this one under a name other than
-    /// [`TASK_SELF`], or another guest's, from `task_for_pid`. The pid is the
-    /// whole of it - every question about the task goes to the process server.
-    Task { pid: i32, refs: u32 },
+    /// A send right to a task: another guest's, from `task_for_pid`, by its
+    /// guest pid. Every question about the task goes to the process server,
+    /// and every change to it to the task itself through the server.
+    ///
+    /// `image` is the process server's for the image the right was made for:
+    /// an `exec` makes a new task on Darwin, and this right dies with the old
+    /// one. Zero where there is no server to number images.
+    Task { pid: i32, image: u64, refs: u32 },
     /// A send right to a thread of some task, by its host thread id.
     Thread { pid: i32, tid: i32, refs: u32 },
     /// A name this runtime answers for without a port behind it: the task, the
@@ -295,19 +299,24 @@ pub fn insert_send_with(address: Address, carried: Option<OwnedFd>) -> Name {
     })
 }
 
-/// A send right to the task `pid`, reusing the name already held for it.
+/// A send right to the task `pid` (a guest pid) at `image`, reusing the name
+/// already held for it.
 ///
 /// One name per task for the same reason as [`insert_send`]: `top` compares
 /// what two calls handed back, and a task that answered to two names would be
 /// two tasks. This task is always [`TASK_SELF`].
-pub fn insert_task(pid: i32) -> Name {
-    if pid == own_pid() {
+pub fn insert_task(pid: i32, image: u64) -> Name {
+    if crate::process::host_pid(pid) == own_pid() {
         return TASK_SELF;
     }
     with(|space| {
         for (name, right) in space.names.iter_mut() {
-            if let Right::Task { pid: held, refs } = right
-                && *held == pid
+            if let Right::Task {
+                pid: held,
+                image: held_image,
+                refs,
+            } = right
+                && (*held, *held_image) == (pid, image)
             {
                 *refs = refs.saturating_add(1);
                 return *name;
@@ -315,8 +324,56 @@ pub fn insert_task(pid: i32) -> Name {
         }
         let name = space.next;
         space.next = space.next.wrapping_add(4);
-        space.names.insert(name, Right::Task { pid, refs: 1 });
+        space.names.insert(
+            name,
+            Right::Task {
+                pid,
+                image,
+                refs: 1,
+            },
+        );
         name
+    })
+}
+
+/// Which task an operation names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Target {
+    /// This one, whose memory and threads the caller can reach directly.
+    Local,
+    /// Another guest, by its guest pid and the image the right was made for.
+    Remote { pid: i32, image: u64 },
+}
+
+/// The task `name` is a right to, or what Darwin's MIG answers when it is not
+/// one: `MACH_SEND_INVALID_DEST` for a name that holds nothing (or a dead
+/// name), and `KERN_INVALID_ARGUMENT` for a right to something else.
+pub fn target(name: Name) -> Result<Target, i32> {
+    if name == TASK_SELF {
+        return Ok(Target::Local);
+    }
+    let guard = space().read().unwrap_or_else(|e| e.into_inner());
+    match guard.names.get(&name) {
+        Some(Right::Task { pid, image, .. }) => match crate::process::host_pid(*pid) == own_pid() {
+            true => Ok(Target::Local),
+            false => Ok(Target::Remote {
+                pid: *pid,
+                image: *image,
+            }),
+        },
+        None | Some(Right::Dead { .. }) => Err(MACH_SEND_INVALID_DEST),
+        Some(_) => Err(KERN_INVALID_ARGUMENT),
+    }
+}
+
+/// The task behind `name` is gone - it exited, or `exec` replaced it - and
+/// `name` is a dead name from now on, as the kernel makes it on Darwin.
+pub fn task_died(name: Name) {
+    with(|space| {
+        if let Some(Right::Task { refs, .. }) = space.names.get(&name) {
+            let refs = *refs;
+            space.names.insert(name, Right::Dead { refs });
+        }
     })
 }
 

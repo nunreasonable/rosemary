@@ -287,6 +287,16 @@ pub(crate) fn with_work(work: impl FnOnce() + Send + 'static) -> Id {
     object
 }
 
+/// A private serial delegate queue, owned by the caller.
+pub(crate) fn serial_queue() -> Id {
+    let object = objc::object::create_instance(queue_class(), 0);
+    unsafe {
+        queue_init(object, objc::sel::get("init"));
+        set_max_concurrent(object, objc::sel::get("setMaxConcurrentOperationCount:"), 1);
+    }
+    object
+}
+
 /// Queue an operation, as `-addOperation:` does. For this crate's own use.
 pub(crate) fn add_to_queue(queue: Id, operation: Id) {
     enqueue(queue, operation);

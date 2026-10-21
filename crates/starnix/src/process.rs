@@ -202,7 +202,14 @@ pub fn descriptors() -> io::Result<Vec<Descriptor>> {
 
 /// This process's mappings, in address order.
 pub fn regions() -> io::Result<Vec<Region>> {
-    let mut regions = sys::regions()?;
+    regions_of(me())
+}
+
+/// `pid`'s mappings, in address order. Reading another process's map is a
+/// question about it, not access to it, so hosts that guard their memory
+/// against other processes (Yama) still answer it for the same user.
+pub fn regions_of(pid: i32) -> io::Result<Vec<Region>> {
+    let mut regions = sys::regions(pid)?;
     regions.sort_by_key(|region| region.start);
     Ok(regions)
 }

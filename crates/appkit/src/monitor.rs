@@ -6,6 +6,9 @@ use objc::sel::Sel;
 
 use crate::define::class_methods;
 
+/// Notification name used by clients observing a screen color-space change.
+pub const COLOR_SPACE_DID_CHANGE: &str = "NSScreenColorSpaceDidChangeNotification";
+
 struct Monitor {
     token: Id,
     mask: u64,
@@ -85,6 +88,26 @@ unsafe extern "C" fn add_local_monitor(_class: Id, _sel: Sel, mask: u64, handler
     token
 }
 
+/// `+addGlobalMonitorForEventsMatchingMask:handler:`.
+///
+/// A global monitor hears the events delivered to *other* applications, and
+/// the host tells this process nothing about those, so the handler is never
+/// called - which is also what a Mac does for a process without accessibility
+/// access, for key events. Removing its token does nothing, as there is
+/// nothing to stop.
+unsafe extern "C" fn add_global_monitor(_class: Id, _sel: Sel, mask: u64, handler: Id) -> Id {
+    if handler.is_null() {
+        return std::ptr::null_mut();
+    }
+    if crate::event::tracing() {
+        eprintln!(
+            "rosemary: appkit: +addGlobalMonitorForEventsMatchingMask: {mask:#x} (never called: \
+             other applications' events are not seen here)"
+        );
+    }
+    objc::object::create_instance(token_class(), 0)
+}
+
 unsafe extern "C" fn remove_monitor(_class: Id, _sel: Sel, token: Id) {
     let mut monitors = MONITORS.lock().unwrap_or_else(|e| e.into_inner());
     let Some(at) = monitors.iter().position(|m| m.token == token) else {
@@ -99,6 +122,7 @@ pub(crate) fn install() {
     let class = objc::class::lookup(c"NSEvent").expect("declared before its methods");
     class_methods!(class, {
         "addLocalMonitorForEventsMatchingMask:handler:" => add_local_monitor, c"@32@0:8Q16@?24";
+        "addGlobalMonitorForEventsMatchingMask:handler:" => add_global_monitor, c"@32@0:8Q16@?24";
         "removeMonitor:" => remove_monitor, c"v24@0:8@16";
     });
 }

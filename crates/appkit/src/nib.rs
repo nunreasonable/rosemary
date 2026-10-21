@@ -142,6 +142,66 @@ unsafe extern "C" fn load_named_class(class: Id, _sel: objc::sel::Sel, name: Id,
     unsafe { load_named(bundle, _sel, name, owner, std::ptr::null_mut()) }
 }
 
+/// `+[NSBundle loadNibFile:externalNameTable:withZone:]`, the oldest spelling:
+/// a path rather than a name, and the owner - and optionally an array to
+/// receive the top-level objects - passed in a dictionary.
+unsafe extern "C" fn load_file(
+    _class: Id,
+    _sel: objc::sel::Sel,
+    file: Id,
+    context: Id,
+    _zone: *mut std::ffi::c_void,
+) -> u8 {
+    // SAFETY: the path is an NSString or nil.
+    let Ok(file) = String::from_utf8(unsafe { foundation::string::bytes(file) }) else {
+        return 0;
+    };
+    if file.is_empty() {
+        return 0;
+    }
+    let lookup = |key: &str| -> Id {
+        if context.is_null() {
+            return std::ptr::null_mut();
+        }
+        let key = foundation::string::from_str(key);
+        // SAFETY: the caller's dictionary and a key this call owns.
+        let value = unsafe {
+            corefoundation::api::CFDictionaryGetValue(
+                context as corefoundation::base::CFTypeRef,
+                key as corefoundation::base::CFTypeRef,
+            )
+        };
+        objc::arc::release(key);
+        value as Id
+    };
+    let owner = lookup("NSOwner");
+    let top_level = lookup("NSTopLevelObjects");
+    let path = prefix::ns::host_path(&file);
+    let loaded = match load(&path, owner) {
+        Ok(loaded) => loaded,
+        Err(why) => {
+            eprintln!("rosemary: appkit: {}: {why}", path.display());
+            return 0;
+        }
+    };
+    loaded.report(&path);
+    if !top_level.is_null() {
+        for object in loaded.objects.values() {
+            if object.is_null() || *object == owner {
+                continue;
+            }
+            // SAFETY: a mutable array the caller supplied, and a live object.
+            unsafe {
+                corefoundation::api::CFArrayAppendValue(
+                    top_level as corefoundation::base::CFTypeRef,
+                    *object as corefoundation::base::CFTypeRef,
+                )
+            };
+        }
+    }
+    1
+}
+
 pub(crate) fn install() {
     let bundle = objc::class::lookup(c"NSBundle").expect("Foundation registered NSBundle");
     methods!(bundle, {
@@ -149,6 +209,7 @@ pub(crate) fn install() {
     });
     class_methods!(bundle, {
         "loadNibNamed:owner:" => load_named_class, c"c32@0:8@16@24";
+        "loadNibFile:externalNameTable:withZone:" => load_file, c"c40@0:8@16@24^v32";
     });
     let nib = objc::class::lookup(c"NSNib").expect("declared before its methods");
     methods!(nib, {

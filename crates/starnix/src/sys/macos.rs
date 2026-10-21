@@ -2,6 +2,12 @@
 
 pub mod signal;
 
+/// No call reaches this process's memory through the kernel more directly
+/// than a pipe does.
+pub mod memory {
+    pub use crate::memory::piped::{read, write};
+}
+
 use std::ffi::{CStr, c_int, c_void};
 use std::io;
 use std::os::fd::RawFd;
@@ -364,8 +370,8 @@ pub fn descriptors() -> io::Result<Vec<Descriptor>> {
         .collect())
 }
 
-pub fn regions() -> io::Result<Vec<Region>> {
-    Ok(regions_of(crate::process::me()))
+pub fn regions(pid: i32) -> io::Result<Vec<Region>> {
+    Ok(regions_of(pid))
 }
 
 /// The real BSM ids are a Darwin API, answered by the host itself to anything

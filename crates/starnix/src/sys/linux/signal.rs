@@ -282,6 +282,89 @@ pub fn send_to_thread(tid: i32, signo: c_int) -> std::io::Result<()> {
     }
 }
 
+pub fn queue(pid: i32, signo: c_int, value: usize) -> std::io::Result<()> {
+    let value = libc::sigval {
+        sival_ptr: value as *mut c_void,
+    };
+    // SAFETY: plain values.
+    match unsafe { libc::sigqueue(pid, signo, value) } {
+        0 => Ok(()),
+        _ => Err(std::io::Error::last_os_error()),
+    }
+}
+
+/// `getdents64` on `/proc/self/task`, straight into a buffer on the stack.
+pub fn for_each_thread(each: &mut dyn FnMut(i32)) -> bool {
+    // SAFETY: a NUL-terminated literal.
+    let fd = unsafe {
+        libc::open(
+            c"/proc/self/task".as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return false;
+    }
+    /// `struct linux_dirent64`'s fixed head: inode, offset, record length,
+    /// type, then the NUL-terminated name.
+    const NAME: usize = 19;
+    let mut buffer = [0u8; 2048];
+    let ok = loop {
+        // SAFETY: a writable buffer of the stated length.
+        let n =
+            unsafe { libc::syscall(libc::SYS_getdents64, fd, buffer.as_mut_ptr(), buffer.len()) };
+        if n <= 0 {
+            break n == 0;
+        }
+        let mut at = 0;
+        while at + NAME <= n as usize {
+            let length = u16::from_ne_bytes([buffer[at + 16], buffer[at + 17]]) as usize;
+            if length == 0 {
+                break;
+            }
+            let name = &buffer[at + NAME..(at + length).min(n as usize)];
+            let mut tid: i32 = 0;
+            let mut digits = 0;
+            for &byte in name.iter().take_while(|byte| **byte != 0) {
+                if !byte.is_ascii_digit() {
+                    digits = 0;
+                    break;
+                }
+                tid = tid.wrapping_mul(10).wrapping_add(i32::from(byte - b'0'));
+                digits += 1;
+            }
+            if digits > 0 {
+                each(tid);
+            }
+            at += length;
+        }
+    };
+    // SAFETY: the descriptor opened above.
+    unsafe { libc::close(fd) };
+    ok
+}
+
+#[cfg(test)]
+mod listing {
+    #[test]
+    fn lists_this_thread_and_a_second_one() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (done, wait) = std::sync::mpsc::channel::<()>();
+        let other = std::thread::spawn(move || {
+            tx.send(rustix::thread::gettid().as_raw_nonzero().get())
+                .unwrap();
+            wait.recv().unwrap();
+        });
+        let other_tid = rx.recv().unwrap();
+        let mut seen = Vec::new();
+        assert!(super::for_each_thread(&mut |tid| seen.push(tid)));
+        done.send(()).unwrap();
+        other.join().unwrap();
+        assert!(seen.contains(&rustix::thread::gettid().as_raw_nonzero().get()));
+        assert!(seen.contains(&other_tid));
+    }
+}
+
 #[cfg(all(test, target_arch = "x86_64"))]
 mod tests {
     use super::machine::SW_BYTES;

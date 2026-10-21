@@ -91,6 +91,9 @@ pub fn check_in(path: &str, argv: Vec<Vec<u8>>) {
         credentials: crate::credentials::offered(),
         fresh: true,
         setid,
+        // Before the check-in, so a signal the server sends once it knows
+        // this process finds the handler in place.
+        serviceable: crate::mach::service::install(),
         ..Checkin::default()
     };
     let _ = ME.set(Me {
@@ -146,6 +149,7 @@ fn me() -> Option<Process> {
         cputype: arch.cpu_type(),
         cpusubtype: arch.cpu_subtype(),
         translated: crate::sysctl::is_translated(),
+        image: server::client::image(),
     })
 }
 

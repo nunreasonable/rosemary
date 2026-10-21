@@ -44,6 +44,8 @@ let
       ../Cargo.toml
       ../Cargo.lock
       ../crates
+      # Patched in through [patch.crates-io] in Cargo.toml.
+      ../third_party/libmimalloc-sys
     ];
   };
 
@@ -87,8 +89,17 @@ let
   };
 
   # Third-party crates only: built from a stub of the workspace, so editing
-  # Rosemary's own sources never recompiles them.
-  cargoArtifacts = craneLib.buildDepsOnly common;
+  # Rosemary's own sources never recompiles them. The patched libmimalloc-sys
+  # is a third-party crate too, and the stub would strip its API.
+  cargoArtifacts = craneLib.buildDepsOnly (removeAttrs common [ "src" ] // {
+    dummySrc = craneLib.mkDummySrc {
+      inherit src;
+      extraDummyScript = ''
+        rm -rf $out/third_party/libmimalloc-sys
+        cp -r --no-preserve=mode ${src}/third_party/libmimalloc-sys $out/third_party/
+      '';
+    };
+  });
 in
 craneLib.buildPackage (common // {
   inherit cargoArtifacts;

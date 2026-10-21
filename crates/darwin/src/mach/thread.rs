@@ -12,6 +12,13 @@
 //! The registers are the ones the thread was interrupted with. Under the
 //! `native` backend that is guest code or a host function it called, on the
 //! same stack either way, which is all a collector scanning that stack needs.
+//!
+//! `task_suspend` parks every thread the same way ([`suspend_task`]). It may be
+//! asked for from another process, through the process server, in which case
+//! it runs in the service signal's handler ([`super::service`]); so does
+//! everything it touches here, which is why a slot's lock is a spin lock that
+//! blocks this module's signals rather than a mutex. A parked thread leaves the
+//! service signal open, so a suspended task still answers for its memory.
 
 use std::cell::UnsafeCell;
 use std::ffi::c_void;
@@ -37,9 +44,13 @@ struct Slot {
     /// Zero when free.
     tid: AtomicI32,
     /// Serializes the threads controlling this one; the target never takes it.
-    control: std::sync::Mutex<()>,
+    control: Spin,
     /// Mach's suspend count. Only the 0 -> 1 and 1 -> 0 edges signal.
     count: AtomicU32,
+    /// Held by a task suspension, which parks the thread whatever `count` is.
+    task_held: AtomicBool,
+    /// Signalled by a task suspension that has yet to see it parked.
+    awaited: AtomicBool,
     phase: AtomicU32,
     /// Whether `context` was changed while parked and has to be restored.
     dirty: AtomicBool,
@@ -178,8 +189,10 @@ fn slots() -> &'static [Slot] {
         let table: Vec<Slot> = (0..SLOTS)
             .map(|_| Slot {
                 tid: AtomicI32::new(0),
-                control: std::sync::Mutex::new(()),
+                control: Spin::new(),
                 count: AtomicU32::new(0),
+                task_held: AtomicBool::new(false),
+                awaited: AtomicBool::new(false),
                 phase: AtomicU32::new(RUNNING),
                 dirty: AtomicBool::new(false),
                 abort: AtomicBool::new(false),
@@ -199,12 +212,15 @@ fn find(tid: i32) -> Option<&'static Slot> {
         .find(|slot| slot.tid.load(Ordering::Acquire) == tid)
 }
 
+/// Whether thread `tid` of this process still exists. A syscall and nothing
+/// else, so the signal handler may ask.
+fn alive(tid: i32) -> bool {
+    starnix::signal::send_to_thread(tid, 0).is_ok()
+}
+
 /// `tid`'s slot, claiming a free one - or one whose thread has ended - if it
-/// has none yet.
+/// has none yet. Lock-free, for the signal handler.
 fn claim(tid: i32) -> Option<&'static Slot> {
-    // Two controllers claiming for one thread at once would give it two slots.
-    static CLAIMING: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    let _claiming = CLAIMING.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(slot) = find(tid) {
         return Some(slot);
     }
@@ -212,19 +228,257 @@ fn claim(tid: i32) -> Option<&'static Slot> {
         let held = slot.tid.load(Ordering::Acquire);
         let free = held == 0
             || (slot.count.load(Ordering::Acquire) == 0
+                && !slot.task_held.load(Ordering::Acquire)
                 && slot.phase.load(Ordering::Acquire) == RUNNING
-                && !starnix::process::has_thread(held));
+                && !alive(held));
         if free
             && slot
                 .tid
                 .compare_exchange(held, tid, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
         {
-            return Some(slot);
+            // Two controllers claiming for one thread at once may each have
+            // taken a slot: the first one in the table is the thread's.
+            let first = find(tid).unwrap_or(slot);
+            if !std::ptr::eq(first, slot) {
+                slot.tid.store(0, Ordering::Release);
+            }
+            return Some(first);
         }
     }
-    // Lost every race above, or the table is full of live threads.
+    // The table is full of live threads.
     find(tid)
+}
+
+/// Give this thread its slot now, so a task suspension from the signal
+/// handler finds it rather than claims it.
+pub fn prepare_thread() {
+    claim(crate::pthread::id() as i32);
+}
+
+/// A lock a signal handler may take: a spin on an atomic, held with this
+/// module's signals blocked on the holding thread, so the holder is never
+/// parked, nor sent into a handler that wants the same lock.
+struct Spin(AtomicBool);
+
+struct SpinGuard<'a> {
+    lock: &'a Spin,
+    mask: libc::sigset_t,
+}
+
+impl Spin {
+    const fn new() -> Spin {
+        Spin(AtomicBool::new(false))
+    }
+
+    /// Only the holder has the signals blocked: a thread still waiting for
+    /// the lock can be parked, and a task suspension that holds it does not
+    /// wait forever for a thread that waits for it.
+    fn lock(&self) -> SpinGuard<'_> {
+        loop {
+            let mask = block_private_signals();
+            if self
+                .0
+                .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+                .is_ok()
+            {
+                return SpinGuard { lock: self, mask };
+            }
+            // SAFETY: the mask saved just above, then no preconditions.
+            unsafe {
+                libc::pthread_sigmask(libc::SIG_SETMASK, &mask, std::ptr::null_mut());
+                libc::sched_yield();
+            }
+        }
+    }
+}
+
+impl Drop for SpinGuard<'_> {
+    fn drop(&mut self) {
+        self.lock.0.store(false, Ordering::Release);
+        // SAFETY: the mask `lock` saved on this thread.
+        unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, &self.mask, std::ptr::null_mut()) };
+    }
+}
+
+/// Block the park signal and the service signal on this thread, returning the
+/// mask to restore. Async-signal-safe.
+fn block_private_signals() -> libc::sigset_t {
+    // SAFETY: two local sets, initialised before use.
+    unsafe {
+        let mut block: libc::sigset_t = std::mem::zeroed();
+        let mut old: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut block);
+        for signal in [suspend_signal(), server::task::signal()]
+            .into_iter()
+            .flatten()
+        {
+            libc::sigaddset(&mut block, signal);
+        }
+        libc::pthread_sigmask(libc::SIG_BLOCK, &block, &mut old);
+        old
+    }
+}
+
+/// The task's own suspend count, which Darwin keeps in the kernel's task and
+/// this process keeps for itself: whoever suspends it, the threads that stop
+/// are this process's.
+static TASK_COUNT: AtomicU32 = AtomicU32::new(0);
+static TASK_LOCK: Spin = Spin::new();
+
+/// How many times a suspension lists the threads again for ones started while
+/// it was parking the others.
+const TASK_ROUNDS: usize = 8;
+
+/// Set everything up a task suspension needs, so that one asked for from the
+/// signal handler allocates nothing. False where the host has no signal for it.
+pub fn prepare() -> bool {
+    install().is_some()
+}
+
+/// `task_suspend` on this task: every thread but the caller's parks before this
+/// returns, and the caller is expected to [`park_self`] next. Only the 0 -> 1
+/// edge parks anything. Async-signal-safe once [`prepare`] has run.
+///
+/// FIXME (ACCURACY): Darwin holds the whole task at once. Here the threads are
+/// listed and parked one by one, and listed again until no new one appears, so
+/// a thread started in the last moment can still slip past.
+pub fn suspend_task() -> i32 {
+    let (Some(()), Some(signal)) = (install(), suspend_signal()) else {
+        return KERN_FAILURE;
+    };
+    let _task = TASK_LOCK.lock();
+    let count = TASK_COUNT.load(Ordering::Acquire);
+    TASK_COUNT.store(count + 1, Ordering::Release);
+    if count > 0 {
+        return KERN_SUCCESS;
+    }
+    let me = crate::pthread::id() as i32;
+    for _ in 0..TASK_ROUNDS {
+        let mut fresh = false;
+        let listed = starnix::signal::for_each_thread(&mut |tid| {
+            if tid != me && hold(tid, signal) {
+                fresh = true;
+            }
+        });
+        await_held();
+        if !listed || !fresh {
+            break;
+        }
+    }
+    KERN_SUCCESS
+}
+
+/// Hold `tid` for the task: true if it was not held for it before.
+fn hold(tid: i32, signal: i32) -> bool {
+    let Some(slot) = claim(tid) else {
+        return false;
+    };
+    let _guard = slot.control.lock();
+    if slot.task_held.swap(true, Ordering::AcqRel) {
+        return false;
+    }
+    if slot.count.load(Ordering::Acquire) > 0 {
+        // Parked already, by `thread_suspend`.
+        return true;
+    }
+    // A thread resumed a moment ago may still be on its way out of the handler.
+    while slot.phase.load(Ordering::Acquire) != RUNNING {
+        // SAFETY: no preconditions.
+        unsafe { libc::sched_yield() };
+    }
+    slot.phase.store(REQUESTED, Ordering::Release);
+    slot.awaited.store(true, Ordering::Release);
+    if starnix::signal::send_to_thread(tid, signal).is_err() {
+        slot.awaited.store(false, Ordering::Release);
+        slot.task_held.store(false, Ordering::Release);
+        slot.phase.store(RUNNING, Ordering::Release);
+    }
+    true
+}
+
+/// Wait until every thread [`hold`] signalled has parked, or ended.
+fn await_held() {
+    for slot in slots() {
+        if !slot.awaited.swap(false, Ordering::AcqRel) {
+            continue;
+        }
+        let tid = slot.tid.load(Ordering::Acquire);
+        while !slot.parked.wait(Some(PARK_POLL)) {
+            if !alive(tid) {
+                let _guard = slot.control.lock();
+                slot.task_held.store(false, Ordering::Release);
+                slot.phase.store(RUNNING, Ordering::Release);
+                break;
+            }
+        }
+    }
+}
+
+/// Park the calling thread for its task's suspension, until [`resume_task`]
+/// lets it go - from another thread, or from another process through the
+/// service handler of one of the threads parked already.
+///
+/// # Safety
+///
+/// `raw` is null, or the context of a signal handler running on this thread,
+/// which `thread_get_state` reads while it is parked.
+pub unsafe fn park_self(raw: *mut c_void) {
+    let Some(slot) = claim(crate::pthread::id() as i32) else {
+        return;
+    };
+    {
+        let _task = TASK_LOCK.lock();
+        if TASK_COUNT.load(Ordering::Acquire) == 0 {
+            return;
+        }
+        let _guard = slot.control.lock();
+        // Parked already, further up this thread's stack: a second suspension
+        // served from inside the first one only counts.
+        if slot.task_held.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        slot.phase.store(REQUESTED, Ordering::Release);
+    }
+    // SAFETY: on the slot's own thread, with the caller's context.
+    unsafe { wait_parked(slot, raw) };
+    // Nobody waited for that post: this thread parked itself.
+    slot.parked.try_wait();
+}
+
+/// `task_resume` on this task. The last outstanding suspension releases every
+/// thread it held that is not suspended on its own account; one with none
+/// outstanding is refused, as Darwin refuses it. Async-signal-safe.
+pub fn resume_task() -> i32 {
+    let _task = TASK_LOCK.lock();
+    let count = TASK_COUNT.load(Ordering::Acquire);
+    if count == 0 {
+        return KERN_FAILURE;
+    }
+    TASK_COUNT.store(count - 1, Ordering::Release);
+    if count > 1 {
+        return KERN_SUCCESS;
+    }
+    for slot in slots() {
+        if !slot.task_held.load(Ordering::Acquire) {
+            continue;
+        }
+        let _guard = slot.control.lock();
+        if slot.task_held.swap(false, Ordering::AcqRel) && slot.count.load(Ordering::Acquire) == 0 {
+            release(slot, slot.tid.load(Ordering::Acquire));
+        }
+    }
+    KERN_SUCCESS
+}
+
+/// Whether this task is suspended now.
+pub fn task_suspended() -> bool {
+    TASK_COUNT.load(Ordering::Acquire) > 0
+}
+
+/// Whether `slot`'s thread is held: by its own suspensions, or its task's.
+fn held(slot: &Slot) -> bool {
+    slot.count.load(Ordering::Acquire) > 0 || slot.task_held.load(Ordering::Acquire)
 }
 
 /// The signal that parks a thread.
@@ -251,10 +505,15 @@ fn install() -> Option<()> {
             // Restarting, so that a call the thread was blocked in carries on
             // after a resume as it does after a Mach one; and everything
             // blocked, so nothing runs on the thread while it is parked.
+            // The server's work is the exception: a suspended task still
+            // answers for its memory.
             let mut action: libc::sigaction = std::mem::zeroed();
             action.sa_sigaction = park as *const () as usize;
             action.sa_flags = libc::SA_SIGINFO | libc::SA_RESTART | libc::SA_ONSTACK;
             libc::sigfillset(&mut action.sa_mask);
+            if let Some(service) = server::task::signal() {
+                libc::sigdelset(&mut action.sa_mask, service);
+            }
             libc::sigaction(suspend, &action, std::ptr::null_mut());
             // Not restarting: interrupting the call is the whole point.
             let mut action: libc::sigaction = std::mem::zeroed();
@@ -275,22 +534,33 @@ extern "C" fn park(_signo: i32, _info: *mut libc::siginfo_t, raw: *mut c_void) {
     if let Some(slot) = find(tid)
         && slot.phase.load(Ordering::Acquire) == REQUESTED
     {
-        // SAFETY: the kernel's context for this handler, and `context` is this
-        // thread's to write until `PARKED` is published.
-        unsafe { *slot.context.get() = starnix::signal::context(raw) };
-        slot.phase.store(PARKED, Ordering::Release);
-        slot.parked.post();
-        slot.released.wait(None);
-        if slot.dirty.swap(false, Ordering::AcqRel) {
-            // SAFETY: the controller is done with `context` once it released
-            // this thread, and `raw` is this handler's own.
-            if let Some(context) = unsafe { &*slot.context.get() } {
-                unsafe { starnix::signal::set_context(raw, context) };
-            }
-        }
-        slot.phase.store(RUNNING, Ordering::Release);
+        // SAFETY: the kernel's context for this handler, on this thread.
+        unsafe { wait_parked(slot, raw) };
     }
     starnix::errno::set(errno);
+}
+
+/// Publish `raw` as `slot`'s thread's context, wait to be released, and write
+/// back whatever `thread_set_state` changed meanwhile.
+///
+/// # Safety
+///
+/// Called on `slot`'s own thread. `raw` is null, or the context of a signal
+/// handler on this thread that has not returned.
+unsafe fn wait_parked(slot: &Slot, raw: *mut c_void) {
+    // SAFETY: `context` is this thread's to write until `PARKED` is published.
+    unsafe { *slot.context.get() = starnix::signal::context(raw) };
+    slot.phase.store(PARKED, Ordering::Release);
+    slot.parked.post();
+    slot.released.wait(None);
+    if slot.dirty.swap(false, Ordering::AcqRel) {
+        // SAFETY: the controller is done with `context` once it released this
+        // thread, and `raw` is the caller's.
+        if let Some(context) = unsafe { &*slot.context.get() } {
+            unsafe { starnix::signal::set_context(raw, context) };
+        }
+    }
+    slot.phase.store(RUNNING, Ordering::Release);
 }
 
 /// The abort signal's handler: being delivered is all it is for.
@@ -316,9 +586,11 @@ pub extern "C" fn thread_suspend(thread: Name) -> i32 {
     let Some(slot) = claim(tid) else {
         return KERN_RESOURCE_SHORTAGE;
     };
-    let guard = slot.control.lock().unwrap_or_else(|e| e.into_inner());
+    let guard = slot.control.lock();
     let count = slot.count.load(Ordering::Acquire);
-    if count > 0 {
+    // Already parked, by an earlier suspension or by its task's: this one
+    // only counts.
+    if count > 0 || slot.task_held.load(Ordering::Acquire) {
         slot.count.store(count + 1, Ordering::Release);
         return KERN_SUCCESS;
     }
@@ -348,7 +620,7 @@ pub extern "C" fn thread_suspend(thread: Name) -> i32 {
     // Mach's suspension is done when the call returns, and a collector reads
     // the registers straight after: wait until they are saved.
     while !slot.parked.wait(Some(PARK_POLL)) {
-        if !starnix::process::has_thread(tid) {
+        if !alive(tid) {
             slot.count.store(0, Ordering::Release);
             slot.phase.store(RUNNING, Ordering::Release);
             return KERN_TERMINATED;
@@ -365,20 +637,26 @@ pub extern "C" fn thread_resume(thread: Name) -> i32 {
     let Some(slot) = find(tid) else {
         return KERN_FAILURE;
     };
-    let _guard = slot.control.lock().unwrap_or_else(|e| e.into_inner());
+    let _guard = slot.control.lock();
     let count = slot.count.load(Ordering::Acquire);
     if count == 0 {
         return KERN_FAILURE;
     }
     slot.count.store(count - 1, Ordering::Release);
-    if count == 1 {
-        slot.phase.store(RELEASED, Ordering::Release);
-        slot.released.post();
-        if slot.abort.swap(false, Ordering::AcqRel) {
-            send_abort(tid);
-        }
+    // Its task's suspension still holds it.
+    if count == 1 && !slot.task_held.load(Ordering::Acquire) {
+        release(slot, tid);
     }
     KERN_SUCCESS
+}
+
+/// Let `slot`'s parked thread go. Called with its `control` held.
+fn release(slot: &Slot, tid: i32) {
+    slot.phase.store(RELEASED, Ordering::Release);
+    slot.released.post();
+    if slot.abort.swap(false, Ordering::AcqRel) {
+        send_abort(tid);
+    }
 }
 
 fn send_abort(tid: i32) {
@@ -401,8 +679,8 @@ pub extern "C" fn thread_abort(thread: Name) -> i32 {
         return KERN_FAILURE;
     }
     if let Some(slot) = find(tid) {
-        let _guard = slot.control.lock().unwrap_or_else(|e| e.into_inner());
-        if slot.count.load(Ordering::Acquire) > 0 {
+        let _guard = slot.control.lock();
+        if held(slot) {
             slot.abort.store(true, Ordering::Release);
             return KERN_SUCCESS;
         }
@@ -503,10 +781,10 @@ fn with_context(thread: Name, f: impl FnOnce(&mut starnix::signal::Context, &Slo
     let Some(slot) = find(tid) else {
         return KERN_FAILURE;
     };
-    let _guard = slot.control.lock().unwrap_or_else(|e| e.into_inner());
+    let _guard = slot.control.lock();
     // A running thread has no saved context; `thread_get_state` suspends one
     // briefly rather than come here without it.
-    if slot.count.load(Ordering::Acquire) == 0 || slot.phase.load(Ordering::Acquire) != PARKED {
+    if !held(slot) || slot.phase.load(Ordering::Acquire) != PARKED {
         return KERN_FAILURE;
     }
     // SAFETY: parked, and `control` is held.
@@ -558,9 +836,7 @@ pub unsafe extern "C" fn thread_get_state(
 
 /// Whether `thread` is one of this process's and suspended now.
 fn suspended(thread: Name) -> bool {
-    local_thread(thread)
-        .and_then(find)
-        .is_some_and(|slot| slot.count.load(Ordering::Acquire) > 0)
+    local_thread(thread).and_then(find).is_some_and(held)
 }
 
 /// `kern_return_t thread_set_state(thread_act_t, thread_state_flavor_t,

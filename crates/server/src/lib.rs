@@ -14,6 +14,8 @@
 //! * [`client`] is a guest's side: check in once, then ask.
 //! * [`credentials`] are a guest's user and group ids, which the server
 //!   holds for every guest and which change by XNU's rules.
+//! * [`task`] is what one task has the server ask of another, and
+//!   [`mailbox`] the queues that hold it until the target answers.
 //! * [`daemon`] is the server: a process table ([`registry`]) kept honest by
 //!   the host kernel (through `starnix`), answered over a private Unix socket
 //!   ([`location`], [`protocol`], [`codec`]).
@@ -25,5 +27,7 @@ pub mod codec;
 pub mod credentials;
 pub mod daemon;
 pub mod location;
+pub mod mailbox;
 pub mod protocol;
 pub mod registry;
+pub mod task;

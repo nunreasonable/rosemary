@@ -52,6 +52,14 @@ struct Framework {
 
 static FRAMEWORKS: &[Framework] = &[
     Framework {
+        leaf: "OpenDirectory",
+        version: 'A',
+        umbrellas: &[],
+        provide: None,
+        data: Some(coreservices::opendirectory::data_symbols),
+        symbol: None,
+    },
+    Framework {
         leaf: "CoreFoundation",
         version: 'A',
         umbrellas: &[],
@@ -461,6 +469,12 @@ fn media_constants() -> Vec<(String, u64)> {
     let mut out = corefoundation::base::string_globals(MEDIA_CONSTANTS);
     out.extend(corefoundation::base::string_globals(VIDEO_CONSTANTS));
     out.extend(corefoundation::base::string_globals(NOW_PLAYING_CONSTANTS));
+    // A stable local notification identity for caption-setting observers.
+    // Host caption preference changes are not currently forwarded.
+    out.extend(corefoundation::base::string_globals(&[(
+        "_kMACaptionAppearanceSettingsChangedNotification",
+        "kMACaptionAppearanceSettingsChangedNotification",
+    )]));
     out.push((
         "_kCMTimeInvalid".to_string(),
         &CM_TIME_INVALID as *const [u64; 3] as usize as u64,
@@ -474,6 +488,14 @@ fn shimmed() -> Vec<(&'static str, *const ())> {
         (
             "NSRunAlertPanel",
             crate::shims::nslog::native::run_alert_panel() as *const (),
+        ),
+        (
+            "CFStringCreateWithFormat",
+            crate::shims::nslog::native::cfstring_create_with_format() as *const (),
+        ),
+        (
+            "CFStringCreateWithFormatAndArguments",
+            crate::shims::nslog::native::cfstring_create_with_format_and_arguments() as *const (),
         ),
     ]
 }
