@@ -13,7 +13,7 @@ use std::io;
 use std::os::fd::RawFd;
 use std::path::PathBuf;
 
-use crate::process::{Audit, Descriptor, Identity, Process, Region, Thread, Usage};
+use crate::process::{Audit, Descriptor, Footprint, Identity, Process, Region, Thread, Usage};
 use crate::socket::Peer;
 use crate::system::{CpuTicks, Memory};
 
@@ -33,6 +33,10 @@ pub fn identity(pid: i32) -> Option<Identity> {
 
 pub fn process(pid: i32) -> Option<Process> {
     exists(pid).then(Process::default)
+}
+
+pub fn footprint(pid: i32) -> Option<Footprint> {
+    exists(pid).then(Footprint::default)
 }
 
 pub fn usage(pid: i32) -> Option<Usage> {

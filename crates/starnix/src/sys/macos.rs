@@ -17,7 +17,7 @@ use std::sync::OnceLock;
 
 use super::sysctl;
 use crate::process::{
-    Audit, Descriptor, DescriptorKind, Identity, Process, Region, State, Thread, Usage,
+    Audit, Descriptor, DescriptorKind, Footprint, Identity, Process, Region, State, Thread, Usage,
 };
 use crate::socket::Peer;
 use crate::system::{CpuTicks, Memory, page_size};
@@ -248,6 +248,16 @@ fn regions_of(pid: i32) -> Vec<Region> {
         address = info.address + info.size;
     }
     regions
+}
+
+pub fn footprint(pid: i32) -> Option<Footprint> {
+    let task: libc::proc_taskinfo = pidinfo(pid, libc::PROC_PIDTASKINFO, 0)?;
+    Some(Footprint {
+        virtual_size: task.pti_virtual_size,
+        resident_size: task.pti_resident_size,
+        resident_peak: task.pti_resident_size,
+        shared_size: 0,
+    })
 }
 
 pub fn usage(pid: i32) -> Option<Usage> {

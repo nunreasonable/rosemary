@@ -15,7 +15,9 @@ use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
 
 use super::{kinfo, sysctl};
-use crate::process::{Audit, Descriptor, Identity, Process, Region, State, Thread, Usage};
+use crate::process::{
+    Audit, Descriptor, Footprint, Identity, Process, Region, State, Thread, Usage,
+};
 use crate::socket::Peer;
 use crate::system::{CpuTicks, Memory, page_size};
 
@@ -128,6 +130,17 @@ pub fn process(pid: i32) -> Option<Process> {
 /// When the machine booted, on the wall clock.
 fn boot_time() -> Option<libc::timeval> {
     sysctl::by_name::<libc::timeval>(c"kern.boottime")
+}
+
+pub fn footprint(pid: i32) -> Option<Footprint> {
+    let proc = kinfo_proc(pid)?;
+    let resident_size = (proc.ki_rssize.max(0) as u64).saturating_mul(page_size());
+    Some(Footprint {
+        virtual_size: proc.ki_size as u64,
+        resident_size,
+        resident_peak: (proc.ki_rusage.ru_maxrss.max(0) as u64 * 1024).max(resident_size),
+        shared_size: 0,
+    })
 }
 
 pub fn usage(pid: i32) -> Option<Usage> {

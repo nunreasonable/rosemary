@@ -1,6 +1,6 @@
 use std::collections::VecDeque;
 use std::ffi::{CString, c_char, c_void};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
 use super::block;
@@ -176,6 +176,30 @@ fn on_main_thread() -> bool {
 pub fn main_queue() -> u64 {
     static MAIN: OnceLock<u64> = OnceLock::new();
     *MAIN.get_or_init(|| global("com.apple.main-thread", false, true))
+}
+
+/// What wakes the main thread's run loop when work lands on the main queue.
+static MAIN_WAKE: AtomicUsize = AtomicUsize::new(0);
+
+/// Install the waker for the main queue.
+///
+/// On a Mac the main queue is a port the main run loop listens on, so work sent
+/// to it from another thread ends the loop's wait at once. Without a waker it
+/// waits for whatever else ends the wait - a frame posted by a worker sat out the
+/// rest of the run loop's slice.
+pub fn set_main_wake_hook(hook: fn()) {
+    MAIN_WAKE.store(hook as usize, Ordering::Release);
+    // Anything queued before the hook existed is still owed a turn.
+    hook();
+}
+
+fn wake_main() {
+    let hook = MAIN_WAKE.load(Ordering::Acquire);
+    if hook != 0 {
+        // SAFETY: only `set_main_wake_hook` stores here, and it stores a `fn()`.
+        let hook: fn() = unsafe { std::mem::transmute(hook) };
+        hook();
+    }
 }
 
 /// Run everything the main queue is holding.
@@ -408,7 +432,9 @@ fn submit(handle: u64, item: Item) {
         .push_back(item);
     // The main queue is drained by the main thread alone; handing it to the pool
     // would run its work on the wrong thread, which is the one thing it promises.
-    if !q.main {
+    if q.main {
+        wake_main();
+    } else {
         schedule(handle);
     }
 }

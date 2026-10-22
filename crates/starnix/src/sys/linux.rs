@@ -10,8 +10,8 @@ use std::path::PathBuf;
 use std::sync::OnceLock;
 
 use crate::process::{
-    Audit, Descriptor, DescriptorKind, FileId, Identity, InUse, Process, Region, State, Thread,
-    Usage,
+    Audit, Descriptor, DescriptorKind, FileId, Footprint, Identity, InUse, Process, Region, State,
+    Thread, Usage,
 };
 use crate::socket::Peer;
 use crate::system::{CpuTicks, Memory, page_size};
@@ -139,10 +139,8 @@ pub fn process(pid: i32) -> Option<Process> {
     })
 }
 
-pub fn usage(pid: i32) -> Option<Usage> {
-    let stat = Stat::read(&format!("/proc/{pid}/stat"))?;
-    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap_or_default();
-    let statm = std::fs::read_to_string(format!("/proc/{pid}/statm")).unwrap_or_default();
+/// The sizes `statm` gives, with the peak from `status`.
+fn footprint_from(statm: &str, status: &str) -> Footprint {
     let mut pages = statm
         .split_whitespace()
         .map(|word| word.parse::<u64>().unwrap_or(0));
@@ -150,6 +148,25 @@ pub fn usage(pid: i32) -> Option<Usage> {
     let virtual_size = pages.next().unwrap_or(0) * page;
     let resident_size = pages.next().unwrap_or(0) * page;
     let shared_size = pages.next().unwrap_or(0) * page;
+    Footprint {
+        virtual_size,
+        resident_size,
+        resident_peak: (status_number(status, "VmHWM:") * 1024).max(resident_size),
+        shared_size,
+    }
+}
+
+pub fn footprint(pid: i32) -> Option<Footprint> {
+    let statm = std::fs::read_to_string(format!("/proc/{pid}/statm")).ok()?;
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap_or_default();
+    Some(footprint_from(&statm, &status))
+}
+
+pub fn usage(pid: i32) -> Option<Usage> {
+    let stat = Stat::read(&format!("/proc/{pid}/stat"))?;
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap_or_default();
+    let statm = std::fs::read_to_string(format!("/proc/{pid}/statm")).unwrap_or_default();
+    let footprint = footprint_from(&statm, &status);
     // Unreadable for a process that changed credentials, which leaves the
     // counters at zero rather than refusing the whole answer.
     let io = std::fs::read_to_string(format!("/proc/{pid}/io")).unwrap_or_default();
@@ -158,10 +175,10 @@ pub fn usage(pid: i32) -> Option<Usage> {
         .map_or(0, |regions| regions.len() as u32);
     let threads = threads(pid).unwrap_or_default();
     Some(Usage {
-        virtual_size,
-        resident_size,
-        resident_peak: (status_number(&status, "VmHWM:") * 1024).max(resident_size),
-        shared_size,
+        virtual_size: footprint.virtual_size,
+        resident_size: footprint.resident_size,
+        resident_peak: footprint.resident_peak,
+        shared_size: footprint.shared_size,
         user_ns: ticks_to_ns(stat.num(14)),
         system_ns: ticks_to_ns(stat.num(15)),
         minor_faults: stat.num(10).max(0) as u64,

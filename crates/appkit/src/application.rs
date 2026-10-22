@@ -66,6 +66,18 @@ static CURRENT_EVENT: AtomicUsize = AtomicUsize::new(0);
 static POSTED_SOURCE: std::sync::OnceLock<std::sync::Arc<corefoundation::runloop::Source>> =
     std::sync::OnceLock::new();
 
+/// The main run loop's source for the main dispatch queue, which also exists
+/// only to end its wait: `turn` drains the queue once the loop returns.
+static MAIN_QUEUE_SOURCE: std::sync::OnceLock<std::sync::Arc<corefoundation::runloop::Source>> =
+    std::sync::OnceLock::new();
+
+fn main_queue_submitted() {
+    if let Some(source) = MAIN_QUEUE_SOURCE.get() {
+        source.signal();
+        corefoundation::runloop::main().wake();
+    }
+}
+
 /// Nothing to do: the events are sent by `turn`, or taken by
 /// `-nextEventMatchingMask:`, once the loop returns for this source.
 unsafe extern "C" fn posted_source_fired(_info: *mut c_void) {}
@@ -385,6 +397,12 @@ fn register_common_modes() {
         let source = POSTED_SOURCE
             .get_or_init(|| corefoundation::runloop::new_source(Some(posted_source_fired), 0));
         loop_.add_source(source, corefoundation::runloop::COMMON_MODES);
+        // Drained by `service_run_loop`, not by the source, so a main-queue block
+        // that runs a nested loop does not start the next one inside it.
+        let source = MAIN_QUEUE_SOURCE
+            .get_or_init(|| corefoundation::runloop::new_source(Some(posted_source_fired), 0));
+        loop_.add_source(source, corefoundation::runloop::COMMON_MODES);
+        darwin::dispatch::queue::set_main_wake_hook(main_queue_submitted);
     });
 }
 
