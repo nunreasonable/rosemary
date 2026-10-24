@@ -336,6 +336,9 @@ pub fn provider() -> SyntheticDylib {
     for (name, addr) in media_constants() {
         out.data(&name, addr);
     }
+    for (name, addr) in crate::shims::coremedia::data_symbols() {
+        out.data(&name, addr);
+    }
     for (name, addr) in shimmed() {
         out.function(&format!("_{name}"), addr as usize as u64);
     }
@@ -372,6 +375,14 @@ const MEDIA_CONSTANTS: &[(&str, &str)] = &[
     ("_kCVPixelBufferPixelFormatTypeKey", "PixelFormatType"),
     ("_kCVPixelBufferWidthKey", "Width"),
     ("_kCVPixelBufferHeightKey", "Height"),
+    (
+        "_kCVPixelBufferCGBitmapContextCompatibilityKey",
+        "CGBitmapContextCompatibility",
+    ),
+    (
+        "_kCVPixelBufferCGImageCompatibilityKey",
+        "CGImageCompatibility",
+    ),
 ];
 
 fn media_constants() -> Vec<(String, u64)> {

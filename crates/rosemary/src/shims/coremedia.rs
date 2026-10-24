@@ -239,6 +239,62 @@ fn decompression_session_create(
     Ok(())
 }
 
+/// `kCMTimeFlags_Valid`, from `CMTime.h`.
+const FLAGS_VALID: u32 = 1 << 0;
+/// `kCMTimeFlags_PositiveInfinity`.
+const FLAGS_POSITIVE_INFINITY: u32 = 1 << 2;
+
+/// `kCMTimeZero`: zero numeric seconds. Any nonzero `timescale` gives the same
+/// answer through `CMTimeGetSeconds`/`CMTimeCompare`, the only way the
+/// documented API observes this value - the stored `timescale` is not itself
+/// part of what "time zero" promises, so this is a real value rather than an
+/// approximation of one.
+static K_CM_TIME_ZERO: CmTime = CmTime {
+    value: 0,
+    timescale: 1,
+    flags: FLAGS_VALID,
+    epoch: 0,
+};
+
+/// `kCMTimeInvalid`: "all of its fields set to 0", per `CMTime.h`'s own
+/// doc comment on the constant.
+static K_CM_TIME_INVALID: CmTime = CmTime {
+    value: 0,
+    timescale: 0,
+    flags: 0,
+    epoch: 0,
+};
+
+/// `kCMTimePositiveInfinity`. `CMTIME_IS_POSITIVE_INFINITY` only looks at
+/// `flags`, so `value`/`timescale`/`epoch` are unobserved and left at 0.
+static K_CM_TIME_POSITIVE_INFINITY: CmTime = CmTime {
+    value: 0,
+    timescale: 0,
+    flags: FLAGS_VALID | FLAGS_POSITIVE_INFINITY,
+    epoch: 0,
+};
+
+/// The three `CMTime` globals a guest's static initializers read directly out
+/// of its GOT - not through a shim call, since these are data, not functions.
+/// Each symbol's address *is* the struct's bytes, the way `_CGRectInfinite` is
+/// in `rosemary::frameworks`, not a pointer to them.
+pub(crate) fn data_symbols() -> Vec<(String, u64)> {
+    vec![
+        (
+            "_kCMTimeZero".to_string(),
+            &K_CM_TIME_ZERO as *const CmTime as usize as u64,
+        ),
+        (
+            "_kCMTimeInvalid".to_string(),
+            &K_CM_TIME_INVALID as *const CmTime as usize as u64,
+        ),
+        (
+            "_kCMTimePositiveInfinity".to_string(),
+            &K_CM_TIME_POSITIVE_INFINITY as *const CmTime as usize as u64,
+        ),
+    ]
+}
+
 /// One of this module's implementations that needs no [`Callbacks`].
 pub type Shim = super::coregraphics::Shim;
 
@@ -298,5 +354,34 @@ mod tests {
     #[test]
     fn a_frame_rate_range_is_three_floats() {
         assert_eq!(size_of::<CaFrameRateRange>(), 12);
+    }
+
+    /// Each of `kCMTimeZero`/`kCMTimeInvalid`/`kCMTimePositiveInfinity` reads
+    /// back as the `CMTime` its doc comment describes, at the address a guest's
+    /// GOT slot for it resolves to.
+    #[test]
+    fn the_cm_time_globals_match_their_documented_fields() {
+        let symbols = data_symbols();
+        let read = |name: &str| {
+            let (_, address) = symbols.iter().find(|(n, _)| n == name).expect(name);
+            // SAFETY: the address of a `static CmTime` this module owns.
+            unsafe { *(*address as *const CmTime) }
+        };
+
+        let zero = read("_kCMTimeZero");
+        assert_eq!(zero.value, 0);
+        assert_ne!(zero.timescale, 0, "a numeric time needs a nonzero scale");
+        assert_eq!(zero.flags & 1, 1, "kCMTimeFlags_Valid must be set");
+
+        let invalid = read("_kCMTimeInvalid");
+        assert_eq!(invalid, CmTime::default(), "an invalid time is all zero");
+
+        let positive_infinity = read("_kCMTimePositiveInfinity");
+        assert_eq!(positive_infinity.flags & 1, 1, "still Valid");
+        assert_eq!(
+            positive_infinity.flags & (1 << 2),
+            1 << 2,
+            "and PositiveInfinity"
+        );
     }
 }
