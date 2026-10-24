@@ -151,6 +151,18 @@ unsafe extern "C" fn tool_tips_font_of_size(_class: Id, _sel: Sel, size: f64) ->
     ui_font(size, 11.0)
 }
 
+/// `+titleBarFontOfSize:` and `+paletteFontOfSize:`, a window's and a utility
+/// panel's title.
+// FIXME (ACCURACY): macOS answers the emphasized (bold) system font for both;
+// this answers the regular one, like `+boldSystemFontOfSize:` here.
+unsafe extern "C" fn title_bar_font_of_size(_class: Id, _sel: Sel, size: f64) -> Id {
+    ui_font(size, 13.0)
+}
+
+unsafe extern "C" fn palette_font_of_size(_class: Id, _sel: Sel, size: f64) -> Id {
+    ui_font(size, 11.0)
+}
+
 /// `-[NSFont fontDescriptor]`. A font here is its own attribute dictionary,
 /// which is what a `CTFontDescriptor` is too.
 unsafe extern "C" fn font_descriptor(receiver: Id, _sel: Sel) -> Id {
@@ -325,6 +337,8 @@ pub(crate) fn install() {
         "controlContentFontOfSize:" => control_content_font_of_size, c"@24@0:8d16";
         "menuBarFontOfSize:" => menu_bar_font_of_size, c"@24@0:8d16";
         "toolTipsFontOfSize:" => tool_tips_font_of_size, c"@24@0:8d16";
+        "titleBarFontOfSize:" => title_bar_font_of_size, c"@24@0:8d16";
+        "paletteFontOfSize:" => palette_font_of_size, c"@24@0:8d16";
     });
 
     let class = objc::class::lookup(c"NSFontManager").expect("declared before its methods");
