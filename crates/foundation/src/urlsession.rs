@@ -159,6 +159,24 @@ pub fn http_response(url: &str, status: u16, headers: Vec<(String, String)>) -> 
     ))
 }
 
+/// `-initWithURL:`. `NSURLRequest` itself had never answered it here, which
+/// left the mutable subclass with nothing to inherit either - unlike `-URL`
+/// and the rest of the accessors below, every one of which is on the
+/// immutable class for exactly that reason.
+unsafe extern "C" fn init_with_url(receiver: Id, _sel: Sel, url: Id) -> Id {
+    // SAFETY: an `NSURL`, or nil.
+    let Some(text) = (unsafe { crate::url::text_of(url) }) else {
+        return std::ptr::null_mut();
+    };
+    // `+alloc` leaves `receiver` with no contents yet - `make` is what
+    // `+requestWithURL:` uses instead - so this `-init` is where they are
+    // made, which is `fill`'s case rather than `request_of`'s.
+    // SAFETY: `receiver` is an instance of the class this module registered
+    // for `Request`.
+    unsafe { crate::boxed::fill(receiver, Request::new(text, DEFAULT_TIMEOUT_SECONDS)) };
+    receiver
+}
+
 unsafe extern "C" fn set_url(receiver: Id, _sel: Sel, url: Id) {
     // SAFETY: an `NSURL`, or nil.
     let Some(text) = (unsafe { crate::url::text_of(url) }) else {
@@ -976,6 +994,7 @@ pub(crate) fn install() {
         "requestWithURL:cachePolicy:timeoutInterval:" => request_with_url_policy_timeout, c"@40@0:8@16Q24d32";
     });
     methods!(immutable, {
+        "initWithURL:" => init_with_url, c"@24@0:8@16";
         "URL" => request_url, c"@16@0:8";
         "HTTPMethod" => http_method, c"@16@0:8";
         "HTTPBody" => http_body, c"@16@0:8";
@@ -1047,6 +1066,42 @@ pub(crate) fn install() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `-initWithURL:` configures the receiver it is sent to, on either the
+    /// immutable class or the mutable one that inherits the method from it.
+    #[test]
+    fn init_with_url_configures_the_request_on_either_class() {
+        crate::bootstrap();
+        for class_name in [c"NSURLRequest", c"NSMutableURLRequest"] {
+            let class = objc::class::lookup(class_name).expect("declared");
+            let object = objc::object::create_instance(class, 0);
+            let url = corefoundation::url::new("https://example.com/path");
+            // SAFETY: `-initWithURL:` is `id (id, SEL, id)`.
+            let request =
+                unsafe { init_with_url(object, objc::sel::get("initWithURL:"), url as Id) };
+            assert!(!request.is_null(), "{class_name:?}");
+            // SAFETY: `init_with_url` just handed back a request this module made.
+            let parts = unsafe { request_parts(request) }.expect("a request this module made");
+            assert_eq!(parts.url, "https://example.com/path");
+            assert_eq!(parts.method, "GET");
+            objc::arc::release(request);
+            // SAFETY: a URL this test just made.
+            unsafe { corefoundation::api::CFRelease(url) };
+        }
+    }
+
+    /// A URL `-initWithURL:` cannot make sense of answers nil, as every other
+    /// request constructor in this module does for the same input.
+    #[test]
+    fn init_with_url_of_a_bad_url_answers_nil() {
+        crate::bootstrap();
+        let class = objc::class::lookup(c"NSURLRequest").expect("declared");
+        let object = objc::object::create_instance(class, 0);
+        // SAFETY: `-initWithURL:` is `id (id, SEL, id)`.
+        let request =
+            unsafe { init_with_url(object, objc::sel::get("initWithURL:"), std::ptr::null_mut()) };
+        assert!(request.is_null());
+    }
 
     /// A request built the way a guest builds one, run the way
     /// `+sendSynchronousRequest:` runs it. Against a real server, because what
