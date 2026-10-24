@@ -5,6 +5,7 @@
 )]
 
 pub mod collator;
+pub mod datetime;
 pub mod events;
 pub mod files;
 pub mod icons;
@@ -16,6 +17,7 @@ pub mod uti;
 
 exports::group! {
     collator,
+    datetime,
     events,
     files,
     icons,

@@ -1381,6 +1381,12 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     // arithmetic with no guest memory involved.
     sig!("CreateTextEncoding", U32, U32, U32, U32),
     sig!("Long2Fix", I32, I32),
+    // `OSStatus UCConvertCFAbsoluteTimeToUTCDateTime(CFAbsoluteTime,
+    // UTCDateTime *)` and its inverses; `UTCDateTime` goes by pointer.
+    sig!("UCConvertCFAbsoluteTimeToUTCDateTime", I32, F64, P),
+    sig!("UCConvertUTCDateTimeToCFAbsoluteTime", I32, P, P),
+    sig!("UCConvertSecondsToCFAbsoluteTime", I32, U32, P),
+    sig!("UCConvertCFAbsoluteTimeToSeconds", I32, F64, P),
     // `OSStatus UpgradeScriptInfoToTextEncoding(ScriptCode, LangCode,
     // RegionCode, ConstStr255Param, TextEncoding *)`.
     sig!("UpgradeScriptInfoToTextEncoding", I32, I16, I16, I16, P, P),
