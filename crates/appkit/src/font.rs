@@ -313,6 +313,10 @@ pub(crate) fn install() {
     methods!(dictionary, {
         "familyName" => font_family_name, c"@16@0:8";
         "fontName" => font_name, c"@16@0:8";
+        // `-[NSFontDescriptor postscriptName]`; a descriptor here is the same
+        // dictionary a font is.
+        "postscriptName" => font_name, c"@16@0:8";
+        "fontAttributes" => font_descriptor, c"@16@0:8";
         "displayName" => font_family_name, c"@16@0:8";
         "pointSize" => font_point_size, c"d16@0:8";
         "fontDescriptor" => font_descriptor, c"@16@0:8";
