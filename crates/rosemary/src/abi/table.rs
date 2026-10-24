@@ -753,6 +753,7 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("CGDisplayRelease", I32, U32),
     sig!("CGColorSpaceCreateDeviceRGB", P),
     sig!("CGColorSpaceRelease", V, P),
+    sig!("CGColorSpaceRetain", P, P),
     // `CGFloat` is `double` on both architectures, so the CTM translation is
     // two ordinary vector arguments.
     sig!("CGContextRelease", V, P),
@@ -807,10 +808,21 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("CGEventCreate", P, P),
     sig!("CGEventPost", V, U32, P),
     sig!("CGEventSetType", V, P, U32),
+    // `CGEventField` is a plain C enum, four bytes like `CGEventType` above.
+    sig!("CGEventGetDoubleValueField", F64, P, U32),
+    sig!("CGEventGetIntegerValueField", I64, P, U32),
+    sig!("CGEventSetDoubleValueField", V, P, U32, F64),
+    sig!("CGEventSetIntegerValueField", V, P, U32, I64),
+    // `CGEventTimestamp` is `uint64_t`.
+    sig!("CGEventGetTimestamp", U64, P),
+    sig!("CGEventSetTimestamp", V, P, U64),
+    sig!("CGEventTapEnable", V, P, BOOL),
     // The gamma ramp, read and written.
     sig!("CGGetDisplayTransferByTable", I32, U32, U32, P, P, P, P),
     sig!("CGSetDisplayTransferByTable", I32, U32, U32, P, P, P),
     sig!("CGGetOnlineDisplayList", I32, U32, P, P),
+    // `CGPoint` by value, as `CGDisplayMoveCursorToPoint` above.
+    sig!("CGGetDisplaysWithPoint", I32, F64, F64, U32, P, P),
     // `void CGGetLastMouseDelta(int32_t *dx, int32_t *dy)` - how a game reads
     // relative mouse motion when the cursor is hidden and locked, which is
     // every first-person camera.
@@ -893,6 +905,8 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("CGImageGetWidth", U64, P),
     sig!("CGImageSourceCreateImageAtIndex", P, P, U64, P),
     sig!("CGImageSourceCreateWithData", P, P, P),
+    sig!("CGImageSourceCreateWithDataProvider", P, P, P),
+    sig!("CGImageSourceCopyPropertiesAtIndex", P, P, U64, P),
     sig!("CGMainDisplayID", U32),
     sig!("CGDisplayRestoreColorSyncSettings", V),
     sig!("NXGetLocalArchInfo", P),
@@ -907,6 +921,19 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("CGWarpMouseCursorPosition", I32, F64, F64),
     sig!("CGSetLocalEventsSuppressionInterval", I32, F64),
     sig!("CGWindowLevelForKey", I32, I32),
+    // `CGDirectDisplayID` is `uint32_t`; a `ColorSyncProfileRef` is a pointer
+    // like any other CF type.
+    sig!("ColorSyncProfileCreateWithDisplayID", P, U32),
+    sig!("ColorSyncProfileCreateWithURL", P, P, P),
+    sig!("ColorSyncProfileGetURL", P, P, P),
+    // `PMPrinter`, `PMPrintSession` and `PMPrintSettings` are opaque Carbon
+    // handles, pointer-sized like any other; `OSStatus` is `int32_t` and
+    // `PMResolution` travels by pointer, never by value.
+    sig!("PMSessionGetCurrentPrinter", I32, P, P),
+    sig!("PMPrinterGetPrinterResolutionCount", I32, P, P),
+    sig!("PMPrinterGetIndexedPrinterResolution", I32, P, U32, P),
+    sig!("PMPrinterGetOutputResolution", I32, P, P, P),
+    sig!("PMPrinterSetOutputResolution", I32, P, P, P),
     sig!("CGColorGetConstantColor", P, P),
     sig!("CGColorCreateCopy", P, P),
     sig!("CGColorRelease", V, P),
@@ -4046,6 +4073,9 @@ pub static REFUSED: &[(&str, &str)] = &[
     ("CFGregorianDateGetAbsoluteTime", AGGREGATE),
     ("CGRectContainsPoint", AGGREGATE),
     ("CGRectInset", AGGREGATE),
+    ("CGRectIntersection", AGGREGATE),
+    ("CGContextConvertRectToUserSpace", AGGREGATE),
+    ("CGDisplayCreateImageForRect", AGGREGATE),
     ("NSMouseInRect", AGGREGATE),
     ("NSRectFill", AGGREGATE),
     ("NSDrawNinePartImage", AGGREGATE),
