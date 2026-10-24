@@ -149,6 +149,8 @@ static HIERARCHY: &[(&str, Option<&str>, usize)] = &[
         crate::printing::OPERATION_INSTANCE_SIZE,
     ),
     ("NSPrintPanel", None, crate::printing::PANEL_INSTANCE_SIZE),
+    ("NSInputManager", None, 0),
+    ("NSFilePromiseReceiver", None, 0),
 ];
 
 pub fn install() {

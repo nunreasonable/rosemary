@@ -42,8 +42,10 @@ mod displaylink;
 pub mod dock;
 mod document;
 pub mod event;
+mod file_promise;
 mod font;
 pub mod hitheme;
+mod input_manager;
 pub mod launch;
 pub mod launchservices;
 pub(crate) mod quartz;
@@ -148,6 +150,8 @@ pub fn bootstrap() {
         status::install();
         document::install();
         printing::install();
+        input_manager::install();
+        file_promise::install();
     });
 }
 
