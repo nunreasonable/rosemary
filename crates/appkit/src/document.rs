@@ -30,6 +30,11 @@ pub struct Document {
     /// ordinary Objective-C message, the same ones a guest would send.
     window_controllers: Id,
     change_count: isize,
+    /// `-undoManager`, made lazily; owned once it exists.
+    undo_manager: Id,
+    /// `-hasUndoManager`. Apple defaults this to YES, which is what makes a
+    /// bare `-undoManager` get a manager at all on a fresh document.
+    has_undo_manager: usize,
 }
 
 pub const INSTANCE_SIZE: usize = size_of::<Document>();
@@ -114,6 +119,7 @@ unsafe fn file_path(url: Id) -> Option<String> {
 unsafe extern "C" fn init(receiver: Id, _sel: Sel) -> Id {
     let doc = doc_of(receiver);
     doc.window_controllers = new_mutable_array();
+    doc.has_undo_manager = 1;
     receiver
 }
 
@@ -306,6 +312,51 @@ unsafe extern "C" fn update_change_count(receiver: Id, _sel: Sel, change: usize)
     };
 }
 
+/// `-undoManager`: a manager made lazily when `-hasUndoManager` says the
+/// document owns one, else nil.
+///
+/// Apple also registers the document as an observer of the manager's
+/// notifications here, so that undoing or redoing updates
+/// `-isDocumentEdited` on its own. Left out: nothing in this file observes
+/// `NSUndoManager`'s notifications, so a program relying on that wiring
+/// must call `-updateChangeCount:` itself.
+unsafe extern "C" fn undo_manager(receiver: Id, _sel: Sel) -> Id {
+    let doc = doc_of(receiver);
+    if doc.has_undo_manager == 0 {
+        return std::ptr::null_mut();
+    }
+    if doc.undo_manager.is_null() {
+        doc.undo_manager = foundation::undomanager::make();
+    }
+    doc.undo_manager
+}
+
+unsafe extern "C" fn set_undo_manager(receiver: Id, _sel: Sel, manager: Id) {
+    let doc = doc_of(receiver);
+    let old = doc.undo_manager;
+    doc.undo_manager = objc::arc::retain(manager);
+    objc::arc::release(old);
+    doc.has_undo_manager = 1;
+}
+
+unsafe extern "C" fn has_undo_manager(receiver: Id, _sel: Sel) -> u8 {
+    u8::from(doc_of(receiver).has_undo_manager != 0)
+}
+
+/// `-setHasUndoManager:`: turning this off also drops whatever manager the
+/// document already owns, per Apple's own note on the property - a document
+/// that stops supporting undo has nothing left to ask for one.
+unsafe extern "C" fn set_has_undo_manager(receiver: Id, _sel: Sel, value: u8) {
+    let doc = doc_of(receiver);
+    doc.has_undo_manager = value as usize;
+    if value == 0 {
+        objc::arc::release(std::mem::replace(
+            &mut doc.undo_manager,
+            std::ptr::null_mut(),
+        ));
+    }
+}
+
 /// `-close`: close every window controller, then leave whichever document
 /// controller holds this one - Apple's order, so a window's own `-close`
 /// delegate callbacks still see the document attached.
@@ -331,6 +382,7 @@ unsafe extern "C" fn dealloc(receiver: Id, _sel: Sel) {
     objc::arc::release(doc.file_type);
     objc::arc::release(doc.display_name);
     objc::arc::release(doc.window_controllers);
+    objc::arc::release(doc.undo_manager);
     objc::arc::finalize(receiver);
 }
 
@@ -443,6 +495,10 @@ pub(crate) fn install() {
         "showWindows" => show_windows, c"v16@0:8";
         "isDocumentEdited" => is_document_edited, c"B16@0:8";
         "updateChangeCount:" => update_change_count, c"v24@0:8Q16";
+        "undoManager" => undo_manager, c"@16@0:8";
+        "setUndoManager:" => set_undo_manager, c"v24@0:8@16";
+        "hasUndoManager" => has_undo_manager, c"B16@0:8";
+        "setHasUndoManager:" => set_has_undo_manager, c"v20@0:8B16";
         "close" => close, c"v16@0:8";
         "dealloc" => dealloc, c"v16@0:8";
     });
@@ -525,5 +581,52 @@ mod tests {
         assert_eq!(count, 0);
         objc::arc::release(doc);
         unsafe { controller_dealloc(controller, objc::sel::get("dealloc")) };
+    }
+
+    /// A fresh document has an undo manager by default, made the first time
+    /// it is asked for and the same instance after - and turning
+    /// `hasUndoManager` off both answers nil and drops the one it had.
+    #[test]
+    fn a_document_lazily_owns_one_undo_manager_until_told_not_to() {
+        let doc = make(c"NSDocument");
+        unsafe { init(doc, objc::sel::get("init")) };
+        assert_eq!(
+            unsafe { has_undo_manager(doc, objc::sel::get("hasUndoManager")) },
+            1,
+            "a fresh document supports undo by default"
+        );
+        let first = unsafe { undo_manager(doc, objc::sel::get("undoManager")) };
+        assert!(!first.is_null());
+        let second = unsafe { undo_manager(doc, objc::sel::get("undoManager")) };
+        assert_eq!(first, second, "the same manager every time");
+
+        unsafe { set_has_undo_manager(doc, objc::sel::get("setHasUndoManager:"), 0) };
+        assert!(
+            unsafe { undo_manager(doc, objc::sel::get("undoManager")) }.is_null(),
+            "nil once the document no longer owns one"
+        );
+        objc::arc::release(doc);
+    }
+
+    /// Assigning a manager directly is what the document then hands back,
+    /// and does so whether or not it previously supported undo at all.
+    #[test]
+    fn setting_an_undo_manager_is_what_is_read_back() {
+        let doc = make(c"NSDocument");
+        unsafe { init(doc, objc::sel::get("init")) };
+        unsafe { set_has_undo_manager(doc, objc::sel::get("setHasUndoManager:"), 0) };
+        let manager = foundation::undomanager::make();
+        unsafe { set_undo_manager(doc, objc::sel::get("setUndoManager:"), manager) };
+        assert_eq!(
+            unsafe { has_undo_manager(doc, objc::sel::get("hasUndoManager")) },
+            1,
+            "assigning one turns hasUndoManager back on"
+        );
+        assert_eq!(
+            unsafe { undo_manager(doc, objc::sel::get("undoManager")) },
+            manager
+        );
+        objc::arc::release(manager);
+        objc::arc::release(doc);
     }
 }

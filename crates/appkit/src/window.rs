@@ -107,6 +107,9 @@ pub struct Window {
     /// `-setDisplaysWhenScreenProfileChanges:`. Nothing here redraws for a
     /// profile change SDL never reports; stored for the same reason.
     displays_when_screen_profile_changes: usize,
+    /// `-undoManager`'s own fallback when the delegate does not answer
+    /// `-windowWillReturnUndoManager:`: made lazily, owned by the window.
+    undo_manager: Id,
 }
 
 pub const INSTANCE_SIZE: usize = size_of::<Window>();
@@ -1894,6 +1897,35 @@ unsafe extern "C" fn set_delegate(receiver: Id, _sel: Sel, value: Id) {
     window_of(receiver).delegate = value;
 }
 
+/// `-[NSWindow undoManager]`: the delegate's, if it implements
+/// `-windowWillReturnUndoManager:`, else a lazy one of the window's own.
+///
+/// The delegate is asked by looking up the method rather than by sending
+/// `-respondsToSelector:` and then the message, matching how this crate
+/// already asks a delegate about `-windowShouldClose:` in `perform_close`.
+unsafe extern "C" fn window_undo_manager(receiver: Id, _sel: Sel) -> Id {
+    let delegate = delegate_of(receiver);
+    let will_return = objc::sel::get("windowWillReturnUndoManager:");
+    if !delegate.is_null() {
+        // SAFETY: a live delegate.
+        let method =
+            (unsafe { objc::object::class_of(delegate) }).and_then(|c| c.method(will_return));
+        if let Some(method) = method {
+            // SAFETY: `-windowWillReturnUndoManager:` is `id (id, SEL, id)`.
+            return unsafe {
+                let f: unsafe extern "C" fn(Id, Sel, Id) -> Id =
+                    std::mem::transmute(method.implementation());
+                f(delegate, will_return, receiver)
+            };
+        }
+    }
+    let window = window_of(receiver);
+    if window.undo_manager.is_null() {
+        window.undo_manager = foundation::undomanager::make();
+    }
+    window.undo_manager
+}
+
 unsafe extern "C" fn set_title(receiver: Id, _sel: Sel, title: Id) {
     let sdl = window_of(receiver).sdl;
     if sdl.is_null() || title.is_null() {
@@ -2103,6 +2135,10 @@ pub(crate) unsafe extern "C" fn dealloc(receiver: Id, sel: Sel) {
     unsafe { order_out(receiver, sel, std::ptr::null_mut()) };
     objc::arc::destroy_weak(&mut window.first_responder);
     objc::arc::destroy_weak(&mut window.initial_first_responder);
+    objc::arc::release(std::mem::replace(
+        &mut window.undo_manager,
+        std::ptr::null_mut(),
+    ));
     WINDOWS
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -3441,6 +3477,7 @@ pub(crate) fn install() {
         "windowController" => window_controller, c"@16@0:8";
         "setWindowController:" => set_window_controller, c"v24@0:8@16";
         "setDelegate:" => set_delegate, c"v24@0:8@16";
+        "undoManager" => window_undo_manager, c"@16@0:8";
         "title" => title, c"@16@0:8";
         "setTitle:" => set_title, c"v24@0:8@16";
         "makeKeyAndOrderFront:" => make_key_and_order_front, c"v24@0:8@16";
@@ -4743,5 +4780,60 @@ mod tests {
         objc::arc::release(view);
         assert!(window_of(window).first_responder.is_null());
         objc::arc::destroy_weak(&mut window_of(window).first_responder);
+    }
+
+    /// A window with no delegate - or a delegate that does not implement
+    /// `-windowWillReturnUndoManager:` - falls back to a lazy manager of its
+    /// own, made once and handed back every time after.
+    #[test]
+    fn undo_manager_falls_back_to_a_lazy_one_of_the_windows_own() {
+        crate::bootstrap();
+        let window =
+            objc::object::create_instance(objc::class::lookup(c"NSWindow").expect("NSWindow"), 0);
+        let sel = objc::sel::get("undoManager");
+        let first = unsafe { window_undo_manager(window, sel) };
+        assert!(!first.is_null());
+        let second = unsafe { window_undo_manager(window, sel) };
+        assert_eq!(first, second, "the same instance every time");
+        objc::arc::release(window);
+    }
+
+    /// A delegate that implements `-windowWillReturnUndoManager:` is asked
+    /// instead, and its answer is what the window hands back - not one of
+    /// its own making.
+    #[test]
+    fn undo_manager_asks_a_delegate_that_implements_it() {
+        crate::bootstrap();
+        let window =
+            objc::object::create_instance(objc::class::lookup(c"NSWindow").expect("NSWindow"), 0);
+        let manager = foundation::undomanager::make();
+        unsafe extern "C" fn will_return(_receiver: Id, _sel: Sel, _window: Id) -> Id {
+            MANAGER_FOR_TEST.with(|m| m.get())
+        }
+        thread_local! {
+            static MANAGER_FOR_TEST: std::cell::Cell<Id> = const { std::cell::Cell::new(std::ptr::null_mut()) };
+        }
+        MANAGER_FOR_TEST.with(|m| m.set(manager));
+        let delegate_class = objc::class::allocate_pair(
+            Some(objc::class::lookup(c"NSObject").expect("NSObject")),
+            c"UndoManagerDelegate",
+            0,
+        )
+        .expect("a class of this name is not declared elsewhere");
+        delegate_class.add_method(
+            objc::sel::get("windowWillReturnUndoManager:"),
+            will_return as objc::class::Imp,
+            c"@24@0:8@16",
+        );
+        objc::class::register_pair(delegate_class);
+        let delegate = objc::object::create_instance(delegate_class, 0);
+        unsafe { set_delegate(window, objc::sel::get("setDelegate:"), delegate) };
+
+        let answered = unsafe { window_undo_manager(window, objc::sel::get("undoManager")) };
+        assert_eq!(answered, manager, "the delegate's answer, not a lazy one");
+
+        objc::arc::release(manager);
+        objc::arc::release(delegate);
+        objc::arc::release(window);
     }
 }
