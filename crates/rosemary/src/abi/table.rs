@@ -1044,6 +1044,7 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("nw_release", V, P),
     sig!("CVDisplayLinkCreateWithActiveCGDisplays", I32, P),
     sig!("CVDisplayLinkCreateWithCGDisplay", I32, U32, P),
+    sig!("CVDisplayLinkCreateWithCGDisplays", I32, P, I64, P),
     sig!("CVDisplayLinkGetActualOutputVideoRefreshPeriod", F64, P),
     // `CVTime` by value: sixteen bytes, both eightbytes integer, and the two
     // ABIs *agree* - `rax`/`rdx` on one side, `x0`/`x1` on the other.
@@ -1098,6 +1099,25 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     // buffer, hand it to the cache, get a texture name back.
     sig!("CVBufferRelease", V, P),
     sig!("CVBufferRetain", P, P),
+    sig!("CVGetHostClockFrequency", F64),
+    // Ten parameters, two past AAPCS64's eighth, and the seventh is guest
+    // code - the release callback a guest expects on its own memory's last
+    // reference.
+    cbsig!(
+        [6],
+        "CVPixelBufferCreateWithBytes",
+        I32,
+        P,
+        U64,
+        U64,
+        U32,
+        P,
+        U64,
+        P,
+        P,
+        P,
+        P
+    ),
     sig!("CVOpenGLTextureCacheCreate", I32, P, P, P, P, P, P),
     sig!(
         "CVOpenGLTextureCacheCreateTextureFromImage",
@@ -3644,8 +3664,11 @@ pub static SIGNATURES: &[FunctionAbi] = &[
         P
     ),
     sig!("CMBlockBufferGetDataPointer", I32, P, U64, P, P, P),
+    sig!("CMBlockBufferGetDataLength", U64, P),
+    sig!("CMBlockBufferCopyDataBytes", I32, P, U64, U64, P),
     sig!("CMCopyDictionaryOfAttachments", P, P, P, U32),
     sig!("CMFormatDescriptionGetMediaSubType", U32, P),
+    sig!("CMAudioFormatDescriptionGetStreamBasicDescription", P, P),
     // Twelve parameters, four past AAPCS64's eighth, and the fourth is guest
     // code.
     cbsig!(

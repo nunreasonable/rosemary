@@ -140,6 +140,31 @@ pub unsafe extern "C" fn CVDisplayLinkCreateWithActiveCGDisplays(out: *mut *mut 
     unsafe { CVDisplayLinkCreateWithCGDisplay(0, out) }
 }
 
+/// `CVReturn CVDisplayLinkCreateWithCGDisplays(const CGDirectDisplayID *displayArray,
+/// CFIndex count, CVDisplayLinkRef *displayLinkOut)`.
+///
+/// Also one display link, on this runtime's one window: the period comes from
+/// the first display of the set, and the rest of the work is
+/// [`CVDisplayLinkCreateWithCGDisplay`]'s.
+///
+/// # Safety
+///
+/// `display_array` must be readable for at least `count` `u32`s when `count`
+/// is positive; `out` as [`CVDisplayLinkCreateWithCGDisplay`].
+pub unsafe extern "C" fn CVDisplayLinkCreateWithCGDisplays(
+    display_array: *const u32,
+    count: i64,
+    out: *mut *mut c_void,
+) -> i32 {
+    if display_array.is_null() || count <= 0 {
+        return INVALID_ARGUMENT;
+    }
+    // SAFETY: the caller's array, at least `count` long by the function's own
+    // contract, so its first element is there to read.
+    let display = unsafe { *display_array };
+    unsafe { CVDisplayLinkCreateWithCGDisplay(display, out) }
+}
+
 /// # Safety
 ///
 /// `callback` must be a host-callable function of the display link's prototype -
@@ -306,6 +331,174 @@ pub unsafe extern "C" fn CVDisplayLinkIsRunning(handle: *mut c_void) -> u8 {
     }) as u8
 }
 
+/// `Float64 CVGetHostClockFrequency(void)`.
+///
+/// The frequency of the clock a `CVGetCurrentHostTime` here would read: the
+/// same nanosecond `CLOCK_MONOTONIC` tick `mach_absolute_time` uses, where
+/// `mach_timebase_info`'s `numer`/`denom` are both one because a tick already
+/// *is* a nanosecond on this host (see `darwin::mach`). A guest dividing that
+/// clock's ticks by this answer gets seconds, which is the only thing either
+/// function promises.
+pub unsafe extern "C" fn CVGetHostClockFrequency() -> f64 {
+    1e9
+}
+
+/// `CVPixelBufferReleaseBytesCallback`.
+type ReleaseBytesCallback = unsafe extern "C" fn(*mut c_void, *const c_void);
+
+/// A `CVPixelBuffer` made by `CVPixelBufferCreateWithBytes`: the caller's own
+/// memory, never copied, released back to the caller - via `releaseCallback` -
+/// only once nothing holds a reference any more.
+struct PixelBuffer {
+    base_address: *mut c_void,
+    release_callback: Option<ReleaseBytesCallback>,
+    release_ref_con: *mut c_void,
+}
+
+// SAFETY: `base_address` and `release_ref_con` are the caller's own pointers,
+// handed back only to the caller's own release callback and never read here.
+unsafe impl Send for PixelBuffer {}
+
+impl Drop for PixelBuffer {
+    fn drop(&mut self) {
+        if let Some(callback) = self.release_callback {
+            // SAFETY: `callback` is the guest's own release callback, run
+            // exactly once - when the last reference goes away - which is
+            // what `CVPixelBufferCreateWithBytes` promises its caller.
+            unsafe { callback(self.release_ref_con, self.base_address) };
+        }
+    }
+}
+
+/// Every pixel buffer this process has made, by the handle the guest holds -
+/// the `CVBuffer` family's own table, parallel to [`LINKS`].
+///
+/// One entry per outstanding reference rather than one entry with a count
+/// field: [`CVBufferRetain`] pushes another clone of the same `Arc` and
+/// [`CVBufferRelease`] drops one, so the `Arc`'s own strong count - not
+/// something this module tracks by hand - is the reference count, and
+/// [`PixelBuffer::drop`] runs exactly when it reaches zero.
+static PIXEL_BUFFERS: Mutex<Vec<(usize, Arc<Mutex<PixelBuffer>>)>> = Mutex::new(Vec::new());
+
+fn pixel_buffer_for(handle: *mut c_void) -> Option<Arc<Mutex<PixelBuffer>>> {
+    PIXEL_BUFFERS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .find(|(h, _)| *h == handle as usize)
+        .map(|(_, buffer)| Arc::clone(buffer))
+}
+
+/// `CVReturn CVPixelBufferCreateWithBytes(CFAllocatorRef allocator, size_t width,
+/// size_t height, OSType pixelFormatType, void *baseAddress, size_t bytesPerRow,
+/// CVPixelBufferReleaseBytesCallback releaseCallback, void *releaseRefCon,
+/// CFDictionaryRef pixelBufferAttributes, CVPixelBufferRef *pixelBufferOut)`.
+///
+/// Wraps `baseAddress` rather than copying it, as the real function does: the
+/// pixels stay the caller's own memory until `releaseCallback` runs, on the
+/// last [`CVBufferRelease`]/[`CVPixelBufferRelease`].
+///
+/// # Safety
+///
+/// `pixel_buffer_out` must be a writable pointer-sized slot; `base_address`
+/// must stay valid until `release_callback` runs (or forever, if
+/// `release_callback` is null).
+pub unsafe extern "C" fn CVPixelBufferCreateWithBytes(
+    _allocator: *const c_void,
+    _width: u64,
+    _height: u64,
+    _pixel_format_type: u32,
+    base_address: *mut c_void,
+    _bytes_per_row: u64,
+    release_callback: Option<ReleaseBytesCallback>,
+    release_ref_con: *mut c_void,
+    _pixel_buffer_attributes: *const c_void,
+    pixel_buffer_out: *mut *mut c_void,
+) -> i32 {
+    if pixel_buffer_out.is_null() || base_address.is_null() {
+        return INVALID_ARGUMENT;
+    }
+    let buffer = Arc::new(Mutex::new(PixelBuffer {
+        base_address,
+        release_callback,
+        release_ref_con,
+    }));
+    // The handle is the `Mutex`'s address, as `CVDisplayLinkCreateWithCGDisplay`'s is.
+    let handle = Arc::as_ptr(&buffer) as *mut c_void;
+    PIXEL_BUFFERS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push((handle as usize, buffer));
+    unsafe { *pixel_buffer_out = handle };
+    SUCCESS
+}
+
+/// `CVReturn CVPixelBufferLockBaseAddress(CVPixelBufferRef pixelBuffer,
+/// CVPixelBufferLockFlags lockFlags)`.
+///
+/// Nothing here ever moves or recycles the backing bytes, so there is nothing
+/// a lock need defend: every call naming a buffer this module made succeeds.
+pub unsafe extern "C" fn CVPixelBufferLockBaseAddress(
+    pixel_buffer: *mut c_void,
+    _lock_flags: u64,
+) -> i32 {
+    match pixel_buffer_for(pixel_buffer) {
+        Some(_) => SUCCESS,
+        None => INVALID_ARGUMENT,
+    }
+}
+
+/// `CVReturn CVPixelBufferUnlockBaseAddress(CVPixelBufferRef pixelBuffer,
+/// CVPixelBufferLockFlags unlockFlags)`. See [`CVPixelBufferLockBaseAddress`].
+pub unsafe extern "C" fn CVPixelBufferUnlockBaseAddress(
+    pixel_buffer: *mut c_void,
+    _unlock_flags: u64,
+) -> i32 {
+    match pixel_buffer_for(pixel_buffer) {
+        Some(_) => SUCCESS,
+        None => INVALID_ARGUMENT,
+    }
+}
+
+/// `void CVPixelBufferRelease(CVPixelBufferRef texture)` - `CFRelease`,
+/// specialised to a pixel buffer. Not thread-safe on real Core Video;
+/// [`CVBufferRelease`], which this forwards to, always takes a lock anyway.
+///
+/// # Safety
+///
+/// `texture` must be null or a handle this module handed out.
+pub unsafe extern "C" fn CVPixelBufferRelease(texture: *mut c_void) {
+    unsafe { CVBufferRelease(texture) }
+}
+
+/// `CVBufferRef CVBufferRetain(CVBufferRef buffer)`.
+///
+/// Null-safe, unlike `CFRetain`. The only `CVBuffer` family this runtime
+/// makes is [`PixelBuffer`], so that is the table this looks in.
+pub unsafe extern "C" fn CVBufferRetain(buffer: *mut c_void) -> *mut c_void {
+    if let Some(buffer_ref) = pixel_buffer_for(buffer) {
+        PIXEL_BUFFERS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push((buffer as usize, buffer_ref));
+    }
+    buffer
+}
+
+/// `void CVBufferRelease(CVBufferRef buffer)`.
+///
+/// Null-safe, unlike `CFRelease`. Drops one reference; [`PixelBuffer::drop`]
+/// runs the release callback when that was the last one.
+pub unsafe extern "C" fn CVBufferRelease(buffer: *mut c_void) {
+    if buffer.is_null() {
+        return;
+    }
+    let mut table = PIXEL_BUFFERS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(pos) = table.iter().position(|(h, _)| *h == buffer as usize) {
+        table.remove(pos);
+    }
+}
+
 /// One turn of the link: build the two timestamps and call the guest.
 ///
 /// `info` is the link's handle, which is how one function serves them all.
@@ -351,6 +544,14 @@ exports::exports! {
     functions {
         "CVDisplayLinkCreateWithCGDisplay" => CVDisplayLinkCreateWithCGDisplay,
         "CVDisplayLinkCreateWithActiveCGDisplays" => CVDisplayLinkCreateWithActiveCGDisplays,
+        "CVDisplayLinkCreateWithCGDisplays" => CVDisplayLinkCreateWithCGDisplays,
+        "CVGetHostClockFrequency" => CVGetHostClockFrequency,
+        "CVPixelBufferCreateWithBytes" => CVPixelBufferCreateWithBytes,
+        "CVPixelBufferLockBaseAddress" => CVPixelBufferLockBaseAddress,
+        "CVPixelBufferUnlockBaseAddress" => CVPixelBufferUnlockBaseAddress,
+        "CVPixelBufferRelease" => CVPixelBufferRelease,
+        "CVBufferRetain" => CVBufferRetain,
+        "CVBufferRelease" => CVBufferRelease,
         "CVDisplayLinkSetOutputCallback" => CVDisplayLinkSetOutputCallback,
         "CVDisplayLinkSetCurrentCGDisplay" => CVDisplayLinkSetCurrentCGDisplay,
         "CVDisplayLinkSetCurrentCGDisplayFromOpenGLContext" => CVDisplayLinkSetCurrentCGDisplayFromOpenGLContext,
@@ -476,6 +677,164 @@ mod tests {
                     0x1 as *mut c_void,
                     std::ptr::null_mut(),
                     std::ptr::null_mut()
+                ),
+                INVALID_ARGUMENT
+            );
+        }
+    }
+
+    /// `CVDisplayLinkCreateWithCGDisplays` reads the first display of the set
+    /// and otherwise behaves as the single-display spelling.
+    #[test]
+    fn create_with_cg_displays_uses_the_first_display() {
+        let displays = [0u32, 99];
+        let mut handle = std::ptr::null_mut();
+        // SAFETY: a two-element array and a writable slot.
+        unsafe {
+            assert_eq!(
+                CVDisplayLinkCreateWithCGDisplays(displays.as_ptr(), 2, &mut handle),
+                SUCCESS
+            );
+        }
+        assert!(!handle.is_null());
+        // SAFETY: `handle` was just created above.
+        unsafe {
+            assert!(CVDisplayLinkGetActualOutputVideoRefreshPeriod(handle) > 0.0);
+            CVDisplayLinkRelease(handle);
+        }
+    }
+
+    #[test]
+    fn create_with_cg_displays_refuses_a_bad_count_or_null_array() {
+        let mut handle = std::ptr::null_mut();
+        // SAFETY: refused before either pointer is read.
+        unsafe {
+            assert_eq!(
+                CVDisplayLinkCreateWithCGDisplays(std::ptr::null(), 1, &mut handle),
+                INVALID_ARGUMENT
+            );
+            let displays = [0u32];
+            assert_eq!(
+                CVDisplayLinkCreateWithCGDisplays(displays.as_ptr(), 0, &mut handle),
+                INVALID_ARGUMENT
+            );
+        }
+    }
+
+    /// Unity's frame cap and any other caller dividing by this expects a
+    /// nanosecond tick, the same one `mach_absolute_time` reports.
+    #[test]
+    fn host_clock_frequency_is_a_nanosecond_tick() {
+        // SAFETY: no arguments, nothing to read.
+        assert_eq!(unsafe { CVGetHostClockFrequency() }, 1e9);
+    }
+
+    static RELEASED: AtomicUsize = AtomicUsize::new(0);
+
+    unsafe extern "C" fn record_release(ref_con: *mut c_void, base_address: *const c_void) {
+        RELEASED.fetch_add(1, Ordering::SeqCst);
+        assert_eq!(ref_con as usize, 0xf00d);
+        assert_eq!(base_address as usize, 0xcafe);
+    }
+
+    /// Wraps the caller's bytes without copying, and releases them - once -
+    /// when the last reference goes away.
+    #[test]
+    fn pixel_buffer_wraps_bytes_and_releases_once() {
+        RELEASED.store(0, Ordering::SeqCst);
+        let mut handle = std::ptr::null_mut();
+        // SAFETY: a writable slot and a release callback matching the
+        // declared prototype; `0xcafe` stands in for memory this test never
+        // dereferences.
+        unsafe {
+            assert_eq!(
+                CVPixelBufferCreateWithBytes(
+                    std::ptr::null(),
+                    4,
+                    4,
+                    0,
+                    0xcafe as *mut c_void,
+                    16,
+                    Some(record_release),
+                    0xf00d as *mut c_void,
+                    std::ptr::null(),
+                    &mut handle,
+                ),
+                SUCCESS
+            );
+        }
+        assert!(!handle.is_null());
+
+        // SAFETY: `handle` was just created above.
+        unsafe {
+            assert_eq!(CVPixelBufferLockBaseAddress(handle, 0), SUCCESS);
+            assert_eq!(CVPixelBufferUnlockBaseAddress(handle, 0), SUCCESS);
+
+            // A second owner, by `CVBufferRetain`, holds the buffer alive
+            // past one `CVPixelBufferRelease`.
+            let retained = CVBufferRetain(handle);
+            assert_eq!(retained, handle);
+            CVPixelBufferRelease(handle);
+            assert_eq!(RELEASED.load(Ordering::SeqCst), 0, "one owner remains");
+            assert_eq!(CVPixelBufferLockBaseAddress(handle, 0), SUCCESS);
+
+            CVBufferRelease(handle);
+            assert_eq!(
+                RELEASED.load(Ordering::SeqCst),
+                1,
+                "the last owner released"
+            );
+            assert_eq!(
+                CVPixelBufferLockBaseAddress(handle, 0),
+                INVALID_ARGUMENT,
+                "gone from the table"
+            );
+        }
+    }
+
+    /// `CVBufferRetain`/`CVBufferRelease` are null-safe, unlike `CFRetain`.
+    #[test]
+    fn buffer_retain_and_release_are_null_safe() {
+        // SAFETY: null is the one input these two guarantee not to fault on.
+        unsafe {
+            assert_eq!(CVBufferRetain(std::ptr::null_mut()), std::ptr::null_mut());
+            CVBufferRelease(std::ptr::null_mut());
+        }
+    }
+
+    /// A buffer never created, as much as a handle `CVDisplayLink` never made.
+    #[test]
+    fn pixel_buffer_create_refuses_null_base_address_or_out_slot() {
+        let mut handle = std::ptr::null_mut();
+        // SAFETY: refused before either pointer is used.
+        unsafe {
+            assert_eq!(
+                CVPixelBufferCreateWithBytes(
+                    std::ptr::null(),
+                    4,
+                    4,
+                    0,
+                    std::ptr::null_mut(),
+                    16,
+                    None,
+                    std::ptr::null_mut(),
+                    std::ptr::null(),
+                    &mut handle,
+                ),
+                INVALID_ARGUMENT
+            );
+            assert_eq!(
+                CVPixelBufferCreateWithBytes(
+                    std::ptr::null(),
+                    4,
+                    4,
+                    0,
+                    0xcafe as *mut c_void,
+                    16,
+                    None,
+                    std::ptr::null_mut(),
+                    std::ptr::null(),
+                    std::ptr::null_mut(),
                 ),
                 INVALID_ARGUMENT
             );

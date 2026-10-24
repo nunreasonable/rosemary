@@ -347,6 +347,9 @@ pub fn provider() -> SyntheticDylib {
     for (name, addr) in crate::shims::coremedia::data_symbols() {
         out.data(&name, addr);
     }
+    for (name, addr) in crate::shims::coremedia::function_symbols() {
+        out.function(&name, addr);
+    }
     for (name, addr) in shimmed() {
         out.function(&format!("_{name}"), addr as usize as u64);
     }
@@ -426,6 +429,9 @@ pub fn symbol(name: &str) -> Option<u64> {
         .iter()
         .filter_map(|f| f.symbol)
         .find_map(|symbol| symbol(name))
+        // CoreMedia, which has no `Framework` row of its own: see
+        // `crate::shims::coremedia::symbol`.
+        .or_else(|| crate::shims::coremedia::symbol(name))
         // libclosure, which a shim forwards to by name - see
         // `crate::shims::block`. Nothing on a host off Darwin defines it, and it
         // has no framework of its own to be a row.
