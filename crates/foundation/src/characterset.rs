@@ -142,8 +142,8 @@ pub(crate) unsafe fn contains_char(set: Id, c: char) -> bool {
     }
 }
 
-/// A new set of `members`, autoreleased.
-fn make_custom(members: Members) -> Id {
+/// A new, retained set of `members` - the caller owns the one reference.
+fn new_custom(members: Members) -> Id {
     let class = objc::class::lookup(c"NSCharacterSet").expect("installed NSCharacterSet");
     // SAFETY: `Body` begins with `isa` and is the class's registered size.
     let object: *mut Body = unsafe { corefoundation::base::allocate(class) };
@@ -153,7 +153,23 @@ fn make_custom(members: Members) -> Id {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .insert(object as usize, members);
-    objc::arc::autorelease(object as Id)
+    object as Id
+}
+
+/// As [`new_custom`], autoreleased - what every Objective-C constructor below
+/// needs, since its caller follows `+`-method convention rather than `Copy`'s.
+fn make_custom(members: Members) -> Id {
+    objc::arc::autorelease(new_custom(members))
+}
+
+/// A retained character set covering the inclusive code point `ranges` - for
+/// `CTFontCopyCharacterSet`, whose "Copy" name means the caller owns the
+/// result rather than getting an autoreleased one.
+pub fn create_with_ranges(ranges: Vec<(u32, u32)>) -> Id {
+    new_custom(Members {
+        ranges,
+        inverted: false,
+    })
 }
 
 unsafe extern "C" fn with_characters_in_string(_class: Id, _sel: Sel, text: Id) -> Id {

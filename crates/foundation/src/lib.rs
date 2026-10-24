@@ -12,7 +12,7 @@ mod block;
 pub mod boxed;
 pub mod bundle;
 pub mod calculate;
-mod characterset;
+pub mod characterset;
 mod constant;
 pub mod cookies;
 pub mod decimal;
