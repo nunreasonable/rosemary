@@ -767,7 +767,12 @@ fn glu_exports_have_callable_abis_and_resolve_without_a_display() {
     use crate::abi::table::{Lookup, lookup};
     assert_eq!(names().len(), 19);
     for name in names() {
-        assert!(matches!(lookup(0, name), Lookup::Known(_)), "{name}");
+        // Nine doubles do not fit the marshaller; a shim reads the ninth.
+        if name == "gluLookAt" {
+            assert!(crate::shims::opengl::shim_for(name).is_some());
+        } else {
+            assert!(matches!(lookup(0, name), Lookup::Known(_)), "{name}");
+        }
         if crate::frameworks::using_builtin() {
             assert_eq!(super::super::symbol(name), symbol(name), "{name}");
         }

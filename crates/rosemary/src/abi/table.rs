@@ -2748,7 +2748,6 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("gluCylinder", V, P, F64, F64, F64, I32, I32),
     sig!("gluDeleteQuadric", V, P),
     sig!("gluDisk", V, P, F64, F64, I32, I32),
-    sig!("gluLookAt", V, F64, F64, F64, F64, F64, F64, F64, F64, F64),
     sig!("gluNewQuadric", P),
     sig!("gluPartialDisk", V, P, F64, F64, I32, I32, F64, F64),
     sig!("gluPerspective", V, F64, F64, F64, F64),
@@ -4179,6 +4178,12 @@ pub static REFUSED: &[(&str, &str)] = &[
     // CFStringGetRangeOfComposedCharactersAtIndex(...)`: as `CFUUIDGetUUIDBytes`
     // above - see `crates/rosemary/src/shims/cfstring.rs`.
     ("CFStringFind", AGGREGATE),
+    // Nine doubles: the ninth is past the last vector register, on the stack,
+    // where the marshaller places none. `shims::opengl` reads it there.
+    (
+        "gluLookAt",
+        "passes a ninth double on the stack, past the vector registers the marshaller fills",
+    ),
     ("CFStringGetRangeOfComposedCharactersAtIndex", AGGREGATE),
     // Seventeen parameters: an allocator and the sixteen bytes of a UUID.
     (
