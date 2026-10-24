@@ -265,6 +265,20 @@ const CG_RECT_NULL: NSRect = NSRect {
     },
 };
 
+/// `CGRect CGRectIntersection(CGRect, CGRect)`: standardized first, and the
+/// null rectangle - not the zero one `NSIntersectionRect` answers - when the
+/// two do not overlap.
+#[allow(non_snake_case)]
+pub unsafe extern "C" fn CGRectIntersection(a: NSRect, b: NSRect) -> NSRect {
+    // SAFETY: both take a `CGRect` by value.
+    let result = unsafe { NSIntersectionRect(standard_rect(a), standard_rect(b)) };
+    // SAFETY: a plain value.
+    match unsafe { CGRectIsEmpty(result) } != 0 {
+        true => CG_RECT_NULL,
+        false => result,
+    }
+}
+
 /// The eight `CGFloat CGRectGet...(CGRect)` accessors.
 ///
 /// Inline functions in the header on a Mac *and* exported symbols, and a guest
@@ -319,6 +333,56 @@ mod tests {
             assert_eq!(CGRectGetMidY(backwards), 30.0);
             assert_eq!(CGRectGetMaxY(backwards), 40.0);
         }
+    }
+
+    #[test]
+    fn overlapping_rects_intersect_to_their_shared_area() {
+        let a = NSRect {
+            origin: NSPoint { x: 0.0, y: 0.0 },
+            size: NSSize {
+                width: 10.0,
+                height: 10.0,
+            },
+        };
+        let b = NSRect {
+            origin: NSPoint { x: 5.0, y: 5.0 },
+            size: NSSize {
+                width: 10.0,
+                height: 10.0,
+            },
+        };
+        // SAFETY: both take a `CGRect` by value.
+        let result = unsafe { CGRectIntersection(a, b) };
+        assert_eq!(result.origin, NSPoint { x: 5.0, y: 5.0 });
+        assert_eq!(
+            result.size,
+            NSSize {
+                width: 5.0,
+                height: 5.0
+            }
+        );
+    }
+
+    #[test]
+    fn rects_that_do_not_overlap_intersect_to_the_null_rect_not_the_zero_one() {
+        let a = NSRect {
+            origin: NSPoint { x: 0.0, y: 0.0 },
+            size: NSSize {
+                width: 1.0,
+                height: 1.0,
+            },
+        };
+        let b = NSRect {
+            origin: NSPoint { x: 5.0, y: 5.0 },
+            size: NSSize {
+                width: 1.0,
+                height: 1.0,
+            },
+        };
+        // SAFETY: both take a `CGRect` by value.
+        let result = unsafe { CGRectIntersection(a, b) };
+        assert!(result.origin.x.is_infinite());
+        assert!(result.origin.y.is_infinite());
     }
 
     /// The conversion is its own inverse, whatever the display height is -
