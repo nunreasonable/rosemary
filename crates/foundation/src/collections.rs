@@ -1217,6 +1217,44 @@ unsafe extern "C" fn contains_object(receiver: Id, _sel: Sel, object: Id) -> boo
         .any(|v| a.policy.equal(*v, object as CFTypeRef))
 }
 
+/// `-enumerateObjectsWithOptions:usingBlock:`, serially and over a copy, so
+/// the block may change the array. Serial is a valid answer to
+/// `NSEnumerationConcurrent`, which only permits concurrency.
+unsafe extern "C" fn enumerate_objects_with_options(
+    receiver: Id,
+    _sel: Sel,
+    options: usize,
+    block: Id,
+) {
+    let Some(array) = (unsafe { collections::array(receiver as CFTypeRef) }) else {
+        return;
+    };
+    // SAFETY: null or a block.
+    let Some(invoke) = (unsafe { objc::block::invoke(block) }) else {
+        return;
+    };
+    // SAFETY: the block is `void (^)(id, NSUInteger, BOOL *)`.
+    let call: unsafe extern "C" fn(Id, Id, usize, *mut bool) =
+        unsafe { std::mem::transmute(invoke) };
+    let values = array.values.clone();
+    let order: Box<dyn Iterator<Item = usize>> = match options & ENUMERATION_REVERSE {
+        0 => Box::new(0..values.len()),
+        _ => Box::new((0..values.len()).rev()),
+    };
+    let mut stop = false;
+    for at in order {
+        // SAFETY: as above; `stop` outlives the call.
+        unsafe { call(block, values[at] as Id, at, &mut stop) };
+        if stop {
+            break;
+        }
+    }
+}
+
+unsafe extern "C" fn enumerate_objects(receiver: Id, sel: Sel, block: Id) {
+    unsafe { enumerate_objects_with_options(receiver, sel, 0, block) };
+}
+
 /// `-makeObjectsPerformSelector:withObject:`, over a copy so the selector may
 /// change the array.
 unsafe extern "C" fn make_objects_perform_with(
@@ -2649,6 +2687,8 @@ pub(crate) fn install() {
         "indexOfObject:" => index_of_object, c"Q24@0:8@16";
         "indexOfObjectIdenticalTo:" => index_of_object_identical_to, c"Q24@0:8@16";
         "makeObjectsPerformSelector:" => make_objects_perform, c"v24@0:8:16";
+        "enumerateObjectsUsingBlock:" => enumerate_objects, c"v24@0:8@?16";
+        "enumerateObjectsWithOptions:usingBlock:" => enumerate_objects_with_options, c"v32@0:8Q16@?24";
         "makeObjectsPerformSelector:withObject:" => make_objects_perform_with, c"v32@0:8:16@24";
         "firstObject" => first_object, c"@16@0:8";
         "lastObject" => last_object, c"@16@0:8";
