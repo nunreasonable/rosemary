@@ -53,7 +53,20 @@ unsafe extern "C" fn selected_keyboard_input_source(_receiver: Id, _sel: Sel) ->
     foundation::notification::name_object(crate::textinput::SOURCE_ID) as Id
 }
 
+/// `-[NSView inputContext]`: the context for a view that takes text, nil for
+/// one that does not, as Apple decides by `NSTextInputClient` conformance.
+unsafe extern "C" fn view_input_context(receiver: Id, _sel: Sel) -> Id {
+    match crate::text::is_input_client(receiver) {
+        true => shared(),
+        false => std::ptr::null_mut(),
+    }
+}
+
 pub(crate) fn install() {
+    let view = objc::class::lookup(c"NSView").expect("declared before its methods");
+    methods!(view, {
+        "inputContext" => view_input_context, c"@16@0:8";
+    });
     let class = objc::class::lookup(c"NSTextInputContext").expect("declared before its methods");
     class_methods!(class, {
         "currentInputContext" => current_input_context, c"@16@0:8";
