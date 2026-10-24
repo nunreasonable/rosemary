@@ -117,6 +117,7 @@ fn start() -> Result<Engine, String> {
         return Err("WebKitGTK made no network session".to_string());
     }
     appkit::event::add_pump_hook(pump);
+    poll_while_running();
     Ok(Engine {
         api,
         compositor,
@@ -151,9 +152,25 @@ fn with_environment<T>(variables: &[(&str, &std::ffi::OsStr)], f: impl FnOnce() 
     result
 }
 
-/// Get the main thread to the pump, from the compositor's thread.
+/// Bring the main thread to the pump every few milliseconds while WebKit runs.
+///
+/// WebKit's replies - a script's result, a finished navigation - arrive on
+/// GLib's main context, which nothing watches between pumps; a program that
+/// waits for one by turning the run loop itself would otherwise wait forever.
+// FIXME (ACCURACY): polled. GLib's own descriptors woken on would be exact.
+fn poll_while_running() {
+    unsafe extern "C" fn tick(_timer: *const std::ffi::c_void, _info: *mut std::ffi::c_void) {
+        appkit::event::wake_window_system();
+    }
+    let every = std::time::Duration::from_millis(8);
+    let timer = corefoundation::runloop::new_timer(every, Some(every), Some(tick), 0);
+    corefoundation::runloop::main().add_timer(&timer, corefoundation::runloop::COMMON_MODES);
+}
+
+/// Get the main thread to the pump, from the compositor's thread - also when
+/// the program, not AppKit, is turning the run loop while it waits for us.
 fn wake() {
-    corefoundation::runloop::main().wake();
+    appkit::event::wake_window_system();
 }
 
 pub fn warn_once(message: &str) {
