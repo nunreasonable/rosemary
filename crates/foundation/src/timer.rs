@@ -268,6 +268,11 @@ fn make(
 
 /// Schedule an already-built timer on the main run loop.
 fn add_to_main_loop(object: Id) {
+    add_to_main_loop_in(object, &[corefoundation::runloop::DEFAULT_MODE.to_string()]);
+}
+
+/// Schedule an already-built timer on the main run loop in each of `modes`.
+fn add_to_main_loop_in(object: Id, modes: &[String]) {
     let timer = timer_of(object);
     if !timer.timer.is_null() {
         return;
@@ -276,8 +281,9 @@ fn add_to_main_loop(object: Id) {
     let repeat = (timer.repeats != 0).then_some(interval);
     let run_loop_timer =
         corefoundation::runloop::new_timer(interval, repeat, Some(fire), object as usize);
-    corefoundation::runloop::main()
-        .add_timer(&run_loop_timer, corefoundation::runloop::DEFAULT_MODE);
+    for mode in modes {
+        corefoundation::runloop::main().add_timer(&run_loop_timer, mode);
+    }
     // Kept alive by the object, and by the table: a scheduled timer outlives
     // the reference the program holds.
     objc::arc::retain(object);
@@ -393,6 +399,37 @@ unsafe extern "C" fn cancel_matching_performs(
         // SAFETY: a scheduled timer of this module's.
         unsafe { invalidate(object, objc::sel::get("invalidate")) };
     }
+}
+
+/// `-performSelector:withObject:afterDelay:inModes:`: the same, run in any of
+/// the given modes; an empty or nil array schedules nothing, as Apple's does.
+unsafe extern "C" fn perform_after_delay_in_modes(
+    receiver: Id,
+    _sel: Sel,
+    selector: Sel,
+    object: Id,
+    delay: f64,
+    modes: Id,
+) {
+    // SAFETY: an array of strings, or nil.
+    let modes: Vec<String> =
+        unsafe { corefoundation::collections::array(modes as corefoundation::base::CFTypeRef) }
+            .map(|array| {
+                array
+                    .values
+                    .iter()
+                    .map(|mode| {
+                        String::from_utf8_lossy(&unsafe { crate::string::bytes(*mode as Id) })
+                            .into_owned()
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+    if modes.is_empty() {
+        return;
+    }
+    let timer = make(delay, receiver, selector, object, false, false, false);
+    add_to_main_loop_in(timer, &modes);
 }
 
 /// The state owned by a `-performSelectorOnMainThread:...` queue entry.
@@ -570,6 +607,8 @@ pub(crate) fn install() {
     methods!(nsobject, {
         "performSelector:withObject:afterDelay:" => perform_after_delay,
             c"v40@0:8:16@24d32";
+        "performSelector:withObject:afterDelay:inModes:" => perform_after_delay_in_modes,
+            c"v48@0:8:16@24d32@40";
         "performSelectorOnMainThread:withObject:waitUntilDone:" => perform_on_main_thread,
             c"v40@0:8:16@24c32";
     });
