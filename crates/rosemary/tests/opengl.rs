@@ -59,8 +59,10 @@ int main(int argc, char **argv) {
     CHECK(dlsym(framework, "glGetString") == (void *)glGetString);
     CHECK(dlsym(framework, "CGLChoosePixelFormat") == NULL);
     CHECK(dlsym(RTLD_DEFAULT, "CGLChoosePixelFormat") == NULL);
-    CHECK(dlsym(framework, "gluPerspective") == NULL);
-    CHECK(dlsym(RTLD_DEFAULT, "gluPerspective") == NULL);
+    CHECK(dlsym(framework, "gluPerspective") == (void *)gluPerspective);
+    CHECK(dlsym(RTLD_DEFAULT, "gluPerspective") == (void *)gluPerspective);
+    CHECK(dlsym(framework, "gluNewTess") == NULL);
+    CHECK(dlsym(RTLD_DEFAULT, "gluNewTess") == NULL);
     // A real host handle must obey the same fallback policy.
     void *system = dlopen("/usr/lib/libSystem.B.dylib", RTLD_LAZY);
     CHECK(system && dlsym(system, "CGLChoosePixelFormat") == NULL);

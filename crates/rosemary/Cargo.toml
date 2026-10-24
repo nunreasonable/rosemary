@@ -50,3 +50,6 @@ mimalloc = { version = "0.1.52", features = ["override"] }
 [dev-dependencies]
 libc.workspace = true
 darwin.workspace = true
+
+[build-dependencies]
+cc = "1.0"

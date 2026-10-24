@@ -2259,6 +2259,7 @@ dependencies = [
  "applicationservices",
  "audiotoolbox",
  "avfoundation",
+ "cc",
  "clap",
  "contacts",
  "coreaudio",

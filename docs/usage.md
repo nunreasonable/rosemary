@@ -208,7 +208,11 @@ can fall back to a sibling sharing textures and buffers, but not vertex arrays,
 framebuffers, or queries. Other backends report contention if handoff fails.
 
 Direct CGL pixel-format/context creation and lifetime APIs, and explicit context
-sharing, remain unsupported. The built-in GLU surface provides `gluOrtho2D`
-through SDL-resolved `glOrtho`; other GLU functions remain unsupported. No host
-GLU library is required. Driver capabilities still determine available profiles
-and extensions.
+sharing, remain unsupported. Built-in GLU provides orthographic, perspective,
+look-at and picking matrices, projection/unprojection, extension-string queries,
+quadrics (spheres, cylinders and full/partial disks), image scaling and 1D/2D
+mipmap construction. The SGI/Mesa algorithms are compiled into Rosemary; GL calls
+use SDL's driver, including pixel-store state for the box-filter image scaler.
+Quadric drawing and matrix operations require a legacy OpenGL context. Other GLU
+functions remain unsupported. No host GLU library is required. Driver capabilities
+still determine available profiles and extensions.

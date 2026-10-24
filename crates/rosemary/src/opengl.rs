@@ -2,6 +2,9 @@ use std::ffi::{CStr, CString};
 
 use machish::resolve::{LazyDylib, NativeDylibProvider, Resolved};
 
+#[path = "glu/mod.rs"]
+mod glu;
+
 /// Built-in frameworks always draw through SDL's GL backend.
 pub fn interposed() -> bool {
     crate::frameworks::using_builtin()
@@ -71,8 +74,13 @@ pub fn symbol(name: &str) -> Option<u64> {
     if name.starts_with("CGL") {
         return appkit::symbol(name);
     }
-    if name.starts_with("glu") && name != "gluOrtho2D" {
-        return None;
+    if name.starts_with("glu") {
+        if let Some(address) = glu::symbol(name) {
+            return Some(address);
+        }
+        if name != "gluOrtho2D" {
+            return None;
+        }
     }
     open().then(|| address(name)).flatten()
 }
@@ -254,10 +262,16 @@ mod tests {
             }
         }
         if builtin {
-            for name in ["CGLDescribePixelFormat", "gluPerspective"] {
+            for name in ["CGLDescribePixelFormat", "gluNewTess"] {
                 assert!(symbol(name).is_none());
                 assert!(darwin::symbol(name).is_none());
                 assert!(darwin::shim_symbol(name).is_none());
+            }
+            for name in glu::names() {
+                let expected = glu::symbol(name).unwrap();
+                assert_eq!(symbol(name), Some(expected));
+                assert_eq!(darwin::symbol(name), Some(expected));
+                assert_eq!(darwin::shim_symbol(name), Some(expected));
             }
         } else {
             assert_eq!(lib.opened(), None);
