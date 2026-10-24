@@ -1589,6 +1589,11 @@ unsafe extern "C" fn remove_from_superview(receiver: Id, _sel: Sel) {
     if let Some(array) = unsafe { corefoundation::collections::array(list as *const c_void) } {
         let before = array.values.len();
         array.values.retain(|v| *v != receiver as *const c_void);
+        if array.values.len() < before {
+            // AppKit's removed view lives until the pool drains, and programs
+            // message it right after removing it: hide it, re-add it.
+            objc::arc::autorelease(objc::arc::retain(receiver));
+        }
         // The list retained the view once per `-addSubview:`, which now moves
         // out of a single entry at most; last, as it may free the receiver.
         for _ in array.values.len()..before {
@@ -2418,6 +2423,21 @@ mod tests {
         };
         set_frame_of(superview, rect(0.0, 0.0, 200.0, 200.0));
         assert_eq!(view_of(subview).frame, rect(0.0, 0.0, 100.0, 100.0));
+    }
+
+    #[test]
+    fn a_removed_view_lives_until_the_pool_drains() {
+        let (_superview, subview) = tree(rect(0.0, 0.0, 10.0, 10.0), rect(0.0, 0.0, 5.0, 5.0), 0);
+        let pool = objc::arc::pool_push();
+        // SAFETY: a live view; the tree's only reference is the superview's.
+        unsafe {
+            objc::arc::release(subview);
+            remove_from_superview(subview, objc::sel::get("removeFromSuperview"));
+            // Still a view: the removal's release waits for the pool.
+            set_hidden(subview, objc::sel::get("setHidden:"), 1);
+            assert_ne!(view_of(subview).hidden, 0);
+        }
+        objc::arc::pool_pop(pool);
     }
 
     #[test]
