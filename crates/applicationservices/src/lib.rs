@@ -1,3 +1,6 @@
+mod colorsync;
+mod printing;
+
 #[repr(i32)]
 enum CGWindowLevelKey {
     _BaseWindow = 0,
@@ -15,4 +18,5 @@ exports::exports! {
     functions {
         "CGWindowLevelForKey" => CGWindowLevelForKey,
     }
+    groups { colorsync, printing }
 }

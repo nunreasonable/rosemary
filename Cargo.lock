@@ -180,7 +180,10 @@ name = "applicationservices"
 version = "0.4.1"
 dependencies = [
  "appkit",
+ "corefoundation",
  "exports",
+ "foundation",
+ "objc",
 ]
 
 [[package]]

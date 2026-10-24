@@ -8,3 +8,6 @@ license.workspace = true
 [dependencies]
 exports.workspace = true
 appkit.workspace = true
+objc.workspace = true
+corefoundation.workspace = true
+foundation.workspace = true
