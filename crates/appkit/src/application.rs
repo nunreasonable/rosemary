@@ -532,7 +532,7 @@ fn queued_event(mask: u64, dequeue: bool) -> Id {
 /// need an event of their own in the same queue so they stay behind the key
 /// that started them. And `-currentEvent` and `+pressedMouseButtons` describe
 /// the event being sent, not the host's state when the pump ran.
-unsafe extern "C" fn next_event(
+pub(crate) unsafe extern "C" fn next_event(
     receiver: Id,
     _sel: Sel,
     mask: u64,

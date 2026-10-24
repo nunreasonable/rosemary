@@ -102,6 +102,8 @@ pub struct Window {
     /// leave the window out of; stored only so a program's own read-back
     /// agrees with what it set.
     excluded_from_windows_menu: usize,
+    /// `-isMovableByWindowBackground`.
+    movable_by_background: usize,
     /// `-setDisplaysWhenScreenProfileChanges:`. Nothing here redraws for a
     /// profile change SDL never reports; stored for the same reason.
     displays_when_screen_profile_changes: usize,
@@ -2326,6 +2328,46 @@ unsafe extern "C" fn set_hides_on_deactivate(receiver: Id, _sel: Sel, value: u8)
     window_of(receiver).hides_on_deactivate = value as usize;
 }
 
+// FIXME (ACCURACY): stored and answered, but a drag on the background does
+// not move the window; only the title bar does.
+unsafe extern "C" fn is_movable_by_background(receiver: Id, _sel: Sel) -> u8 {
+    (window_of(receiver).movable_by_background != 0) as u8
+}
+
+unsafe extern "C" fn set_movable_by_background(receiver: Id, _sel: Sel, value: u8) {
+    window_of(receiver).movable_by_background = value as usize;
+}
+
+/// `-nextEventMatchingMask:untilDate:inMode:dequeue:`, which Apple forwards to
+/// `NSApp`: a window's own tracking loop reads the application's queue.
+unsafe extern "C" fn next_event(
+    _receiver: Id,
+    sel: Sel,
+    mask: u64,
+    until: Id,
+    mode: Id,
+    dequeue: u8,
+) -> Id {
+    // SAFETY: the application's method with the same arguments.
+    unsafe {
+        crate::application::next_event(
+            crate::application::shared(),
+            sel,
+            mask,
+            until,
+            mode,
+            dequeue,
+        )
+    }
+}
+
+/// `-nextEventMatchingMask:`: the same, waiting as long as it takes.
+unsafe extern "C" fn next_event_matching(receiver: Id, sel: Sel, mask: u64) -> Id {
+    let future = foundation::timer::date(f64::MAX);
+    // SAFETY: as above, with the default mode.
+    unsafe { next_event(receiver, sel, mask, future, std::ptr::null_mut(), 1) }
+}
+
 unsafe extern "C" fn is_excluded_from_windows_menu(receiver: Id, _sel: Sel) -> u8 {
     (window_of(receiver).excluded_from_windows_menu != 0) as u8
 }
@@ -3448,6 +3490,10 @@ pub(crate) fn install() {
         "hidesOnDeactivate" => hides_on_deactivate, c"c16@0:8";
         "setExcludedFromWindowsMenu:" => set_excluded_from_windows_menu, c"v20@0:8c16";
         "isExcludedFromWindowsMenu" => is_excluded_from_windows_menu, c"c16@0:8";
+        "isMovableByWindowBackground" => is_movable_by_background, c"c16@0:8";
+        "setMovableByWindowBackground:" => set_movable_by_background, c"v20@0:8c16";
+        "nextEventMatchingMask:untilDate:inMode:dequeue:" => next_event, c"@48@0:8Q16@24@32B40";
+        "nextEventMatchingMask:" => next_event_matching, c"@24@0:8Q16";
         "setDisplaysWhenScreenProfileChanges:" => set_displays_when_screen_profile_changes, c"v20@0:8c16";
         "displaysWhenScreenProfileChanges" => displays_when_screen_profile_changes, c"c16@0:8";
         "currentEvent" => window_current_event, c"@16@0:8";

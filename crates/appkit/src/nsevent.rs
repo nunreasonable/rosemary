@@ -574,9 +574,24 @@ unsafe extern "C" fn other_event(
     event
 }
 
+static COALESCING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// `+isMouseCoalescingEnabled`, on by default as Apple's is.
+// FIXME (ACCURACY): remembered, but motion reaches the program as the window
+// system delivers it either way.
+unsafe extern "C" fn is_mouse_coalescing(_class: Id, _sel: Sel) -> u8 {
+    COALESCING.load(std::sync::atomic::Ordering::Relaxed) as u8
+}
+
+unsafe extern "C" fn set_mouse_coalescing(_class: Id, _sel: Sel, on: u8) {
+    COALESCING.store(on != 0, std::sync::atomic::Ordering::Relaxed);
+}
+
 pub(crate) fn install() {
     let class = objc::class::lookup(c"NSEvent").expect("declared before its methods");
     crate::define::class_methods!(class, {
+        "isMouseCoalescingEnabled" => is_mouse_coalescing, c"c16@0:8";
+        "setMouseCoalescingEnabled:" => set_mouse_coalescing, c"v20@0:8c16";
         "modifierFlags" => current_modifier_flags, c"Q16@0:8";
         "mouseLocation" => mouse_location, c"{CGPoint=dd}16@0:8";
         "pressedMouseButtons" => pressed_mouse_buttons, c"Q16@0:8";
