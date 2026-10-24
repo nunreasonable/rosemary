@@ -104,6 +104,7 @@ pub fn bootstrap() {
         cgcontext::install();
         cursor::install();
         font::install();
+        coretext::install();
         image::install();
         image::bitmap::install();
         menu::install();
