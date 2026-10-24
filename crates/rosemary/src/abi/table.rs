@@ -3568,6 +3568,27 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("CVPixelBufferGetPixelFormatType", U32, P),
     sig!("CVPixelBufferPoolCreatePixelBuffer", I32, P, P, P),
     sig!("CVPixelBufferRelease", V, P),
+    sig!("CMBlockBufferReplaceDataBytes", I32, P, P, U64, U64),
+    sig!("CMBlockBufferGetDataLength", U64, P),
+    sig!("CMBlockBufferGetTypeID", U64),
+    sig!("CMSampleBufferGetTypeID", U64),
+    sig!("CVPixelBufferRetain", P, P),
+    sig!("CVPixelBufferGetDataSize", U64, P),
+    sig!("CVPixelBufferGetIOSurface", P, P),
+    sig!("CVPixelBufferGetPlaneCount", U64, P),
+    sig!("CVPixelBufferIsPlanar", BOOL, P),
+    sig!("CVPixelBufferGetTypeID", U64),
+    sig!("CVMetalTextureCacheFlush", V, P, U64),
+    sig!("CVMetalTextureCacheGetTypeID", U64),
+    sig!("CVMetalTextureGetTypeID", U64),
+    sig!("IOSurfaceGetPlaneCount", U64, P),
+    sig!("IOSurfaceGetWidthOfPlane", U64, P, U64),
+    sig!("IOSurfaceGetHeightOfPlane", U64, P, U64),
+    sig!("IOSurfaceGetBytesPerRowOfPlane", U64, P, U64),
+    sig!("IOSurfaceGetBytesPerElementOfPlane", U64, P, U64),
+    sig!("IOSurfaceGetElementWidthOfPlane", U64, P, U64),
+    sig!("IOSurfaceGetElementHeightOfPlane", U64, P, U64),
+    sig!("IOSurfaceGetBaseAddressOfPlane", P, P, U64),
     // VideoToolbox.
     cbsig!(
         [7],
@@ -4087,6 +4108,13 @@ pub static REFUSED: &[(&str, &str)] = &[
     ("kCFStreamSSLValidatesCertificateChain", DATA),
     // `CGRect` is returned in memory the caller provides.
     ("CMVideoFormatDescriptionGetCleanAperture", AGGREGATE),
+    // `CMTime` is twenty-four bytes, passed and returned in memory; `CGSize`
+    // comes back in two SSE registers. On macOS `shims::coremedia` answers
+    // these before the table is asked.
+    ("CMTimeMake", AGGREGATE),
+    ("CMTimeGetSeconds", AGGREGATE),
+    ("CMSampleBufferGetPresentationTimeStamp", AGGREGATE),
+    ("CVImageBufferGetEncodedSize", AGGREGATE),
     ("kCFTypeArrayCallBacks", DATA),
     ("kUTTagClassFilenameExtension", DATA),
     ("kUTTagClassMIMEType", DATA),
