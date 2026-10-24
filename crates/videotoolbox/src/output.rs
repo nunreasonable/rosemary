@@ -92,7 +92,7 @@ impl OutputSpec {
 
     /// The format pictures come out in, fixed by the first one when nothing
     /// was asked for.
-    fn resolve(&mut self, colour: &Colour) -> u32 {
+    pub(crate) fn resolve(&mut self, colour: &Colour) -> u32 {
         *self.format.get_or_insert(match colour.full_range {
             Some(true) => NV12_FULL,
             _ => NV12_VIDEO,

@@ -919,6 +919,25 @@ fn copy_property_reports_hardware_and_realtime() {
     assert_ne!(unsafe { VTDecompressionSessionGetTypeID() }, 0);
 }
 
+/// Roblox's `MacCoreAudioCodecs` log showed `VTSessionSetProperty
+/// MaxNumberOfFramesBeforeOutput failed: -12900` right before its video
+/// never loaded - this key must stop being `kVTPropertyNotSupportedErr`.
+#[test]
+fn max_frames_before_output_is_accepted_and_stored() {
+    let session = open(MockBackend::new("hard"), std::ptr::null());
+    assert_eq!(
+        session.property(MAX_FRAMES_BEFORE_OUTPUT),
+        Err(PROPERTY_NOT_SUPPORTED),
+        "nothing to report before it is ever set"
+    );
+    let four = number(4);
+    // SAFETY: a live session and a retained CFNumber.
+    let status =
+        unsafe { VTSessionSetProperty(session.session, key(MAX_FRAMES_BEFORE_OUTPUT), four) };
+    assert_eq!(status, 0, "noErr, not kVTPropertyNotSupportedErr (-12900)");
+    assert_eq!(session.property(MAX_FRAMES_BEFORE_OUTPUT), Ok(four));
+}
+
 /// The probe clip through a session on `registry` with `attributes`, as
 /// Roblox drives one: decode each sample with flags 9 (asynchronous and
 /// temporal processing), then finish, wait and invalidate. Checks every picture against what the clip was made with.

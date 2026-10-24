@@ -10,6 +10,7 @@
 
 use std::collections::BTreeMap;
 use std::ffi::c_void;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Condvar, Mutex, MutexGuard, OnceLock};
 use std::thread::ThreadId;
 
@@ -52,6 +53,13 @@ const REAL_TIME: &str = "RealTime";
 const USING_HARDWARE: &str = "UsingHardwareAcceleratedVideoDecoder";
 const ENABLE_HARDWARE: &str = "EnableHardwareAcceleratedVideoDecoder";
 const REQUIRE_HARDWARE: &str = "RequireHardwareAcceleratedVideoDecoder";
+/// `kVTDecompressionPropertyKey_MaxNumberOfFramesBeforeOutput`: a cap on how
+/// many frames the decoder may hold back for reordering. Accepted and
+/// stored - every backend here already delivers in display order on the
+/// submitting thread, so there is no reorder wait to cap - rather than
+/// answered with `kVTPropertyNotSupportedErr`, which is what sent Roblox's
+/// video down a path that never loaded.
+const MAX_FRAMES_BEFORE_OUTPUT: &str = "MaxNumberOfFramesBeforeOutput";
 
 /// The session property keys, as `(Mach-O name, text)`; the texts are Apple's.
 pub(crate) const KEYS: &[(&str, &str)] = &[
@@ -59,6 +67,10 @@ pub(crate) const KEYS: &[(&str, &str)] = &[
     (
         "_kVTDecompressionPropertyKey_UsingHardwareAcceleratedVideoDecoder",
         USING_HARDWARE,
+    ),
+    (
+        "_kVTDecompressionPropertyKey_MaxNumberOfFramesBeforeOutput",
+        MAX_FRAMES_BEFORE_OUTPUT,
     ),
 ];
 
@@ -98,6 +110,9 @@ struct Ready {
     image: usize,
     pts: Time,
     duration: Time,
+    /// The picture's size and output format, for the first-frame diagnostic;
+    /// `None` for a failed frame, which has no image to describe.
+    frame: Option<(usize, usize, u32)>,
 }
 
 impl Ready {
@@ -109,6 +124,7 @@ impl Ready {
             image: 0,
             pts: pending.pts,
             duration: pending.duration,
+            frame: None,
         }
     }
 }
@@ -123,6 +139,8 @@ struct Inner {
     malfunctioned: bool,
     /// The retained `RealTime` value, or null.
     real_time: usize,
+    /// The retained `MaxNumberOfFramesBeforeOutput` value, or null.
+    max_frames_before_output: usize,
 }
 
 struct State {
@@ -137,6 +155,9 @@ struct State {
     /// The threads delivering callbacks now, once per delivery.
     delivering: Mutex<Vec<ThreadId>>,
     idle: Condvar,
+    /// Whether a decoded frame has reached the guest's callback yet, for the
+    /// one-line diagnostic that says video is actually flowing.
+    delivered_first_frame: AtomicBool,
 }
 
 impl Drop for State {
@@ -144,6 +165,7 @@ impl Drop for State {
         release(self.format as CFTypeRef);
         let inner = self.inner.get_mut().unwrap_or_else(|e| e.into_inner());
         release(inner.real_time as CFTypeRef);
+        release(inner.max_frames_before_output as CFTypeRef);
     }
 }
 
@@ -395,6 +417,7 @@ pub(crate) unsafe fn create_with(
             invalid: false,
             malfunctioned: false,
             real_time: 0,
+            max_frames_before_output: 0,
         }),
         backend: chosen,
         format: retain(format) as usize,
@@ -403,6 +426,7 @@ pub(crate) unsafe fn create_with(
         refcon: refcon as usize,
         delivering: Mutex::new(Vec::new()),
         idle: Condvar::new(),
+        delivered_first_frame: AtomicBool::new(false),
     };
     // SAFETY: `Session` is the registered layout.
     let session = unsafe { corefoundation::base::allocate::<Session>(class()) };
@@ -466,6 +490,11 @@ impl Collector<'_> {
             self.ready.push(Ready::failed(pending, 0));
             return;
         }
+        // Resolved ahead of `make_image`, which does the same internally
+        // (idempotently: the format is fixed by the first picture) - this
+        // is the only way to learn it without reading it back off the
+        // pixel buffer, which has no public accessor for it here.
+        let format = self.output.resolve(&picture.colour);
         match output::make_image(&picture, self.output) {
             Ok(image) => self.ready.push(Ready {
                 source_refcon: pending.source_refcon,
@@ -474,6 +503,7 @@ impl Collector<'_> {
                 image: image as usize,
                 pts: pending.pts,
                 duration: pending.duration,
+                frame: Some((picture.width, picture.height, format)),
             }),
             Err(status) => {
                 backend::report_once(format!(
@@ -579,6 +609,14 @@ fn deliver(state: &State, ready: Vec<Ready>) {
     }
     let _done = Done(state, me);
     for frame in ready {
+        if let Some((width, height, format)) = frame.frame {
+            if !state.delivered_first_frame.swap(true, Ordering::Relaxed) {
+                eprintln!(
+                    "rosemary: VideoToolbox: first frame delivered ({width}x{height}, format {})",
+                    corevideo::format::name(format)
+                );
+            }
+        }
         // Checked before each callback: one may invalidate the session.
         if !lock(state).invalid {
             // SAFETY: the guest's callback, with the arguments it registered
@@ -836,6 +874,11 @@ pub unsafe extern "C" fn VTSessionCopyProperty(
             0 => corefoundation::collections::boolean(false),
             value => value as CFTypeRef,
         }
+    } else if is_key(key, MAX_FRAMES_BEFORE_OUTPUT) {
+        match inner.max_frames_before_output {
+            0 => return PROPERTY_NOT_SUPPORTED,
+            value => value as CFTypeRef,
+        }
     } else {
         return PROPERTY_NOT_SUPPORTED;
     };
@@ -857,10 +900,21 @@ pub unsafe extern "C" fn VTSessionSetProperty(
     if inner.invalid {
         return INVALID_SESSION;
     }
-    if !is_key(key, REAL_TIME) {
+    let slot = if is_key(key, REAL_TIME) {
+        &mut inner.real_time
+    } else if is_key(key, MAX_FRAMES_BEFORE_OUTPUT) {
+        // A hint this runtime does not need to act on: every backend
+        // already delivers frames in display order as they are submitted,
+        // so there is no reorder wait for a cap to shorten. Stored, and
+        // answered `noErr`, rather than `kVTPropertyNotSupportedErr` - which
+        // is what a guest that treats that error as fatal reads as "this
+        // decoder cannot be configured" and gives up on before ever
+        // submitting a frame.
+        &mut inner.max_frames_before_output
+    } else {
         return PROPERTY_NOT_SUPPORTED;
-    }
-    let old = std::mem::replace(&mut inner.real_time, retain(value) as usize);
+    };
+    let old = std::mem::replace(slot, retain(value) as usize);
     drop(inner);
     release(old as CFTypeRef);
     0
