@@ -185,7 +185,10 @@ pub fn global() -> Result<&'static Api, &'static str> {
 
 /// A library that is never there, for the test that a missing FFmpeg
 /// leaves a backend unavailable.
-#[cfg(test)]
+///
+/// Not `#[cfg(test)]`: the test is `videotoolbox`'s, and a dependency is
+/// never built with `cfg(test)` for a dependent's tests.
+#[doc(hidden)]
 pub fn bogus() -> Result<&'static Api, &'static str> {
     static API: OnceLock<Result<Api, String>> = OnceLock::new();
     API.get_or_init(|| {
