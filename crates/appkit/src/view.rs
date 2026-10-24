@@ -969,6 +969,10 @@ unsafe fn hit(view: Id, point: NSPoint, depth: usize) -> Id {
 /// The inherited `NSView` hit-test behavior, without redispatching an override
 /// on `view`. This distinction matters when that override calls `super`.
 unsafe fn hit_base(view: Id, point: NSPoint, depth: usize) -> Id {
+    // AppKit's `-hitTest:` ignores a hidden view and everything under it.
+    if view_of(view).hidden != 0 {
+        return std::ptr::null_mut();
+    }
     let frame = view_of(view).frame;
     if !contains(frame, point) {
         return std::ptr::null_mut();
@@ -2414,6 +2418,22 @@ mod tests {
         };
         set_frame_of(superview, rect(0.0, 0.0, 200.0, 200.0));
         assert_eq!(view_of(subview).frame, rect(0.0, 0.0, 100.0, 100.0));
+    }
+
+    #[test]
+    fn a_hidden_subview_is_not_hit() {
+        let (superview, top) = tree(
+            rect(0.0, 0.0, 100.0, 100.0),
+            rect(0.0, 0.0, 100.0, 100.0),
+            0,
+        );
+        let point = NSPoint { x: 5.0, y: 5.0 };
+        // SAFETY: live views; `-setHidden:` is `void (id, SEL, BOOL)`.
+        unsafe {
+            assert_eq!(hit_test(superview, point), top);
+            set_hidden(top, objc::sel::get("setHidden:"), 1);
+            assert_eq!(hit_test(superview, point), superview);
+        }
     }
 
     static OVERRIDE_RAN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);

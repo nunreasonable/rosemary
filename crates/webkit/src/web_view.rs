@@ -951,7 +951,9 @@ unsafe fn make_gtk_view(engine: &Engine, configuration: Id, id: usize) -> Ptr {
     }
     // SAFETY: the new widget is floating until something sinks it; this owns it.
     unsafe { (api.g_object_ref_sink)(gtk) };
-    let agent = unsafe { user_agent(configuration) };
+    // A custom agent set before the widget existed is the one to send.
+    let custom = with_view(id, |v| v.custom_user_agent.clone()).flatten();
+    let agent = custom.unwrap_or_else(|| unsafe { user_agent(configuration) });
     if engine::tracing() {
         eprintln!("rosemary: webkit: user agent {agent}");
     }
@@ -1461,7 +1463,7 @@ fn trace_page(engine: &Engine, id: usize, gtk: Ptr) {
         };
         eprintln!("rosemary: webkit: view {}: page {text}", data as usize);
     }
-    let script = c"JSON.stringify({ url: location.href.slice(0, 80), state: document.readyState, visibility: document.visibilityState, focus: document.hasFocus(), active: document.activeElement ? document.activeElement.outerHTML.slice(0, 80) : null })";
+    let script = c"JSON.stringify({ url: location.href.slice(0, 80), state: document.readyState, agent: navigator.userAgent, visibility: document.visibilityState, focus: document.hasFocus(), active: document.activeElement ? document.activeElement.outerHTML.slice(0, 80) : null })";
     // SAFETY: the view's widget and a script it copies.
     unsafe {
         (engine.api.webkit_web_view_evaluate_javascript)(
@@ -1789,6 +1791,14 @@ fn mouse(receiver: Id, event: Id, pressed: bool, button: usize) {
                 send!(window, "makeFirstResponder:", receiver => Id; u8);
             }
         }
+    }
+    if engine::tracing() {
+        eprintln!(
+            "rosemary: webkit: view {:?}: button {button} {} at {:?}",
+            with_object(receiver, |v| (v.id, v.surface)),
+            if pressed { "down" } else { "up" },
+            page_point(receiver, event)
+        );
     }
     if let Some(engine) = pointer_to(receiver, event) {
         engine.compositor.send(Command::Button {
