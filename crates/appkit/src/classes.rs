@@ -136,6 +136,12 @@ static HIERARCHY: &[(&str, Option<&str>, usize)] = &[
         None,
         crate::cursor::TRACKING_AREA_INSTANCE_SIZE,
     ),
+    ("NSDocument", None, crate::document::INSTANCE_SIZE),
+    (
+        "NSDocumentController",
+        None,
+        crate::document::CONTROLLER_INSTANCE_SIZE,
+    ),
 ];
 
 pub fn install() {

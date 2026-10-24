@@ -40,6 +40,7 @@ mod define;
 pub mod dialog;
 mod displaylink;
 pub mod dock;
+mod document;
 pub mod event;
 mod font;
 pub mod hitheme;
@@ -144,6 +145,7 @@ pub fn bootstrap() {
         nsevent::install();
         monitor::install();
         status::install();
+        document::install();
     });
 }
 

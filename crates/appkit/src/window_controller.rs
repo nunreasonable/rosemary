@@ -9,8 +9,17 @@ use crate::define::methods;
 /// The association key for a controller's window, which it retains.
 static WINDOW: u8 = 0;
 
+/// The association key for a controller's document, which it does not retain
+/// - the document owns the controller (see `crate::document`), and retaining
+/// each other would leak both.
+static DOCUMENT: u8 = 0;
+
 fn key() -> *const std::ffi::c_void {
     &WINDOW as *const u8 as *const std::ffi::c_void
+}
+
+fn document_key() -> *const std::ffi::c_void {
+    &DOCUMENT as *const u8 as *const std::ffi::c_void
 }
 
 fn window(controller: Id) -> Id {
@@ -81,10 +90,22 @@ unsafe extern "C" fn is_window_loaded(receiver: Id, _sel: Sel) -> u8 {
     u8::from(!window(receiver).is_null())
 }
 
+unsafe extern "C" fn document_of(receiver: Id, _sel: Sel) -> Id {
+    objc::arc::associated(receiver, document_key())
+}
+
+/// `-setDocument:`: `-[NSDocument addWindowController:]` and
+/// `-removeWindowController:` are the only callers here, so this does not
+/// itself touch the document's own list back.
+unsafe extern "C" fn set_document(receiver: Id, _sel: Sel, value: Id) {
+    objc::arc::set_associated(receiver, document_key(), value);
+}
+
 unsafe extern "C" fn nothing(_receiver: Id, _sel: Sel) {}
 
 unsafe extern "C" fn dealloc(receiver: Id, _sel: Sel) {
     set_window(receiver, std::ptr::null_mut());
+    objc::arc::set_associated(receiver, document_key(), std::ptr::null_mut());
     objc::arc::finalize(receiver);
 }
 
@@ -97,6 +118,8 @@ pub(crate) fn install() {
         "showWindow:" => show_window, c"v24@0:8@16";
         "close" => close, c"v16@0:8";
         "isWindowLoaded" => is_window_loaded, c"c16@0:8";
+        "document" => document_of, c"@16@0:8";
+        "setDocument:" => set_document, c"v24@0:8@16";
         "windowDidLoad" => nothing, c"v16@0:8";
         "windowWillLoad" => nothing, c"v16@0:8";
         "dealloc" => dealloc, c"v16@0:8";
