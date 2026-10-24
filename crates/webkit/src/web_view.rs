@@ -1602,6 +1602,18 @@ fn start_navigation(receiver: Id) -> Id {
     navigation
 }
 
+unsafe extern "C" fn stop_loading_action(receiver: Id, sel: Sel, _sender: Id) {
+    unsafe { stop_loading(receiver, sel) };
+}
+
+unsafe extern "C" fn go_back_action(receiver: Id, sel: Sel, _sender: Id) {
+    unsafe { go_back(receiver, sel) };
+}
+
+unsafe extern "C" fn go_forward_action(receiver: Id, sel: Sel, _sender: Id) {
+    unsafe { go_forward(receiver, sel) };
+}
+
 unsafe extern "C" fn stop_loading(receiver: Id, _sel: Sel) {
     if let Some((engine, gtk)) = gtk_of(receiver) {
         // SAFETY: the view's widget.
@@ -2015,6 +2027,10 @@ pub fn install() {
         "canGoForward" => can_go_forward, c"c16@0:8";
         "goBack" => go_back, c"@16@0:8";
         "goForward" => go_forward, c"@16@0:8";
+        // The `IBAction` spellings, which take a sender and return nothing.
+        "stopLoading:" => stop_loading_action, c"v24@0:8@16";
+        "goBack:" => go_back_action, c"v24@0:8@16";
+        "goForward:" => go_forward_action, c"v24@0:8@16";
         "URL" => url, c"@16@0:8";
         "evaluateJavaScript:completionHandler:" => evaluate_javascript, c"v32@0:8@16@?24";
         "customUserAgent" => custom_user_agent, c"@16@0:8";
