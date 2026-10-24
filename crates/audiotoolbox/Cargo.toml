@@ -8,5 +8,7 @@ license.workspace = true
 [dependencies]
 exports.workspace = true
 coreaudio.workspace = true
+corefoundation.workspace = true
 darwin.workspace = true
+prefix.workspace = true
 sdl3.workspace = true

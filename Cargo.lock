@@ -233,8 +233,10 @@ name = "audiotoolbox"
 version = "0.4.1"
 dependencies = [
  "coreaudio",
+ "corefoundation",
  "darwin",
  "exports",
+ "prefix",
  "sdl3",
 ]
 
