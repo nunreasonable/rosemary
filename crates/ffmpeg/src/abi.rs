@@ -135,10 +135,7 @@ mod tests {
             ("AVCodecContext.get_format", context::GET_FORMAT as i64),
             ("AVCodecContext.sample_rate", context::SAMPLE_RATE as i64),
             ("AVCodecContext.ch_layout", context::CH_LAYOUT as i64),
-            (
-                "AVChannelLayout.nb_channels",
-                ch_layout::NB_CHANNELS as i64,
-            ),
+            ("AVChannelLayout.nb_channels", ch_layout::NB_CHANNELS as i64),
             (
                 "AVCodecContext.hw_device_ctx",
                 context::HW_DEVICE_CTX as i64,

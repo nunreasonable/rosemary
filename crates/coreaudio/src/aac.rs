@@ -358,13 +358,17 @@ impl AacDecoder {
                 return Err("out of memory".to_string());
             }
             std::ptr::copy_nonoverlapping(asc.as_ptr(), buffer, asc.len());
-            buffer.add(asc.len()).write_bytes(0, abi::INPUT_BUFFER_PADDING_SIZE);
+            buffer
+                .add(asc.len())
+                .write_bytes(0, abi::INPUT_BUFFER_PADDING_SIZE);
             abi::write::<*mut u8>(self.context, abi::context::EXTRADATA, buffer);
             abi::write::<i32>(self.context, abi::context::EXTRADATA_SIZE, size);
             (self.api.avcodec_open2)(self.context, codec, std::ptr::null_mut())
         };
         if status < 0 {
-            return Err(format!("FFmpeg did not open the aac decoder (error {status})"));
+            return Err(format!(
+                "FFmpeg did not open the aac decoder (error {status})"
+            ));
         }
         // Not the context's `sample_rate`: FFmpeg's aac decoder leaves it at
         // zero until the first frame (it may yet find SBR and double it), so
@@ -461,7 +465,10 @@ impl AacDecoder {
                 abi::read::<i32>(self.frame, abi::frame::FORMAT),
                 abi::read::<i32>(self.frame, abi::frame::NB_SAMPLES),
                 abi::read::<i32>(self.frame, abi::frame::SAMPLE_RATE),
-                abi::read::<i32>(self.frame, abi::frame::CH_LAYOUT + abi::ch_layout::NB_CHANNELS),
+                abi::read::<i32>(
+                    self.frame,
+                    abi::frame::CH_LAYOUT + abi::ch_layout::NB_CHANNELS,
+                ),
             )
         };
         if format != SAMPLE_FMT_FLTP {
@@ -479,9 +486,8 @@ impl AacDecoder {
         }
         // SAFETY: as above; for audio, `extended_data` always points at
         // one plane per channel (at `data` itself up to eight).
-        let planes = unsafe {
-            abi::read::<*const *const f32>(self.frame, abi::frame::EXTENDED_DATA)
-        };
+        let planes =
+            unsafe { abi::read::<*const *const f32>(self.frame, abi::frame::EXTENDED_DATA) };
         if planes.is_null() {
             return Err(-1);
         }
@@ -654,7 +660,10 @@ mod tests {
         let asc = asc_for_description(AAC_LC, 44100.0, 2, 1024).expect("a table rate, stereo");
         assert_eq!(asc, [0x12, 0x10]);
         // HE-AAC's description has the doubled rate; the core is 22050.
-        assert_eq!(asc_for_description(AAC_HE, 44100.0, 2, 2048), Some([0x13, 0x90]));
+        assert_eq!(
+            asc_for_description(AAC_HE, 44100.0, 2, 2048),
+            Some([0x13, 0x90])
+        );
         assert!(asc_for_description(AAC_LC, 44101.0, 2, 1024).is_none());
         assert!(asc_for_description(AAC_LC, 44100.0, 7, 1024).is_none());
     }
