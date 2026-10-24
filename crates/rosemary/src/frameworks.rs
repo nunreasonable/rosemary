@@ -156,6 +156,14 @@ static FRAMEWORKS: &[Framework] = &[
         symbol: Some(coreaudio::symbol),
     },
     Framework {
+        leaf: "CoreBluetooth",
+        version: 'A',
+        umbrellas: &[],
+        provide: None,
+        data: Some(corebluetooth::data_symbols),
+        symbol: Some(corebluetooth::symbol),
+    },
+    Framework {
         leaf: "Contacts",
         version: 'A',
         umbrellas: &[],

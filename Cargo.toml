@@ -29,6 +29,7 @@ corevideo = { path = "crates/corevideo" }
 iosurface = { path = "crates/iosurface" }
 coreaudio = { path = "crates/coreaudio" }
 contacts = { path = "crates/contacts" }
+corebluetooth = { path = "crates/corebluetooth" }
 avfoundation = { path = "crates/avfoundation" }
 security = { path = "crates/security" }
 gamecontroller = { path = "crates/gamecontroller" }

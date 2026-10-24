@@ -24,6 +24,7 @@ corevideo.workspace = true
 iosurface.workspace = true
 coreaudio.workspace = true
 contacts.workspace = true
+corebluetooth.workspace = true
 avfoundation.workspace = true
 security.workspace = true
 gamecontroller.workspace = true
