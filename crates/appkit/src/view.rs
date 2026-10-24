@@ -1847,6 +1847,10 @@ unsafe extern "C" fn display(receiver: Id, _sel: Sel) {
     crate::backing::display_view(receiver);
 }
 
+unsafe extern "C" fn display_rect(receiver: Id, _sel: Sel, _rect: NSRect) {
+    crate::backing::display_view(receiver);
+}
+
 unsafe extern "C" fn draw_rect(_receiver: Id, _sel: Sel, _rect: NSRect) {}
 
 unsafe extern "C" fn set_needs_display(receiver: Id, _sel: Sel, flag: u8) {
@@ -2012,6 +2016,14 @@ pub(crate) fn install() {
         "isHiddenOrHasHiddenAncestor" => is_hidden_or_has_hidden_ancestor_method, c"c16@0:8";
         "display" => display, c"v16@0:8";
         "displayIfNeeded" => display, c"v16@0:8";
+        // Opacity only decides which ancestor starts drawing; this tree always
+        // redraws the view itself.
+        "displayIgnoringOpacity" => display, c"v16@0:8";
+        "displayIfNeededIgnoringOpacity" => display, c"v16@0:8";
+        // FIXME (ACCURACY): the whole view is redrawn, not only the rectangle.
+        "displayRect:" => display_rect, c"v48@0:8{CGRect={CGPoint=dd}{CGSize=dd}}16";
+        "displayRectIgnoringOpacity:" => display_rect, c"v48@0:8{CGRect={CGPoint=dd}{CGSize=dd}}16";
+        "displayIfNeededInRect:" => display_rect, c"v48@0:8{CGRect={CGPoint=dd}{CGSize=dd}}16";
         "drawRect:" => draw_rect, c"v48@0:8{CGRect={CGPoint=dd}{CGSize=dd}}16";
         "setNeedsDisplay:" => set_needs_display, c"v20@0:8c16";
         "setNeedsDisplay" => mark_needs_display, c"v16@0:8";
