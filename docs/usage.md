@@ -90,6 +90,7 @@ rosemary server --stop         # ask this prefix's server to exit
 | `ROSEMARY_EXE` | (set by the launcher) | The path that starts another copy of Rosemary. Under the bundled glibc the kernel reports the bundled dynamic loader as this process's executable, so the runtime re-launches itself (`rosemary server`, a guest spawning a Mach-O) through this instead. |
 | `ROSEMARY_METAL_PRESENTATION_MODE` | unset | Set the presentation mode used by Vulkan in Rosemary's Metal translation. Valid values are `immediate`, `fifo`, `fifo_relaxed`, and `mailbox`. |
 | `ROSEMARY_SCREEN_REFRESH_RATE` | unset | Hertz that guests are told the display refreshes at, in place of the host's mode: `NSScreen`/`UIScreen` `maximumFramesPerSecond` and the refresh-interval properties. |
+| `ROSEMARY_VIDEO_DECODERS` | `vulkan,vaapi,cuda,cpu` | The H.264 decoders VideoToolbox decompression sessions may use, in the order they are tried. `vulkan`, `vaapi`, `cuda` and `vdpau` are FFmpeg 8 (`libavcodec.so.62`, loaded when first needed) over that hardware API; each is tried once per process on a tiny clip before it is used, and skipped if the host's FFmpeg, driver or GPU cannot decode it. VA-API tries each render node under `/dev/dri/by-path`. `cpu` is a software decoder, which does not exist yet. `none` turns decoding off, so sessions report `kVTCouldNotFindVideoDecoderErr` and the program falls back to its own decoding, as it does when no decoder works. A session announces the decoder it got, and why there is none, on stderr. |
 
 ## Prefixes
 
