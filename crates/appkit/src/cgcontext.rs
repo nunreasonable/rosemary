@@ -1277,6 +1277,19 @@ pub unsafe extern "C" fn CGAffineTransformMakeTranslation(x: f64, y: f64) -> CGA
     }
 }
 
+/// `CGAffineTransform CGAffineTransformMakeRotation(CGFloat angle)`: `angle`
+/// in radians, positive turning clockwise as Apple documents.
+pub unsafe extern "C" fn CGAffineTransformMakeRotation(angle: f64) -> CGAffineTransform {
+    let (sin, cos) = angle.sin_cos();
+    CGAffineTransform {
+        a: cos,
+        b: sin,
+        c: -sin,
+        d: cos,
+        ..IDENTITY
+    }
+}
+
 pub unsafe extern "C" fn CGAffineTransformConcat(
     first: CGAffineTransform,
     second: CGAffineTransform,
@@ -1328,6 +1341,20 @@ pub unsafe extern "C" fn CGRectApplyAffineTransform(rect: NSRect, t: CGAffineTra
             width: right - left,
             height: top - bottom,
         },
+    }
+}
+
+/// `CGRect CGContextConvertRectToUserSpace(CGContextRef, CGRect)`: the CTM
+/// carries user space to device space, so its inverse carries a device-space
+/// rectangle back.
+pub unsafe extern "C" fn CGContextConvertRectToUserSpace(
+    context: CFTypeRef,
+    rect: NSRect,
+) -> NSRect {
+    // SAFETY: both take a `CGContextRef` and a plain value.
+    unsafe {
+        let inverse = CGAffineTransformInvert(CGContextGetCTM(context));
+        CGRectApplyAffineTransform(rect, inverse)
     }
 }
 
@@ -1548,12 +1575,14 @@ exports::exports! {
         "CGAffineTransformMake" => CGAffineTransformMake,
         "CGAffineTransformMakeScale" => CGAffineTransformMakeScale,
         "CGAffineTransformMakeTranslation" => CGAffineTransformMakeTranslation,
+        "CGAffineTransformMakeRotation" => CGAffineTransformMakeRotation,
         "CGAffineTransformConcat" => CGAffineTransformConcat,
         "CGAffineTransformScale" => CGAffineTransformScale,
         "CGAffineTransformTranslate" => CGAffineTransformTranslate,
         "CGAffineTransformInvert" => CGAffineTransformInvert,
         "CGAffineTransformIsIdentity" => CGAffineTransformIsIdentity,
         "CGRectApplyAffineTransform" => CGRectApplyAffineTransform,
+        "CGContextConvertRectToUserSpace" => CGContextConvertRectToUserSpace,
         "CGColorCreate" => CGColorCreate,
         "CGColorCreateGenericRGB" => CGColorCreateGenericRGB,
         "CGColorCreateGenericGray" => CGColorCreateGenericGray,
@@ -1589,6 +1618,42 @@ mod tests {
         NSRect {
             origin: NSPoint { x, y },
             size: NSSize { width, height },
+        }
+    }
+
+    #[test]
+    fn rotation_matches_apples_documented_component_formula() {
+        // A quarter turn clockwise sends (1, 0) to (0, 1).
+        let t = unsafe { CGAffineTransformMakeRotation(std::f64::consts::FRAC_PI_2) };
+        let (x, y) = t.apply(1.0, 0.0);
+        assert!((x).abs() < 1e-9);
+        assert!((y - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn convert_rect_to_user_space_undoes_the_ctm() {
+        crate::bootstrap();
+        // SAFETY: the context stays live until released below.
+        unsafe {
+            let mut pixels = [0u32; 4];
+            let context = CGBitmapContextCreate(
+                pixels.as_mut_ptr().cast(),
+                2,
+                2,
+                8,
+                8,
+                std::ptr::null(),
+                0x2006,
+            );
+            CGContextTranslateCTM(context, 1.0, 1.0);
+            CGContextScaleCTM(context, 2.0, 2.0);
+            // User space maps to device space as `device = 2 * user + 1`.
+            let user = CGContextConvertRectToUserSpace(context, rect(2.0, 2.0, 4.0, 4.0));
+            CGContextRelease(context);
+            assert!((user.origin.x - 0.5).abs() < 1e-9);
+            assert!((user.origin.y - 0.5).abs() < 1e-9);
+            assert!((user.size.width - 2.0).abs() < 1e-9);
+            assert!((user.size.height - 2.0).abs() < 1e-9);
         }
     }
 
