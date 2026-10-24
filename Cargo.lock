@@ -9,6 +9,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b2187590a23ab1e3df8681afdf0987c48504d80291f002fcdb651f0ef5e25169"
 
 [[package]]
+name = "accelerate"
+version = "0.4.1"
+dependencies = [
+ "exports",
+]
+
+[[package]]
 name = "addr2line"
 version = "0.25.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2266,6 +2273,7 @@ dependencies = [
 name = "rosemary"
 version = "0.4.1"
 dependencies = [
+ "accelerate",
  "appkit",
  "applicationservices",
  "audiotoolbox",

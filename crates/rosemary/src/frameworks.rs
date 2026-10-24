@@ -232,6 +232,14 @@ static FRAMEWORKS: &[Framework] = &[
         data: Some(metal::data_symbols),
         symbol: Some(metal::symbol),
     },
+    Framework {
+        leaf: "Accelerate",
+        version: 'A',
+        umbrellas: &[],
+        provide: Some(accelerate::provide),
+        data: None,
+        symbol: Some(accelerate::symbol),
+    },
 ];
 
 fn paths_of(framework: &Framework) -> Vec<String> {
