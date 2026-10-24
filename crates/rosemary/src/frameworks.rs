@@ -124,6 +124,19 @@ static FRAMEWORKS: &[Framework] = &[
         symbol: Some(coreservices::symbol),
     },
     Framework {
+        // The `UTType` class and its `_UTTypeX` constants are published by
+        // `foundation` - see its `CLASSES` and `uttype::data_symbols` - since
+        // they feed `NSURLContentTypeKey` there. This entry only registers
+        // the framework's own path, so a guest's weak import of either binds
+        // instead of finding no such framework at all.
+        leaf: "UniformTypeIdentifiers",
+        version: 'A',
+        umbrellas: &[],
+        provide: None,
+        data: None,
+        symbol: None,
+    },
+    Framework {
         leaf: "AudioToolbox",
         version: 'A',
         umbrellas: &[],

@@ -543,6 +543,19 @@ pub const STRING_GLOBALS: &[(&str, &str)] = &[
     ("_kCGImagePropertyHasAlpha", "HasAlpha"),
     ("_kCGImagePropertyOrientation", "Orientation"),
     ("_kUTTypePNG", "public.png"),
+    (
+        "_NSFontDescriptorSystemDesignDefault",
+        coretext::DESIGN_DEFAULT,
+    ),
+    ("_NSFontDescriptorSystemDesignSerif", coretext::DESIGN_SERIF),
+    (
+        "_NSFontDescriptorSystemDesignMonospaced",
+        coretext::DESIGN_MONOSPACED,
+    ),
+    (
+        "_NSFontDescriptorSystemDesignRounded",
+        coretext::DESIGN_ROUNDED,
+    ),
     ("_kLSItemDisplayName", "LSItemDisplayName"),
     // Dragged files arrive as this type; the guest compares pasteboard types to it.
     ("_kUTTypeFileURL", "public.file-url"),

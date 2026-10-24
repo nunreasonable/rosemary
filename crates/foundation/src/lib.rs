@@ -54,6 +54,7 @@ pub mod url;
 mod urlcomponents;
 mod urlcredential;
 pub mod urlsession;
+pub mod uttype;
 pub mod value;
 
 mod collections;
@@ -105,6 +106,7 @@ pub fn bootstrap() {
         regularexpression::install();
         sortdescriptor::install();
         urlcredential::install();
+        uttype::install();
     });
 }
 
@@ -313,6 +315,7 @@ pub const CLASSES: &[&str] = &[
     "NSURLCredential",
     "NSRegularExpression",
     "NSTextCheckingResult",
+    "UTType",
 ];
 
 // The image-resident number classes are `constant::CLASSES`, published the same
@@ -338,6 +341,7 @@ pub fn data_symbols() -> Vec<(String, u64)> {
     out.extend(corefoundation::base::named_string_globals(
         NOTIFICATION_NAMES,
     ));
+    out.extend(uttype::data_symbols());
     // `NSZeroPoint`, `NSZeroSize` and `NSZeroRect` are **structs** in Foundation's `__DATA`,
     // not pointers to them: the guest loads the symbol's address and reads two
     // or four doubles out of it. A one-word cell would leave the rest of the
@@ -379,6 +383,9 @@ pub const STRING_GLOBALS: &[(&str, &str)] = &[
     ("_NSLocalizedFailureErrorKey", "NSLocalizedFailure"),
     ("_NSHelpAnchorErrorKey", "NSHelpAnchor"),
     ("_NSStringEncodingErrorKey", "NSStringEncodingErrorKey"),
+    // Value type `UTType`, not `NSString` - see `uttype::for_path`. There is
+    // no CoreFoundation twin: `kCFURL...` resource keys predate `UTType`.
+    ("_NSURLContentTypeKey", "NSURLContentTypeKey"),
     ("_NSOSStatusErrorDomain", "NSOSStatusErrorDomain"),
     ("_NSMachErrorDomain", "NSMachErrorDomain"),
     (

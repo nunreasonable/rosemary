@@ -394,6 +394,67 @@ fn merged_attributes(base: CFTypeRef, overrides: CFTypeRef) -> CFTypeRef {
     new_dictionary(&pairs)
 }
 
+/// `NSFontDescriptorSystemDesign` values. Self-spelled, like every other
+/// private constant this crate publishes - see `appkit::KEYS`.
+pub(crate) const DESIGN_DEFAULT: &str = "NSFontDescriptorSystemDesignDefault";
+pub(crate) const DESIGN_SERIF: &str = "NSFontDescriptorSystemDesignSerif";
+pub(crate) const DESIGN_MONOSPACED: &str = "NSFontDescriptorSystemDesignMonospaced";
+pub(crate) const DESIGN_ROUNDED: &str = "NSFontDescriptorSystemDesignRounded";
+
+/// A face whose family reads as serif, for [`DESIGN_SERIF`].
+///
+/// FIXME (ACCURACY): fontconfig's fallback defaults have a generic monospace
+/// family (used by [`fonts::default_family`]) but no generic serif one, so
+/// this guesses from common serif family names instead of asking the host's
+/// configuration. A host with only odd serif family names installed answers
+/// nothing, like `Default`.
+fn serif_family() -> Option<String> {
+    fonts::all_faces()
+        .into_iter()
+        .map(|face| face.family)
+        .find(|family| family.to_ascii_lowercase().contains("serif"))
+}
+
+/// `-[NSFontDescriptor fontDescriptorWithDesign:]`.
+///
+/// A copy of `descriptor` whose family is swapped for one matching `design`,
+/// clearing the resolved file a `-fontDescriptor` already carries so the new
+/// family is what resolves next time, not the old one. Every other
+/// attribute - size, weight, slant - passes through untouched.
+///
+/// `Default`, and any design this font backend has no substitute family for,
+/// answer the receiver unchanged: Apple documents that for `Default`, and a
+/// descriptor is a more usable answer than nil for the rest.
+pub(crate) fn font_descriptor_with_design(descriptor: CFTypeRef, design: &str) -> CFTypeRef {
+    if descriptor.is_null() {
+        return std::ptr::null();
+    }
+    let family = match design {
+        DESIGN_MONOSPACED => fonts::default_family(true),
+        DESIGN_SERIF => serif_family(),
+        DESIGN_DEFAULT => None,
+        // FIXME (ACCURACY): no face here is marked as a rounded design, so
+        // this cannot pick one out from its family's regular sibling; it
+        // degrades to the receiver's own design.
+        DESIGN_ROUNDED => None,
+        // Not a design this type defines.
+        _ => return std::ptr::null(),
+    };
+    let Some(family) = family else {
+        return unsafe { corefoundation::api::CFRetain(descriptor) };
+    };
+    let value = string(&family);
+    let overrides = new_dictionary(&[
+        (key("CTFontFamilyNameAttribute"), value),
+        (key(PATH_KEY), std::ptr::null()),
+        (key(INDEX_KEY), std::ptr::null()),
+    ]);
+    release(value);
+    let merged = merged_attributes(descriptor, overrides);
+    release(overrides);
+    merged
+}
+
 pub(crate) fn loaded(font: CFTypeRef) -> Option<Arc<LoadedFace>> {
     let path = get_string(font, PATH_KEY)?;
     let index = get_number(font, INDEX_KEY).unwrap_or(0.0) as u32;
@@ -2233,6 +2294,19 @@ mod tests {
     }
 
     #[test]
+    fn default_design_answers_the_receiver_unchanged() {
+        crate::bootstrap();
+        let name = string("Fira Mono");
+        // SAFETY: a descriptor this call just made.
+        let descriptor = unsafe { CTFontDescriptorCreateWithNameAndSize(name, 12.0) };
+        let answer = font_descriptor_with_design(descriptor, DESIGN_DEFAULT);
+        assert_eq!(answer, descriptor, "Default keeps the same attributes");
+        for object in [descriptor, answer, name] {
+            release(object);
+        }
+    }
+
+    #[test]
     fn suggest_line_break_prefers_the_space_over_splitting_a_word() {
         let Some(default_family) = fonts::default_family(false) else {
             eprintln!("skipped: no fonts on this host");
@@ -2305,6 +2379,39 @@ mod tests {
             release(axes);
             release(variation);
             release(font);
+        }
+    }
+
+    #[test]
+    fn an_unknown_design_answers_nil() {
+        crate::bootstrap();
+        let name = string("Fira Mono");
+        // SAFETY: a descriptor this call just made.
+        let descriptor = unsafe { CTFontDescriptorCreateWithNameAndSize(name, 12.0) };
+        let answer = font_descriptor_with_design(descriptor, "NSFontDescriptorSystemDesignNope");
+        assert!(answer.is_null());
+        release(descriptor);
+        release(name);
+    }
+
+    #[test]
+    fn monospaced_design_swaps_the_family_and_drops_the_old_resolution() {
+        crate::bootstrap();
+        let Some(monospace) = fonts::default_family(true) else {
+            return;
+        };
+        let name = string("Fira Sans");
+        // SAFETY: a descriptor this call just made.
+        let descriptor = unsafe { CTFontDescriptorCreateWithNameAndSize(name, 12.0) };
+        let answer = font_descriptor_with_design(descriptor, DESIGN_MONOSPACED);
+        assert_ne!(answer, descriptor);
+        assert_eq!(
+            get_string(answer, "CTFontFamilyNameAttribute").as_deref(),
+            Some(monospace.as_str())
+        );
+        assert!(get_string(answer, PATH_KEY).is_none(), "resolution cleared");
+        for object in [descriptor, answer, name] {
+            release(object);
         }
     }
 }

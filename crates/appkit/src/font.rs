@@ -175,6 +175,21 @@ unsafe extern "C" fn symbolic_traits(receiver: Id, _sel: Sel) -> u32 {
     unsafe { crate::coretext::CTFontGetSymbolicTraits(receiver as *const _) }
 }
 
+/// `-[NSFontDescriptor fontDescriptorWithDesign:]`.
+unsafe extern "C" fn font_descriptor_with_design(receiver: Id, _sel: Sel, design: Id) -> Id {
+    if design.is_null() {
+        return std::ptr::null_mut();
+    }
+    // SAFETY: `design` is an NSString, by this selector's declared type.
+    let bytes = unsafe { foundation::string::bytes(design) };
+    let Ok(text) = std::str::from_utf8(&bytes) else {
+        return std::ptr::null_mut();
+    };
+    let result = crate::coretext::font_descriptor_with_design(receiver as *const _, text);
+    // SAFETY: null, or an object this call just produced a reference to.
+    unsafe { autorelease(result as *const _) }
+}
+
 /// `-[NSFontManager availableFontFamilies]`: every family the face database
 /// holds, each once, sorted as AppKit's is.
 unsafe extern "C" fn available_font_families(_receiver: Id, _sel: Sel) -> Id {
@@ -321,6 +336,7 @@ pub(crate) fn install() {
         "pointSize" => font_point_size, c"d16@0:8";
         "fontDescriptor" => font_descriptor, c"@16@0:8";
         "symbolicTraits" => symbolic_traits, c"I16@0:8";
+        "fontDescriptorWithDesign:" => font_descriptor_with_design, c"@24@0:8@16";
     });
 
     let class = objc::class::lookup(c"NSFont").expect("declared before its methods");
