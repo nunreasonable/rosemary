@@ -277,6 +277,17 @@ unsafe extern "C" fn active_application(_receiver: Id, _sel: Sel) -> Id {
     current_dictionary()
 }
 
+/// `-[NSWorkspace mountedLocalVolumePaths]`: the root, the one mount
+/// `getfsstat` reports here too.
+unsafe extern "C" fn mounted_local_volume_paths(_receiver: Id, _sel: Sel) -> Id {
+    autoreleased_array(&[autoreleased("/")])
+}
+
+/// `-[NSWorkspace mountedRemovableMedia]`: none.
+unsafe extern "C" fn mounted_removable_media(_receiver: Id, _sel: Sel) -> Id {
+    autoreleased_array(&[])
+}
+
 fn autoreleased_array(objects: &[Id]) -> Id {
     let values: Vec<*const std::ffi::c_void> = objects.iter().map(|o| *o as _).collect();
     let array = corefoundation::collections::new_array(
@@ -599,6 +610,8 @@ pub(crate) fn install() {
         "runningApplications" => workspace_running_applications, c"@16@0:8";
         "launchedApplications" => launched_applications, c"@16@0:8";
         "activeApplication" => active_application, c"@16@0:8";
+        "mountedLocalVolumePaths" => mounted_local_volume_paths, c"@16@0:8";
+        "mountedRemovableMedia" => mounted_removable_media, c"@16@0:8";
         "launchApplicationAtURL:options:configuration:error:" => launch_application,
             c"@48@0:8@16Q24@32^@40";
         "iconForFileType:" => icon_for_file_type, c"@24@0:8@16";
