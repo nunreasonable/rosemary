@@ -479,6 +479,20 @@ unsafe extern "C" fn contents_of_directory(
     unsafe { corefoundation::api::CFAutorelease(array) as Id }
 }
 
+/// `-fileAttributesAtPath:traverseLink:`, the deprecated spelling of
+/// `-attributesOfItemAtPath:error:` with no error to report.
+// FIXME (ACCURACY): a link is always traversed, as `-attributesOfItemAtPath:`
+// here always follows one too.
+unsafe extern "C" fn file_attributes_traverse_link(
+    receiver: Id,
+    sel: Sel,
+    path: Id,
+    _traverse: bool,
+) -> Id {
+    // SAFETY: the same receiver and path, with no error slot.
+    unsafe { attributes_of_item(receiver, sel, path, std::ptr::null_mut()) }
+}
+
 /// `-attributesOfItemAtPath:error:`, with the keys a program actually reads.
 ///
 /// Size, type and the two timestamps. A dictionary with only some of an item's
@@ -1007,6 +1021,7 @@ pub(crate) fn install() {
             => create_symlink, c"B40@0:8@16@24^@32";
         "linkItemAtPath:toPath:error:" => link_item, c"B40@0:8@16@24^@32";
         "attributesOfItemAtPath:error:" => attributes_of_item, c"@32@0:8@16^@24";
+        "fileAttributesAtPath:traverseLink:" => file_attributes_traverse_link, c"@28@0:8@16B24";
         "attributesOfFileSystemForPath:error:" => attributes_of_file_system, c"@32@0:8@16^@24";
         "isWritableFileAtPath:" => is_writable, c"B24@0:8@16";
         "isReadableFileAtPath:" => file_exists, c"B24@0:8@16";
