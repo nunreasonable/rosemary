@@ -554,6 +554,74 @@ unsafe extern "C" fn sort_using_function(
     }
 }
 
+/// Order by each `NSSortDescriptor` in turn, the next one breaking a tie.
+///
+/// Each descriptor is *sent* `-compareObject:toObject:`, so a guest's own
+/// subclass of one is honoured.
+fn sort_by_descriptors(values: &mut [CFTypeRef], descriptors: Id) {
+    // SAFETY: an array, or nil for none.
+    let Some(descriptors) =
+        (unsafe { collections::array(descriptors as CFTypeRef) }).map(|a| a.values.clone())
+    else {
+        return;
+    };
+    let compare = objc::sel::get("compareObject:toObject:");
+    // SAFETY: `-compareObject:toObject:` is `NSComparisonResult (id, SEL, id, id)`.
+    let send: unsafe extern "C" fn(Id, Sel, Id, Id) -> i64 =
+        unsafe { std::mem::transmute(objc::msg::entry()) };
+    values.sort_by(|a, b| {
+        for descriptor in &descriptors {
+            // SAFETY: a descriptor the array holds, and two of the sorted objects.
+            match unsafe { send(*descriptor as Id, compare, *a as Id, *b as Id) } {
+                ..0 => return std::cmp::Ordering::Less,
+                0 => continue,
+                _ => return std::cmp::Ordering::Greater,
+            }
+        }
+        std::cmp::Ordering::Equal
+    });
+}
+
+/// `-[NSArray sortedArrayUsingDescriptors:]`.
+unsafe extern "C" fn sorted_array_using_descriptors(
+    receiver: Id,
+    _sel: Sel,
+    descriptors: Id,
+) -> Id {
+    // SAFETY: an array.
+    let Some(array) = (unsafe { collections::array(receiver as CFTypeRef) }) else {
+        return std::ptr::null_mut();
+    };
+    let mut values = array.values.clone();
+    sort_by_descriptors(&mut values, descriptors);
+    // SAFETY: a fresh array follows the convenience-constructor rule.
+    unsafe {
+        api::CFAutorelease(collections::new_array(
+            &values,
+            Policy::from_type_callbacks(),
+            false,
+        )) as Id
+    }
+}
+
+/// `-[NSMutableArray sortUsingDescriptors:]`.
+unsafe extern "C" fn sort_using_descriptors(receiver: Id, _sel: Sel, descriptors: Id) {
+    // SAFETY: an array.
+    let Some(array) = (unsafe { collections::array(receiver as CFTypeRef) }) else {
+        return;
+    };
+    if !array.mutable {
+        immutable("NSArray", "sortUsingDescriptors:");
+    }
+    // Sorted out of place, as `-sortUsingFunction:context:` is.
+    let mut values = array.values.clone();
+    sort_by_descriptors(&mut values, descriptors);
+    // SAFETY: the same array; the descriptors are done with it.
+    if let Some(array) = unsafe { collections::array(receiver as CFTypeRef) } {
+        array.values = values;
+    }
+}
+
 /// `-componentsJoinedByString:`, the other half of
 /// `-[NSString componentsSeparatedByString:]`.
 ///
@@ -2563,6 +2631,7 @@ pub(crate) fn install() {
         "sortedArrayUsingSelector:" => sorted_array_using_selector, c"@24@0:8:16";
         "sortedArrayUsingComparator:" => sorted_array_using_comparator, c"@24@0:8@?16";
         "sortedArrayUsingFunction:context:" => sorted_array_using_function, c"@32@0:8^?16^v24";
+        "sortedArrayUsingDescriptors:" => sorted_array_using_descriptors, c"@24@0:8@16";
         "filteredArrayUsingPredicate:" => filtered_array_using_predicate, c"@24@0:8@16";
         "indexOfObjectWithOptions:passingTest:" => index_of_object_with_options_passing_test, c"Q32@0:8Q16@?24";
         "countByEnumeratingWithState:objects:count:" => array_enumerate, c"Q40@0:8^{?=Q^@^QQ5}16^@24Q32";
@@ -2601,6 +2670,7 @@ pub(crate) fn install() {
         "replaceObjectAtIndex:withObject:" => replace_object_at_index, c"v32@0:8Q16@24";
         "setObject:atIndexedSubscript:" => set_object_at_indexed_subscript, c"v32@0:8@16Q24";
         "sortUsingFunction:context:" => sort_using_function, c"v32@0:8^?16^v24";
+        "sortUsingDescriptors:" => sort_using_descriptors, c"v24@0:8@16";
         "removeAllObjects" => remove_all_objects, c"v16@0:8";
     });
     class_methods!(mutable_array, {

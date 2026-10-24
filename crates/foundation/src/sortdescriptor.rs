@@ -273,4 +273,42 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn an_array_sorts_by_its_descriptors() {
+        crate::bootstrap();
+        let numbers = [crate::number(3), crate::number(1), crate::number(2)];
+        let values: Vec<CFTypeRef> = numbers.iter().map(|n| *n as CFTypeRef).collect();
+        let array = corefoundation::collections::new_array(
+            &values,
+            corefoundation::callbacks::Policy::from_type_callbacks(),
+            true,
+        );
+        let d = descriptor("self", false);
+        let descriptors = corefoundation::collections::new_array(
+            &[d as CFTypeRef],
+            corefoundation::callbacks::Policy::from_type_callbacks(),
+            false,
+        );
+        // SAFETY: `-sortUsingDescriptors:` is `void (id, SEL, NSArray *)` and
+        // `-sortedArrayUsingDescriptors:` returns the sorted copy.
+        unsafe {
+            let send: unsafe extern "C" fn(Id, Sel, Id) -> Id =
+                std::mem::transmute(objc::msg::entry());
+            let sorted = send(
+                array as Id,
+                objc::sel::get("sortedArrayUsingDescriptors:"),
+                descriptors as Id,
+            );
+            let sorted = corefoundation::collections::array(sorted as CFTypeRef).unwrap();
+            assert_eq!(sorted.values, [values[0], values[2], values[1]]);
+            send(
+                array as Id,
+                objc::sel::get("sortUsingDescriptors:"),
+                descriptors as Id,
+            );
+            let array = corefoundation::collections::array(array).unwrap();
+            assert_eq!(array.values, [values[0], values[2], values[1]]);
+        }
+    }
 }
