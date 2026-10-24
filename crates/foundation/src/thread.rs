@@ -400,12 +400,26 @@ unsafe extern "C" fn dealloc(receiver: Id, _sel: Sel) {
     objc::arc::finalize(receiver);
 }
 
+/// `+exit`: tell observers, then end the calling thread without returning.
+///
+/// Nothing with a destructor may be live in this frame: `pthread_exit` ends the
+/// thread from under it, as it does for the guest's own start routine. The
+/// unwind ABI because glibc's `pthread_exit` force-unwinds through this frame.
+unsafe extern "C-unwind" fn exit_thread(_class: Id, _sel: Sel) -> ! {
+    // SAFETY: `+currentThread` is `id (Class, SEL)`.
+    let thread = unsafe { current_thread(std::ptr::null_mut(), objc::sel::get("currentThread")) };
+    crate::notification::post("NSThreadWillExitNotification", thread, std::ptr::null_mut());
+    // SAFETY: ends this thread; never returns.
+    unsafe { libc::pthread_exit(std::ptr::null_mut()) }
+}
+
 pub(crate) fn install() {
     let class = objc::class::lookup(c"NSThread").expect("declared abstract by this crate");
     class_methods!(class, {
         "detachNewThreadSelector:toTarget:withObject:" => detach, c"v40@0:8:16@24@32";
         "sleepForTimeInterval:" => sleep_for_interval, c"v24@0:8d16";
         "isMultiThreaded" => is_multi_threaded, c"B16@0:8";
+        "exit" => exit_thread, c"v16@0:8";
         "isMainThread" => is_main_thread, c"B16@0:8";
         "currentThread" => current_thread, c"@16@0:8";
         "mainThread" => main_thread, c"@16@0:8";
@@ -441,6 +455,39 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
 
     use super::*;
+
+    static AFTER_EXIT: AtomicUsize = AtomicUsize::new(0);
+
+    extern "C-unwind" fn exits_early(_: *mut std::ffi::c_void) -> *mut std::ffi::c_void {
+        // SAFETY: `+exit` takes no arguments and does not return.
+        unsafe { exit_thread(std::ptr::null_mut(), objc::sel::get("exit")) };
+        #[allow(unreachable_code)]
+        {
+            AFTER_EXIT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            std::ptr::null_mut()
+        }
+    }
+
+    #[test]
+    fn exit_ends_the_calling_thread() {
+        crate::bootstrap();
+        // glibc unwinds the thread through the start routine on exit, which the
+        // plain C ABI would abort on.
+        type Start = extern "C" fn(*mut std::ffi::c_void) -> *mut std::ffi::c_void;
+        type StartUnwind = extern "C-unwind" fn(*mut std::ffi::c_void) -> *mut std::ffi::c_void;
+        // SAFETY: the same signature, differing only in whether it may unwind.
+        let start = unsafe { std::mem::transmute::<StartUnwind, Start>(exits_early) };
+        let mut thread: libc::pthread_t = 0;
+        // SAFETY: a plain host thread running a function that exits it.
+        unsafe {
+            assert_eq!(
+                libc::pthread_create(&mut thread, std::ptr::null(), start, std::ptr::null_mut()),
+                0
+            );
+            assert_eq!(libc::pthread_join(thread, std::ptr::null_mut()), 0);
+        }
+        assert_eq!(AFTER_EXIT.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
     use crate::block::fake;
 
     static RAN_ON: AtomicUsize = AtomicUsize::new(0);

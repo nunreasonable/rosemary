@@ -367,6 +367,10 @@ fn zeroed<T>() -> u64 {
 }
 
 pub const STRING_GLOBALS: &[(&str, &str)] = &[
+    (
+        "_NSThreadWillExitNotification",
+        "NSThreadWillExitNotification",
+    ),
     ("_NSLocalizedDescriptionKey", "NSLocalizedDescription"),
     (
         "_NSLocalizedFailureReasonErrorKey",
