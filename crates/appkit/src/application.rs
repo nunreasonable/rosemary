@@ -44,6 +44,10 @@ pub const WILL_TERMINATE: &str = "NSApplicationWillTerminateNotification";
 pub const WILL_BECOME_ACTIVE: &str = "NSApplicationWillBecomeActiveNotification";
 pub const DID_BECOME_ACTIVE: &str = "NSApplicationDidBecomeActiveNotification";
 pub const WILL_RESIGN_ACTIVE: &str = "NSApplicationWillResignActiveNotification";
+/// Posted by nothing here: see [`is_active`] for why this process never
+/// resigns active. Published anyway, for the reason every name in
+/// `crate::NOTIFICATION_NAMES` is.
+pub const DID_RESIGN_ACTIVE: &str = "NSApplicationDidResignActiveNotification";
 /// Posted when a display is added, removed or resized.
 pub const DID_CHANGE_SCREEN_PARAMETERS: &str = "NSApplicationDidChangeScreenParametersNotification";
 

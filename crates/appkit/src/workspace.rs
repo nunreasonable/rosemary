@@ -10,6 +10,11 @@ pub const WILL_SLEEP: &str = "NSWorkspaceWillSleepNotification";
 pub const DID_WAKE: &str = "NSWorkspaceDidWakeNotification";
 pub const SCREENS_DID_SLEEP: &str = "NSWorkspaceScreensDidSleepNotification";
 pub const SCREENS_DID_WAKE: &str = "NSWorkspaceScreensDidWakeNotification";
+/// Posted by nothing here: there is no removable-volume tracking to notice a
+/// mount or unmount with. Published anyway, for the reason every name in
+/// `crate::NOTIFICATION_NAMES` is.
+pub const DID_MOUNT: &str = "NSWorkspaceDidMountNotification";
+pub const DID_UNMOUNT: &str = "NSWorkspaceDidUnmountNotification";
 
 /// The `NSWorkspaceLaunchConfiguration...` keys, published as data in
 /// `crate::STRING_GLOBALS`.
@@ -17,6 +22,11 @@ pub const LAUNCH_ARGUMENTS: &str = "NSWorkspaceLaunchConfigurationArguments";
 pub const LAUNCH_ENVIRONMENT: &str = "NSWorkspaceLaunchConfigurationEnvironment";
 pub const LAUNCH_APPLE_EVENT: &str = "NSWorkspaceLaunchConfigurationAppleEvent";
 pub const LAUNCH_ARCHITECTURE: &str = "NSWorkspaceLaunchConfigurationArchitecture";
+
+/// `NSWorkspaceRecycleOperation`, a deprecated `-performFileOperation:`
+/// operation type whose value is its own name, like the pasteboard types
+/// `crate::STRING_GLOBALS` publishes the same way.
+pub const RECYCLE_OPERATION: &str = "NSWorkspaceRecycleOperation";
 
 /// What an `NSRunningApplication` for a process this one launched knows about
 /// it, by object address. Anything not listed here is this process.

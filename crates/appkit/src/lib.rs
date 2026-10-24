@@ -422,6 +422,7 @@ pub const NOTIFICATION_NAMES: &[&str] = &[
     application::WILL_BECOME_ACTIVE,
     application::DID_BECOME_ACTIVE,
     application::WILL_RESIGN_ACTIVE,
+    application::DID_RESIGN_ACTIVE,
     window::DID_RESIZE,
     window::DID_MOVE,
     window::DID_CHANGE_SCREEN,
@@ -447,6 +448,13 @@ pub const NOTIFICATION_NAMES: &[&str] = &[
     workspace::DID_WAKE,
     workspace::SCREENS_DID_SLEEP,
     workspace::SCREENS_DID_WAKE,
+    // Posted by nothing here: there is no removable-volume tracking to notice
+    // a mount or unmount with. Published for the same reason as the note
+    // below this list.
+    workspace::DID_MOUNT,
+    workspace::DID_UNMOUNT,
+    menu::DID_BEGIN_TRACKING,
+    menu::DID_END_TRACKING,
     view::FRAME_DID_CHANGE,
     view::BOUNDS_DID_CHANGE,
     // Watched by a widget toolkit and posted by nothing here: there is no system
@@ -622,9 +630,14 @@ pub const STRING_GLOBALS: &[(&str, &str)] = &[
     // that writes with one and reads with the other has to name the same type.
     ("_NSPasteboardTypeString", "public.utf8-plain-text"),
     ("_NSStringPboardType", "public.utf8-plain-text"),
+    // The modern UTI pasteboard types a program names directly rather than
+    // through the deprecated `Pboard` spellings below.
+    ("_NSPasteboardTypeFileURL", "public.file-url"),
+    ("_NSPasteboardTypePDF", "com.adobe.pdf"),
     // The rest of the deprecated pasteboard types, whose values are their own
     // names - which is what they are on a Mac, and what makes a program that
     // writes with the old spelling and reads with it find its own data.
+    ("_NSPICTPboardType", "NSPICTPboardType"),
     ("_NSFilenamesPboardType", "NSFilenamesPboardType"),
     ("_NSFilesPromisePboardType", "NSFilesPromisePboardType"),
     ("_NSURLPboardType", "NSURLPboardType"),
@@ -652,10 +665,18 @@ pub const STRING_GLOBALS: &[(&str, &str)] = &[
     // `NSForegroundColorAttributeName` above already is.
     ("_NSUnderlineStyleAttributeName", "NSUnderline"),
     ("_NSUnderlineColorAttributeName", "NSUnderlineColor"),
+    ("_NSStrikethroughStyleAttributeName", "NSStrikethrough"),
     ("_NSDocumentTypeDocumentAttribute", "DocumentType"),
     ("_NSHTMLTextDocumentType", "NSHTML"),
     ("_NSRTFTextDocumentType", "NSRTF"),
     ("_NSBaselineOffsetAttributeName", "NSBaselineOffset"),
+    // The marked-clause-segment key an input method annotates composed text
+    // with; this runtime's own `crate::input_context` never sets it, but a
+    // program is free to look for it in marked text it builds itself.
+    (
+        "_NSMarkedClauseSegmentAttributeName",
+        "NSMarkedClauseSegment",
+    ),
     // `NSViewAnimation`'s dictionary keys and effects, Apple's strings.
     ("_NSViewAnimationTargetKey", "NSViewAnimationTargetKey"),
     (
@@ -686,6 +707,9 @@ pub const STRING_GLOBALS: &[(&str, &str)] = &[
     ("_NSPrintFirstPage", "NSPrintFirstPage"),
     ("_NSPrintLastPage", "NSPrintLastPage"),
     ("_NSPrintScalingFactor", "NSPrintScalingFactor"),
+    // A deprecated `-performFileOperation:` operation type; see
+    // `crate::workspace::RECYCLE_OPERATION`.
+    ("_NSWorkspaceRecycleOperation", workspace::RECYCLE_OPERATION),
 ];
 
 /// `NSFontWeight` globals, which are **`CGFloat` variables** and not pointers.

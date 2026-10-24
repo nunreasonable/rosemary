@@ -881,12 +881,20 @@ pub(crate) fn release_items(items: Vec<Id>) {
     items.into_iter().for_each(objc::arc::release);
 }
 
+/// Posted around a menu's tracking session; see
+/// [`will_open`]/[`did_close`], the same points `-menuWillOpen:`/
+/// `-menuDidClose:` bracket.
+pub const DID_BEGIN_TRACKING: &str = "NSMenuDidBeginTrackingNotification";
+pub const DID_END_TRACKING: &str = "NSMenuDidEndTrackingNotification";
+
 pub(crate) fn will_open(menu: Id) {
     tell_delegate(menu, "menuWillOpen:");
+    foundation::notification::post(DID_BEGIN_TRACKING, menu, std::ptr::null_mut());
 }
 
 pub(crate) fn did_close(menu: Id) {
     tell_delegate(menu, "menuDidClose:");
+    foundation::notification::post(DID_END_TRACKING, menu, std::ptr::null_mut());
 }
 
 /// Choose `item`: its action is sent to its target, bracketed by the two
