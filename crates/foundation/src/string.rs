@@ -424,6 +424,101 @@ fn is_mutable_receiver(receiver: Id) -> bool {
             .any(|ancestor| ancestor.name_str() == "NSMutableString")
 }
 
+/// `made`, autoreleased, or a mutable string with its contents when the factory
+/// was sent to `NSMutableString`: the factories are inherited, and
+/// `+[NSMutableString stringWithCharacters:length:]` answers a mutable string.
+fn for_receiver(receiver: Id, made: Id) -> Id {
+    if made.is_null() || !is_mutable_receiver(receiver) {
+        return made;
+    }
+    // SAFETY: `made` is a string this module just made.
+    let bytes = unsafe { bytes(made) };
+    let copy = corefoundation::string::new_mutable();
+    // SAFETY: a fresh mutable string.
+    unsafe { corefoundation::string::set_bytes(copy, &bytes) };
+    // SAFETY: a fresh object.
+    unsafe { api::CFAutorelease(copy) as Id }
+}
+
+/// An initializer's answer from a factory's: owned by the caller, and the
+/// allocated receiver it replaces given back.
+fn initialized(receiver: Id, made: Id) -> Id {
+    let made = for_receiver(receiver, made);
+    objc::arc::release(receiver);
+    objc::arc::retain(made)
+}
+
+unsafe extern "C" fn class_string_with_utf8(class: Id, sel: Sel, cstr: *const c_char) -> Id {
+    for_receiver(class, unsafe { string_with_utf8(class, sel, cstr) })
+}
+
+unsafe extern "C" fn class_string_with_cstring_encoding(
+    class: Id,
+    sel: Sel,
+    cstr: *const c_char,
+    ns: usize,
+) -> Id {
+    for_receiver(class, unsafe {
+        string_with_cstring_encoding(class, sel, cstr, ns)
+    })
+}
+
+unsafe extern "C" fn class_string_with_cstring(class: Id, sel: Sel, cstr: *const c_char) -> Id {
+    for_receiver(class, unsafe { string_with_cstring(class, sel, cstr) })
+}
+
+unsafe extern "C" fn class_string_with_characters(
+    class: Id,
+    sel: Sel,
+    chars: *const u16,
+    count: usize,
+) -> Id {
+    for_receiver(class, unsafe {
+        string_with_characters(class, sel, chars, count)
+    })
+}
+
+unsafe extern "C" fn class_string_with_contents_of_file(
+    class: Id,
+    sel: Sel,
+    path: Id,
+    encoding: usize,
+    error: *mut Id,
+) -> Id {
+    for_receiver(class, unsafe {
+        string_with_contents_of_file(class, sel, path, encoding, error)
+    })
+}
+
+unsafe extern "C" fn class_string_with_contents_of_url(
+    class: Id,
+    sel: Sel,
+    url: Id,
+    encoding: usize,
+    error: *mut Id,
+) -> Id {
+    for_receiver(class, unsafe {
+        string_with_contents_of_url(class, sel, url, encoding, error)
+    })
+}
+
+unsafe extern "C" fn init_with_string(receiver: Id, sel: Sel, other: Id) -> Id {
+    initialized(receiver, unsafe {
+        string_with_string(receiver, sel, other)
+    })
+}
+
+unsafe extern "C" fn init_with_characters(
+    receiver: Id,
+    sel: Sel,
+    chars: *const u16,
+    count: usize,
+) -> Id {
+    initialized(receiver, unsafe {
+        string_with_characters(receiver, sel, chars, count)
+    })
+}
+
 unsafe extern "C" fn string_with_format(class: Id, _sel: Sel, format: Id) -> Id {
     // SAFETY: the format is an `NSString` or nil.
     let rendered = unescape_rendered(&unsafe { bytes(format) });
@@ -1790,34 +1885,51 @@ pub(crate) fn install() {
     });
 
     class_methods!(class, {
-        "stringWithUTF8String:" => string_with_utf8, c"@24@0:8*16";
-        "stringWithCString:encoding:" => string_with_cstring_encoding, c"@32@0:8*16Q24";
-        "stringWithCString:" => string_with_cstring, c"@24@0:8*16";
+        "stringWithUTF8String:" => class_string_with_utf8, c"@24@0:8*16";
+        "stringWithCString:encoding:" => class_string_with_cstring_encoding, c"@32@0:8*16Q24";
+        "stringWithCString:" => class_string_with_cstring, c"@24@0:8*16";
         "defaultCStringEncoding" => default_cstring_encoding, c"Q16@0:8";
-        "stringWithContentsOfFile:encoding:error:" => string_with_contents_of_file,
+        "stringWithContentsOfFile:encoding:error:" => class_string_with_contents_of_file,
             c"@40@0:8@16Q24^@32";
-        "stringWithContentsOfURL:encoding:error:" => string_with_contents_of_url,
+        "stringWithContentsOfURL:encoding:error:" => class_string_with_contents_of_url,
         c"@40@0:8@16Q24^@32";
         "string" => empty_string, c"@16@0:8";
         "stringWithFormat:" => string_with_format, c"@24@0:8@16";
         "localizedStringWithFormat:" => string_with_format, c"@24@0:8@16";
         "stringWithString:" => string_with_string, c"@24@0:8@16";
-        "stringWithCharacters:length:" => string_with_characters, c"@32@0:8^S16Q24";
+        "stringWithCharacters:length:" => class_string_with_characters, c"@32@0:8^S16Q24";
         "pathWithComponents:" => path_with_components, c"@24@0:8@16";
     });
     methods!(class, {
-        "initWithString:" => string_with_string, c"@24@0:8@16";
+        "initWithString:" => init_with_string, c"@24@0:8@16";
         // `-initWithCharacters:length:` on a freshly allocated `NSString` answers
         // a new object rather than filling the receiver in. That is what every
         // other initializer here does, and what the immutable storage allows:
         // `corefoundation::string` lays a string out at creation.
-        "initWithCharacters:length:" => string_with_characters, c"@32@0:8^S16Q24";
+        "initWithCharacters:length:" => init_with_characters, c"@32@0:8^S16Q24";
     });
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn factories_sent_to_the_mutable_class_answer_mutable_strings() {
+        crate::bootstrap();
+        let mutable = objc::class::ptr(objc::class::lookup(c"NSMutableString").unwrap()) as Id;
+        let immutable = objc::class::ptr(objc::class::lookup(c"NSString").unwrap()) as Id;
+        let units = [104u16, 105];
+        let sel = objc::sel::get("stringWithCharacters:length:");
+        // SAFETY: two classes and a two-unit buffer.
+        unsafe {
+            let made = class_string_with_characters(mutable, sel, units.as_ptr(), 2);
+            assert!(corefoundation::string::is_mutable(made as CFTypeRef));
+            assert_eq!(bytes(made), b"hi");
+            let made = class_string_with_characters(immutable, sel, units.as_ptr(), 2);
+            assert!(!corefoundation::string::is_mutable(made as CFTypeRef));
+        }
+    }
 
     #[test]
     fn normalization_forms_compose_and_decompose_an_accent() {
