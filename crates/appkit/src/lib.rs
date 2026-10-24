@@ -17,6 +17,7 @@ pub mod appearance;
 pub mod application;
 mod aqua;
 pub mod backing;
+mod beep;
 mod bezier;
 pub mod button;
 mod catalog;
@@ -327,6 +328,7 @@ exports::exports! {
         "CGLLockContext" => opengl::CGLLockContext,
         "CGLUnlockContext" => opengl::CGLUnlockContext,
         "CGLGetShareGroup" => opengl::CGLGetShareGroup,
+        "NSBeep" => beep::NSBeep,
     }
     groups {
         pasteboard_manager,

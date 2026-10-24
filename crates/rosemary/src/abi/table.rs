@@ -912,6 +912,7 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("NXGetLocalArchInfo", P),
     sig!("NSDisableScreenUpdates", V),
     sig!("NSEnableScreenUpdates", V),
+    sig!("NSBeep", V),
     sig!("CGSessionCopyCurrentDictionary", P),
     sig!("CGWindowServerCreateServerPort", U32),
     sig!("CGReleaseDisplayFadeReservation", I32, U32),
