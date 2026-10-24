@@ -493,6 +493,69 @@ unsafe extern "C" fn file_attributes_traverse_link(
     unsafe { attributes_of_item(receiver, sel, path, std::ptr::null_mut()) }
 }
 
+/// `-setAttributes:ofItemAtPath:error:`: the permissions and the modification
+/// date, the two a program sets.
+// FIXME (ACCURACY): ownership, the immutable and append-only flags and the
+// creation date are accepted and left as they are.
+unsafe extern "C" fn set_attributes_of_item(
+    _receiver: Id,
+    _sel: Sel,
+    attributes: Id,
+    path: Id,
+    error: *mut Id,
+) -> u8 {
+    // SAFETY: null or writable.
+    unsafe { no_error(error) };
+    // SAFETY: an `NSString`, or nil.
+    let Some(path) = (unsafe { path_of(path) }) else {
+        return 0;
+    };
+    if attributes.is_null() || std::fs::symlink_metadata(&path).is_err() {
+        return 0;
+    }
+    // SAFETY: a dictionary.
+    let mode = unsafe { attribute(attributes, "NSFilePosixPermissions") };
+    // SAFETY: a number, or nil.
+    if let Some(mode) = unsafe { corefoundation::collections::number(mode as CFTypeRef) } {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::Permissions::from_mode(mode.as_i64() as u32 & 0o7777);
+        if std::fs::set_permissions(&path, mode).is_err() {
+            return 0;
+        }
+    }
+    // SAFETY: a dictionary.
+    let date = unsafe { attribute(attributes, "NSFileModificationDate") };
+    if !date.is_null() {
+        // SAFETY: `-timeIntervalSince1970` is `double (id, SEL)`.
+        let seconds = unsafe {
+            let f: unsafe extern "C" fn(Id, Sel) -> f64 = std::mem::transmute(objc::msg::entry());
+            f(date, objc::sel::get("timeIntervalSince1970"))
+        };
+        let time = match seconds >= 0.0 {
+            true => std::time::UNIX_EPOCH + std::time::Duration::from_secs_f64(seconds),
+            false => std::time::UNIX_EPOCH - std::time::Duration::from_secs_f64(-seconds),
+        };
+        let file = std::fs::File::options().write(true).open(&path);
+        let file = file.or_else(|_| std::fs::File::open(&path));
+        if file.and_then(|f| f.set_modified(time)).is_err() {
+            return 0;
+        }
+    }
+    1
+}
+
+/// `-changeFileAttributes:atPath:`, the deprecated spelling of
+/// `-setAttributes:ofItemAtPath:error:`.
+unsafe extern "C" fn change_file_attributes(
+    receiver: Id,
+    sel: Sel,
+    attributes: Id,
+    path: Id,
+) -> u8 {
+    // SAFETY: the same arguments, with no error slot.
+    unsafe { set_attributes_of_item(receiver, sel, attributes, path, std::ptr::null_mut()) }
+}
+
 /// `-attributesOfItemAtPath:error:`, with the keys a program actually reads.
 ///
 /// Size, type and the two timestamps. A dictionary with only some of an item's
@@ -1022,6 +1085,8 @@ pub(crate) fn install() {
         "linkItemAtPath:toPath:error:" => link_item, c"B40@0:8@16@24^@32";
         "attributesOfItemAtPath:error:" => attributes_of_item, c"@32@0:8@16^@24";
         "fileAttributesAtPath:traverseLink:" => file_attributes_traverse_link, c"@28@0:8@16B24";
+        "setAttributes:ofItemAtPath:error:" => set_attributes_of_item, c"B40@0:8@16@24^@32";
+        "changeFileAttributes:atPath:" => change_file_attributes, c"B32@0:8@16@24";
         "attributesOfFileSystemForPath:error:" => attributes_of_file_system, c"@32@0:8@16^@24";
         "isWritableFileAtPath:" => is_writable, c"B24@0:8@16";
         "isReadableFileAtPath:" => file_exists, c"B24@0:8@16";
@@ -1196,6 +1261,51 @@ mod tests {
                 0
             );
         }
+    }
+
+    #[test]
+    fn changed_attributes_reach_the_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let manager = manager();
+        let file = std::env::temp_dir().join(format!("rosemary-fm-attr-{}", std::process::id()));
+        std::fs::write(&file, b"x").unwrap();
+        let path = crate::string::from_str(&file.to_string_lossy());
+        let mode = corefoundation::collections::new_number(
+            corefoundation::collections::Number::Integer(0o640),
+        );
+        // 2001-01-01T00:00:10Z, ten seconds past the reference date.
+        let date = crate::timer::date(10.0) as CFTypeRef;
+        let pairs = [
+            (
+                corefoundation::base::interned_name("NSFilePosixPermissions") as CFTypeRef,
+                mode,
+            ),
+            (
+                corefoundation::base::interned_name("NSFileModificationDate") as CFTypeRef,
+                date,
+            ),
+        ];
+        let attributes = corefoundation::collections::new_dictionary(
+            &pairs,
+            corefoundation::callbacks::Policy::from_key_callbacks(),
+            corefoundation::callbacks::Policy::from_type_callbacks(),
+            false,
+        );
+        // SAFETY: the prototype `-changeFileAttributes:atPath:` declares.
+        let changed = unsafe {
+            change_file_attributes(
+                manager,
+                objc::sel::get("changeFileAttributes:atPath:"),
+                attributes as Id,
+                path,
+            )
+        };
+        assert_eq!(changed, 1);
+        let metadata = std::fs::metadata(&file).unwrap();
+        assert_eq!(metadata.permissions().mode() & 0o7777, 0o640);
+        let modified = metadata.modified().unwrap();
+        assert_eq!(since_1970(modified), 978_307_210.0);
+        std::fs::remove_file(&file).unwrap();
     }
 
     /// `-contentsAtPath:` and the selectors an app pairs it with.
