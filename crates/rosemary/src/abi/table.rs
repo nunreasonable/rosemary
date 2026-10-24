@@ -246,6 +246,18 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     // A queue takes its callback as an ordinary argument, where an
     // `AudioUnit` takes one inside a structure - so `cbsig!` describes it and
     // the thunk is made at the seam.
+    // `ExtAudioFile` wraps linear PCM read/write around WAV and AIFF
+    // containers. `AudioFileTypeID` and `ExtAudioFilePropertyID` are both
+    // `UInt32`, and the one floating-point-free argument list here is the
+    // `SInt64` frame offset `ExtAudioFileSeek` takes.
+    sig!("ExtAudioFileOpenURL", I32, P, P),
+    sig!("ExtAudioFileCreateWithURL", I32, P, U32, P, P, U32, P),
+    sig!("ExtAudioFileDispose", I32, P),
+    sig!("ExtAudioFileGetProperty", I32, P, U32, P, P),
+    sig!("ExtAudioFileSetProperty", I32, P, U32, U32, P),
+    sig!("ExtAudioFileRead", I32, P, P, P),
+    sig!("ExtAudioFileWrite", I32, P, U32, P),
+    sig!("ExtAudioFileSeek", I32, P, I64),
     sig!("AudioQueueAllocateBuffer", I32, P, U32, P),
     sig!("AudioQueueDispose", I32, P, BOOL),
     sig!("AudioQueueEnqueueBuffer", I32, P, P, U32, P),
@@ -1177,6 +1189,8 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("IOHIDElementIsWrapping", BOOL, P),
     sig!("IOHIDElementGetLogicalMax", I64, P),
     sig!("IOHIDElementGetLogicalMin", I64, P),
+    sig!("IOHIDElementGetReportSize", U32, P),
+    sig!("IOHIDElementGetReportCount", U32, P),
     sig!("IOHIDElementGetType", U32, P),
     // A `CFTypeID` is an `unsigned long`, so sixty-four bits, and this takes
     // nothing.
@@ -1251,6 +1265,11 @@ pub static SIGNATURES: &[FunctionAbi] = &[
         P
     ),
     sig!("IOPMAssertionRelease", I32, U32),
+    // `IOPMAssertionLevel` is a `uint32_t`; both of these are the lighter
+    // sibling of `IOPMAssertionCreateWithDescription` above, so they share its
+    // `IOPMAssertionID *` out-parameter and floating-point-free argument list.
+    sig!("IOPMAssertionCreateWithName", I32, P, U32, P, P),
+    sig!("IOPMAssertionDeclareUserActivity", I32, P, U32, P),
     // The sleep/wake notification family is the *other* power API, and it is
     // the one an application registers with in order to be told before the
     // machine sleeps.
@@ -1279,6 +1298,7 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     // point.
     sig!("IORegistryEntryCreateIterator", I32, U32, P, U32, P),
     sig!("IORegistryEntryFromPath", U32, U32, P),
+    sig!("IORegistryEntryGetChildIterator", I32, U32, P, P),
     sig!("IORegistryEntrySearchCFProperty", P, U32, P, P, P, U32),
     sig!("IORegistryEntryGetParentEntry", I32, U32, P, P),
     // `kern_return_t IOServiceAddMatchingNotification(IONotificationPortRef,
