@@ -54,6 +54,11 @@ pub struct MenuItem {
     indentation: isize,
     /// `-representedObject`, retained.
     represented: Id,
+    /// `-allowsAutomaticKeyEquivalentLocalization`. Nothing here localises a
+    /// key equivalent for the host's keyboard layout, so the flag has no
+    /// behaviour behind it; stored so a program's read-back agrees with what
+    /// it set, and defaulted to Apple's `YES` by both initialisers below.
+    allows_automatic_key_equivalent_localization: usize,
 }
 
 pub const MENU_INSTANCE_SIZE: usize = size_of::<Menu>();
@@ -275,6 +280,7 @@ unsafe extern "C" fn init_item(
     item.key_equivalent = objc::arc::retain(key_equivalent);
     item.enabled = 1;
     item.modifier_mask = crate::keymap::flags::COMMAND as usize;
+    item.allows_automatic_key_equivalent_localization = 1;
     receiver
 }
 
@@ -284,6 +290,7 @@ unsafe extern "C" fn init_plain_item(receiver: Id, _sel: Sel) -> Id {
     let item = item_of(receiver);
     item.enabled = 1;
     item.modifier_mask = crate::keymap::flags::COMMAND as usize;
+    item.allows_automatic_key_equivalent_localization = 1;
     receiver
 }
 
@@ -380,6 +387,18 @@ unsafe extern "C" fn is_hidden(receiver: Id, _sel: Sel) -> u8 {
 
 unsafe extern "C" fn set_hidden(receiver: Id, _sel: Sel, hidden: u8) {
     item_of(receiver).hidden = hidden as usize;
+}
+
+unsafe extern "C" fn allows_automatic_key_equivalent_localization(receiver: Id, _sel: Sel) -> u8 {
+    (item_of(receiver).allows_automatic_key_equivalent_localization != 0) as u8
+}
+
+unsafe extern "C" fn set_allows_automatic_key_equivalent_localization(
+    receiver: Id,
+    _sel: Sel,
+    value: u8,
+) {
+    item_of(receiver).allows_automatic_key_equivalent_localization = value as usize;
 }
 
 /// The requests that describe how a menu *looks*, which nothing here draws.
@@ -606,11 +625,21 @@ unsafe extern "C" fn menu_bar_height(_receiver: Id, _sel: Sel) -> f64 {
     global_menu_bar_height()
 }
 
+/// `+menuZone`: the allocator the class name, not `NSZone` itself, has used
+/// `+alloc` instead of since the zone allocator it predates was retired. A
+/// fixed non-null pointer is enough for a caller that only null-checks it,
+/// which is all `+menuZone` is ever documented to be good for today.
+unsafe extern "C" fn menu_zone(_class: Id, _sel: Sel) -> *mut c_void {
+    static ZONE: u8 = 0;
+    std::ptr::addr_of!(ZONE) as *mut c_void
+}
+
 pub(crate) fn install() {
     let menu = objc::class::lookup(c"NSMenu").expect("declared before its methods");
     class_methods!(menu, {
         "menuBarVisible" => menu_bar_visible, c"c16@0:8";
         "setMenuBarVisible:" => set_menu_bar_visible, c"v20@0:8c16";
+        "menuZone" => menu_zone, c"^v16@0:8";
     });
     methods!(menu, {
         "initWithTitle:" => init_with_title, c"@24@0:8@16";
@@ -677,6 +706,8 @@ pub(crate) fn install() {
         "setEnabled:" => set_enabled, c"v20@0:8c16";
         "isHidden" => is_hidden, c"c16@0:8";
         "setHidden:" => set_hidden, c"v20@0:8c16";
+        "allowsAutomaticKeyEquivalentLocalization" => allows_automatic_key_equivalent_localization, c"c16@0:8";
+        "setAllowsAutomaticKeyEquivalentLocalization:" => set_allows_automatic_key_equivalent_localization, c"v20@0:8c16";
         "setKeyEquivalentModifierMask:" => set_key_equivalent_modifier_mask, c"v24@0:8Q16";
         "keyEquivalentModifierMask" => key_equivalent_modifier_mask, c"Q16@0:8";
         "isSeparatorItem" => is_separator_item, c"c16@0:8";
@@ -1503,5 +1534,42 @@ mod tests {
         add_full_screen_item();
         assert_eq!(titles(view), ["Show Sidebar", "-", "Enter Full Screen"]);
         assert!(titles(other).is_empty());
+    }
+
+    /// Apple's default is `YES`, which both designated initialisers set, and
+    /// a program's own read-back must agree with whatever it then set.
+    #[test]
+    fn an_item_allows_automatic_localization_by_default_and_remembers_being_told_no() {
+        crate::bootstrap();
+        let object = objc::object::create_instance(
+            objc::class::lookup(c"NSMenuItem").expect("NSMenuItem"),
+            0,
+        );
+        let get = objc::sel::get("allowsAutomaticKeyEquivalentLocalization");
+        let set = objc::sel::get("setAllowsAutomaticKeyEquivalentLocalization:");
+        // SAFETY: `-init` is `id (id, SEL)`; the rest are this item's own
+        // accessors.
+        unsafe {
+            let object = init_plain_item(object, objc::sel::get("init"));
+            assert_eq!(allows_automatic_key_equivalent_localization(object, get), 1);
+            set_allows_automatic_key_equivalent_localization(object, set, 0);
+            assert_eq!(allows_automatic_key_equivalent_localization(object, get), 0);
+            set_allows_automatic_key_equivalent_localization(object, set, 1);
+            assert_eq!(allows_automatic_key_equivalent_localization(object, get), 1);
+        }
+    }
+
+    /// `+menuZone` answers a fixed non-null pointer; nothing here allocates
+    /// menu items from a zone, so there is nothing else for it to be.
+    #[test]
+    fn menu_zone_is_non_null_and_stable() {
+        crate::bootstrap();
+        let sel = objc::sel::get("menuZone");
+        // SAFETY: `+menuZone` is `NSZone * (Class, SEL)`.
+        unsafe {
+            let first = menu_zone(std::ptr::null_mut(), sel);
+            assert!(!first.is_null());
+            assert_eq!(menu_zone(std::ptr::null_mut(), sel), first);
+        }
     }
 }
