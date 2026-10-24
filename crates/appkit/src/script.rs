@@ -267,7 +267,8 @@ pub fn run() {
 /// `ROSEMARY_DEBUG_INPUT_WINDOW` says which: `key` for the key window, for a
 /// dialog; `main` for the largest shown one, for an application window the
 /// compositor has not given focus to; `top` for the most recently shown, for a
-/// menu; the first window made otherwise.
+/// menu; a number for the SDL window with that id; the first window made
+/// otherwise.
 fn target() -> Option<u32> {
     target_window().map(sdl3::video::window_id)
 }
@@ -302,6 +303,12 @@ fn target_window() -> Option<sdl3::Window> {
             // SAFETY: a window this crate made.
             .map(|window| unsafe { crate::window::sdl_window(window) })
             .rfind(|sdl| !sdl.is_null()),
+        // An SDL window id, as `ROSEMARY_TRACE_WINDOW` prints it: the one way
+        // to name a window that is neither key, largest nor newest.
+        which if which.parse::<u32>().is_ok() => {
+            let window = sdl3::video::window_from_id(which.parse().unwrap_or(0));
+            (!window.is_null()).then_some(window)
+        }
         _ => crate::window::sdl_windows().into_iter().next(),
     }
 }
