@@ -432,7 +432,9 @@ exports::exports! {
         "FSIsAliasFile" => FSIsAliasFile,
         "FSResolveAliasFile" => FSResolveAliasFile,
         "FSGetCatalogInfo" => FSGetCatalogInfo,
+        "FSSetCatalogInfo" => FSSetCatalogInfo,
         "FSGetVolumeInfo" => FSGetVolumeInfo,
+        "FNNotify" => FNNotify,
     }
 }
 
@@ -640,7 +642,7 @@ pub struct CatalogInfo {
 /// field of [`CatalogInfo`] after the first date.
 #[repr(C, packed(2))]
 #[derive(Clone, Copy, Default)]
-struct UtcDateTime {
+pub(crate) struct UtcDateTime {
     high_seconds: u16,
     low_seconds: u32,
     fraction: u16,
@@ -716,6 +718,11 @@ mod info {
         | RSRC_SIZES
         | SHARING_FLAGS
         | USER_PRIVS;
+    /// What [`super::FSSetCatalogInfo`] can act on: the lock bit, the
+    /// permissions, and the two dates a POSIX file lets anyone but the kernel
+    /// change. The Finder info, the valence, the sizes and the other two dates
+    /// are facts of the file this tree reads rather than fields it can write.
+    pub const SETTABLE: u32 = NODE_FLAGS | PERMISSIONS | CONTENT_MOD | ACCESS_DATE;
 }
 
 /// `kFSNodeIsDirectoryMask`.
@@ -728,7 +735,7 @@ const UNIX_TO_1904: i64 = 2_082_844_800;
 
 impl UtcDateTime {
     /// A Unix timestamp in the File Manager's own counting.
-    fn from_unix(seconds: i64) -> Self {
+    pub(crate) fn from_unix(seconds: i64) -> Self {
         let since = seconds.saturating_add(UNIX_TO_1904).max(0) as u64;
         UtcDateTime {
             high_seconds: (since >> 32) as u16,
@@ -1035,4 +1042,203 @@ fn fill(out: &mut CatalogInfo, which: u32, path: &std::path::Path, metadata: &st
     // A resource fork is an HFS+ named fork, and there are none here - so its
     // sizes are zero rather than unanswered.
     let _ = which & info::RSRC_SIZES;
+}
+
+impl UtcDateTime {
+    /// The Unix timestamp `self` names, for a date this tree is about to hand
+    /// to `futimens` through [`std::fs::File::set_times`].
+    fn to_system_time(self) -> std::time::SystemTime {
+        let since_1904 = (u64::from(self.high_seconds) << 32) | u64::from(self.low_seconds);
+        let unix = since_1904 as i64 - UNIX_TO_1904;
+        std::time::UNIX_EPOCH + std::time::Duration::from_secs(unix.max(0) as u64)
+    }
+}
+
+/// `OSErr FSSetCatalogInfo(const FSRef *ref, FSCatalogInfoBitmap whichInfo,
+/// const FSCatalogInfo *catalogInfo)`
+///
+/// A bit this tree cannot act on is refused by name - the same rule
+/// [`FSGetCatalogInfo`] follows for the bits it cannot answer - rather than
+/// silently dropped, which would tell a caller its change took when it did not.
+/// The Finder info, the valence and the sizes are read-only facts of the file
+/// everywhere in this bitmap; only the three a POSIX file actually carries -
+/// its lock bit, its permissions, and two of its four dates - are settable.
+///
+/// # Safety
+///
+/// `reference` is a whole `FSRef`; `catalog_info` is null or readable for a
+/// whole `CatalogInfo` when `which` is non-zero.
+pub unsafe extern "C" fn FSSetCatalogInfo(
+    reference: *const c_void,
+    which: u32,
+    catalog_info: *const CatalogInfo,
+) -> i16 {
+    let Some(path) = (unsafe { load(reference) }) else {
+        return PARAM_ERR as i16;
+    };
+    if which == 0 {
+        return NO_ERR as i16;
+    }
+    if which & !info::SETTABLE != 0 {
+        eprintln!(
+            "rosemary: coreservices: FSSetCatalogInfo: {:#x} of the catalog bitmap is not \
+             something this tree can act on",
+            which & !info::SETTABLE
+        );
+        return PARAM_ERR as i16;
+    }
+    if catalog_info.is_null() {
+        return PARAM_ERR as i16;
+    }
+    // SAFETY: the caller states it is readable; unaligned for the reason
+    // `FSGetCatalogInfo` reads `FSCatalogInfo` unaligned.
+    let wanted = unsafe { catalog_info.read_unaligned() };
+    if which & info::PERMISSIONS != 0 {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::Permissions::from_mode(u32::from(wanted.permissions.mode));
+        if std::fs::set_permissions(&path, mode).is_err() {
+            return IO_ERR as i16;
+        }
+    }
+    if which & info::NODE_FLAGS != 0 {
+        let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+            return FNF_ERR as i16;
+        };
+        let mut permissions = metadata.permissions();
+        permissions.set_readonly(wanted.node_flags & NODE_LOCKED != 0);
+        if std::fs::set_permissions(&path, permissions).is_err() {
+            return IO_ERR as i16;
+        }
+    }
+    if which & (info::CONTENT_MOD | info::ACCESS_DATE) != 0 {
+        // Read-only is enough for `futimens`; opening for write would refuse a
+        // directory, and a directory's dates are as settable as a file's.
+        let Ok(file) = std::fs::File::open(&path) else {
+            return IO_ERR as i16;
+        };
+        let mut times = std::fs::FileTimes::new();
+        if which & info::CONTENT_MOD != 0 {
+            times = times.set_modified(wanted.content_mod_date.to_system_time());
+        }
+        if which & info::ACCESS_DATE != 0 {
+            times = times.set_accessed(wanted.access_date.to_system_time());
+        }
+        if file.set_times(times).is_err() {
+            return IO_ERR as i16;
+        }
+    }
+    NO_ERR as i16
+}
+
+#[cfg(test)]
+mod set_catalog_info_tests {
+    use super::*;
+
+    /// The lock bit round-trips through `FSSetCatalogInfo` and
+    /// `FSGetCatalogInfo`, and the file is still there to ask about.
+    #[test]
+    fn the_lock_bit_round_trips() {
+        let path = std::env::temp_dir().join(format!(
+            "rosemary-fssetcatalog-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::write(&path, b"x").unwrap();
+        let mut reference = [0_u8; FS_REF_BYTES];
+        let mut is_dir = 0_u8;
+        let text = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+        // SAFETY: a C string and storage for a whole reference.
+        unsafe {
+            assert_eq!(
+                FSPathMakeRef(
+                    text.as_ptr().cast(),
+                    reference.as_mut_ptr().cast(),
+                    &mut is_dir
+                ),
+                NO_ERR
+            );
+        }
+        let mut set = CatalogInfo {
+            node_flags: NODE_LOCKED,
+            ..CatalogInfo::default()
+        };
+        // SAFETY: a reference just made, and a whole `CatalogInfo` this test owns.
+        unsafe {
+            assert_eq!(
+                FSSetCatalogInfo(reference.as_ptr().cast(), info::NODE_FLAGS, &raw const set),
+                NO_ERR as i16
+            );
+        }
+        let mut got = CatalogInfo::default();
+        // SAFETY: as above, and storage for a whole `CatalogInfo`.
+        unsafe {
+            assert_eq!(
+                FSGetCatalogInfo(
+                    reference.as_ptr().cast(),
+                    info::NODE_FLAGS,
+                    &raw mut got,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut()
+                ),
+                NO_ERR as i16
+            );
+        }
+        assert_eq!(got.node_flags & NODE_LOCKED, NODE_LOCKED);
+        // Unlock again so `remove_file` below does not need to clear it itself.
+        set.node_flags = 0;
+        // SAFETY: as above.
+        unsafe { FSSetCatalogInfo(reference.as_ptr().cast(), info::NODE_FLAGS, &raw const set) };
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    /// A bit this tree cannot write - the valence, say - is refused rather than
+    /// silently ignored.
+    #[test]
+    fn an_unsettable_bit_is_refused() {
+        let dir = std::env::temp_dir();
+        let text = std::ffi::CString::new(dir.to_str().unwrap()).unwrap();
+        let mut reference = [0_u8; FS_REF_BYTES];
+        // SAFETY: a C string and storage for a whole reference.
+        unsafe {
+            assert_eq!(
+                FSPathMakeRef(
+                    text.as_ptr().cast(),
+                    reference.as_mut_ptr().cast(),
+                    std::ptr::null_mut()
+                ),
+                NO_ERR
+            );
+        }
+        let set = CatalogInfo::default();
+        // SAFETY: a reference just made, and a whole `CatalogInfo`.
+        let status =
+            unsafe { FSSetCatalogInfo(reference.as_ptr().cast(), info::VALENCE, &raw const set) };
+        assert_eq!(status, PARAM_ERR as i16);
+    }
+
+    /// Nothing subscribes, so there is nobody to tell - and nothing crashes
+    /// telling them anyway.
+    #[test]
+    fn fn_notify_is_accepted_with_no_subscribers() {
+        // SAFETY: a null `FSRef` is a documented "no particular item" case.
+        let status = unsafe { FNNotify(std::ptr::null(), 1, 0) };
+        assert_eq!(status, NO_ERR);
+    }
+}
+
+/// `OSStatus FNNotify(const FSRef *fileOrDirectory, FNMessage message,
+/// OptionBits flags)`
+///
+/// Tells every process that subscribed through `FNSubscribe` that a file or
+/// directory changed, so the Finder can redraw it. Nothing in this tree
+/// subscribes - there is no Finder here - so there is nobody to tell: accepted
+/// and done, as `coreservices::events::SetSystemUIMode` answers for a menu bar
+/// this host has not got either.
+pub unsafe extern "C" fn FNNotify(
+    _file_or_directory: *const c_void,
+    _message: u32,
+    _flags: u32,
+) -> OSStatus {
+    NO_ERR
 }

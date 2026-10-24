@@ -1372,6 +1372,8 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("FSIsAliasFile", I32, P, P, P),
     sig!("FSNewAlias", I32, P, P, P),
     sig!("FSSetCatalogInfo", I32, P, U32, P),
+    // `OSStatus FNNotify(const FSRef *, FNMessage, OptionBits)`.
+    sig!("FNNotify", I32, P, U32, U32),
     sig!("FSGetVolumeInfo", I32, I16, U32, P, U32, P, P, P),
     sig!("FSGetVolumeParms", I32, I16, P, U32),
     sig!("FSPathMoveObjectToTrashSync", I32, P, P, U32),
