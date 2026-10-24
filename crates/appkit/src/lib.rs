@@ -69,6 +69,7 @@ mod paragraph;
 pub mod pasteboard;
 mod pasteboard_manager;
 mod popup;
+pub mod printing;
 pub mod raster;
 mod responder;
 pub mod screen;
@@ -146,6 +147,7 @@ pub fn bootstrap() {
         monitor::install();
         status::install();
         document::install();
+        printing::install();
     });
 }
 
@@ -673,6 +675,13 @@ pub const STRING_GLOBALS: &[(&str, &str)] = &[
     ("_NSAccessibilityDescriptionAttribute", "AXDescription"),
     // The only named system image a program asks for here.
     ("_NSImageNameApplicationIcon", "NSApplicationIcon"),
+    // `NSPrintInfo`'s dictionary keys, a program reads and writes through the
+    // symbol rather than the literal - their value is free to be their own
+    // name, as the deprecated pasteboard types above are.
+    ("_NSPrintAllPages", "NSPrintAllPages"),
+    ("_NSPrintFirstPage", "NSPrintFirstPage"),
+    ("_NSPrintLastPage", "NSPrintLastPage"),
+    ("_NSPrintScalingFactor", "NSPrintScalingFactor"),
 ];
 
 /// `NSFontWeight` globals, which are **`CGFloat` variables** and not pointers.
