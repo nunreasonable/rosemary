@@ -635,6 +635,7 @@ dependencies = [
  "foundation",
  "libc",
  "prefix",
+ "sdl3",
 ]
 
 [[package]]

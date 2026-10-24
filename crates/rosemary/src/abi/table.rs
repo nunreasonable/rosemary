@@ -1339,6 +1339,18 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("SendEventToEventTarget", I32, P, P),
     // `OSStatus SetSystemUIMode(SystemUIMode, SystemUIOptions)`, two `UInt32`.
     sig!("SetSystemUIMode", I32, U32, U32),
+    // `OSStatus GetEventParameter(EventRef, EventParamName, EventParamType,
+    // EventParamType *, UInt32, UInt32 *, void *)`.
+    sig!("GetEventParameter", I32, P, U32, U32, P, U32, P, P),
+    // `OSStatus SetEventParameter(EventRef, EventParamName, EventParamType,
+    // UInt32, const void *)`.
+    sig!("SetEventParameter", I32, P, U32, U32, U32, P),
+    // `OSStatus CallNextEventHandler(EventHandlerCallRef, EventRef)`.
+    sig!("CallNextEventHandler", I32, P, P),
+    // `Boolean GetColor(Point, ConstStr255Param, const RGBColor *, RGBColor
+    // *)`. `Point` is two `SInt16`s, which is one integer register.
+    sig!("GetColor", U8, U32, P, P, P),
+    sig!("GetCurrentButtonState", U32),
     // `OSErr FSFindFolder(FSVolumeRefNum, OSType, Boolean, FSRef *)`.
     sig!("FSFindFolder", I16, I16, U32, U8, P),
     sig!("GetIconRef", I16, I16, U32, U32, P),
