@@ -10,6 +10,7 @@ pub mod files;
 pub mod icons;
 pub mod process;
 pub mod resources;
+pub mod textencoding;
 pub mod uti;
 
 exports::group! {
@@ -19,5 +20,6 @@ exports::group! {
     icons,
     process,
     resources,
+    textencoding,
     uti,
 }

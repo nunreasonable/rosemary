@@ -1356,6 +1356,23 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("GetIconRef", I16, I16, U32, U32, P),
     sig!("ReleaseIconRef", I16, P),
     sig!("LocaleRefFromLocaleString", I32, P, P),
+    // `TextEncoding CreateTextEncoding(TextEncodingBase, TextEncodingVariant,
+    // TextEncodingFormat)` and `Fixed Long2Fix(long)`, both plain integer
+    // arithmetic with no guest memory involved.
+    sig!("CreateTextEncoding", U32, U32, U32, U32),
+    sig!("Long2Fix", I32, I32),
+    // `OSStatus UpgradeScriptInfoToTextEncoding(ScriptCode, LangCode,
+    // RegionCode, ConstStr255Param, TextEncoding *)`.
+    sig!("UpgradeScriptInfoToTextEncoding", I32, I16, I16, I16, P, P),
+    // `OSStatus TECGetTextEncodingFromInternetName(TextEncoding *,
+    // ConstStr255Param)`.
+    sig!("TECGetTextEncodingFromInternetName", I32, P, P),
+    sig!("TECCreateConverter", I32, P, U32, U32),
+    sig!("TECDisposeConverter", I32, P),
+    sig!("TECClearConverterContextInfo", I32, P),
+    // `OSStatus TECConvertText(TECObjectRef, const UInt8 *, ByteCount,
+    // ByteCount *, UInt8 *, ByteCount, ByteCount *)`.
+    sig!("TECConvertText", I32, P, P, U64, P, P, U64, P),
     sig!("UCCreateCollator", I32, P, U32, U32, P),
     sig!("UCDisposeCollator", I32, P),
     sig!("UCCompareText", I32, P, P, U64, P, U64, P, P),
