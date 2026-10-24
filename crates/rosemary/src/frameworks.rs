@@ -120,7 +120,7 @@ static FRAMEWORKS: &[Framework] = &[
         version: 'A',
         umbrellas: &["Carbon"],
         provide: Some(coreservices::provide),
-        data: None,
+        data: Some(coreservices::data_symbols),
         symbol: Some(coreservices::symbol),
     },
     Framework {

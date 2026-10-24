@@ -8,6 +8,7 @@ pub mod collator;
 pub mod events;
 pub mod files;
 pub mod icons;
+pub mod metadata;
 pub mod process;
 pub mod resources;
 pub mod textencoding;
@@ -18,8 +19,14 @@ exports::group! {
     events,
     files,
     icons,
+    metadata,
     process,
     resources,
     textencoding,
     uti,
+}
+
+/// The `kMDItem*` globals; see `metadata::ATTRIBUTE_NAMES`.
+pub fn data_symbols() -> Vec<(String, u64)> {
+    metadata::data_symbols()
 }

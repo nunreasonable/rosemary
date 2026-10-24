@@ -1373,6 +1373,10 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     // `OSStatus TECConvertText(TECObjectRef, const UInt8 *, ByteCount,
     // ByteCount *, UInt8 *, ByteCount, ByteCount *)`.
     sig!("TECConvertText", I32, P, P, U64, P, P, U64, P),
+    // `MDItemRef MDItemCreate(CFAllocatorRef, CFStringRef)` and `CFTypeRef
+    // MDItemCopyAttribute(MDItemRef, CFStringRef)`.
+    sig!("MDItemCreate", P, P, P),
+    sig!("MDItemCopyAttribute", P, P, P),
     sig!("UCCreateCollator", I32, P, U32, U32, P),
     sig!("UCDisposeCollator", I32, P),
     sig!("UCCompareText", I32, P, P, U64, P, U64, P, P),
