@@ -2,6 +2,7 @@ pub mod block;
 pub mod data;
 pub mod object;
 pub mod queue;
+pub mod source;
 pub mod sync;
 pub mod time;
 
@@ -113,6 +114,7 @@ exports::exports! {
         "dispatch_group_notify_f" => sync::group_notify_f,
         "dispatch_group_async_f" => sync::group_async_f,
         "dispatch_group_async" => sync::group_async,
+        "dispatch_apply" => sync::apply,
         "dispatch_apply_f" => sync::apply_f,
         "dispatch_group_wait" => sync::group_wait,
         "dispatch_semaphore_create" => sync::semaphore_create,
@@ -126,11 +128,28 @@ exports::exports! {
         "dispatch_set_context" => object::set_context,
         "dispatch_get_context" => object::get_context,
         "dispatch_set_finalizer_f" => object::set_finalizer_f,
+        "dispatch_suspend" => object::suspend_entry,
+        "dispatch_resume" => object::resume_entry,
+        "dispatch_activate" => object::activate_entry,
+        "dispatch_source_create" => source::create,
+        "dispatch_source_set_timer" => source::set_timer,
+        "dispatch_source_set_event_handler" => source::set_event_handler,
+        "dispatch_source_set_event_handler_f" => source::set_event_handler_f,
+        "dispatch_source_set_cancel_handler" => source::set_cancel_handler,
+        "dispatch_source_set_cancel_handler_f" => source::set_cancel_handler_f,
+        "dispatch_source_cancel" => source::cancel,
+        "dispatch_source_testcancel" => source::testcancel,
+        "dispatch_source_get_data" => source::get_data,
+        "dispatch_source_get_handle" => source::get_handle,
+        "dispatch_source_get_mask" => source::get_mask,
     }
     data {
         "__dispatch_main_q" => main_queue(),
         "__dispatch_queue_attr_concurrent" => queue::concurrent_attr(),
         "__dispatch_data_destructor_free" => data::destructor_free(),
+    }
+    constants {
+        "_dispatch_source_type_timer" => &raw const source::TYPE_TIMER as usize as u64,
     }
 }
 

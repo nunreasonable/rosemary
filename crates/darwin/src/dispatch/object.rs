@@ -12,6 +12,7 @@ pub enum Kind {
     Group,
     Semaphore,
     Data,
+    Source,
 }
 
 /// The header every dispatch object begins with.
@@ -57,6 +58,11 @@ impl Header {
 
     pub fn kind(&self) -> Kind {
         self.kind
+    }
+
+    /// Whether the process owns this object; see [`make_global`].
+    pub fn is_global(&self) -> bool {
+        self.global.load(Ordering::Acquire)
     }
 }
 
@@ -140,7 +146,10 @@ pub unsafe fn release(handle: u64) {
         h.finalizer.load(Ordering::Acquire),
         h.context.load(Ordering::Acquire),
     );
-    let target = super::queue::target(handle);
+    let target = match h.kind {
+        Kind::Source => super::source::target(handle),
+        _ => super::queue::target(handle),
+    };
     let target = if target == 0 {
         unsafe { super::queue::get_global_queue(0, 0) }
     } else {
@@ -156,6 +165,7 @@ pub unsafe fn release(handle: u64) {
             Kind::Group => drop(Box::from_raw(handle as *mut super::sync::Group)),
             Kind::Semaphore => drop(Box::from_raw(handle as *mut super::sync::Semaphore)),
             Kind::Data => drop(Box::from_raw(handle as *mut super::data::Data)),
+            Kind::Source => drop(Box::from_raw(handle as *mut super::source::Source)),
         }
     }
     if finalizer != 0 && context != 0 {
@@ -177,6 +187,37 @@ pub unsafe extern "C" fn retain_entry(handle: u64) {
 pub unsafe extern "C" fn release_entry(handle: u64) {
     // SAFETY: the guest is giving up a reference it holds.
     unsafe { release(handle) };
+}
+
+/// `void dispatch_suspend(dispatch_object_t)`. Only queues and sources can be
+/// suspended; anything else is ignored.
+pub unsafe extern "C" fn suspend_entry(handle: u64) {
+    // SAFETY: a live object.
+    match unsafe { header(handle) }.map(Header::kind) {
+        Some(Kind::Queue) => super::queue::suspend(handle),
+        Some(Kind::Source) => super::source::suspend(handle),
+        _ => {}
+    }
+}
+
+/// `void dispatch_resume(dispatch_object_t)`. Also what starts a new source,
+/// which is created inactive.
+pub unsafe extern "C" fn resume_entry(handle: u64) {
+    // SAFETY: a live object.
+    match unsafe { header(handle) }.map(Header::kind) {
+        Some(Kind::Queue) => super::queue::resume(handle),
+        Some(Kind::Source) => super::source::resume(handle),
+        _ => {}
+    }
+}
+
+/// `void dispatch_activate(dispatch_object_t)`. Every queue here is created
+/// active, so only a source has anything to do.
+pub unsafe extern "C" fn activate_entry(handle: u64) {
+    // SAFETY: a live object.
+    if let Some(Kind::Source) = unsafe { header(handle) }.map(Header::kind) {
+        super::source::activate(handle);
+    }
 }
 
 /// `void dispatch_set_context(dispatch_object_t, void *)`.

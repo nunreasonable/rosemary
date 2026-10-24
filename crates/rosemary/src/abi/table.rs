@@ -1777,6 +1777,7 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     // back - nothing about the object crosses.
     sig!("difftime", F64, I64, I64),
     sig!("dirname", P, P),
+    sig!("dispatch_activate", V, P),
     sig!("dispatch_get_context", P, P),
     sig!("dispatch_get_global_queue", P, I64, U64),
     cbsig!([3], "dispatch_group_async_f", V, P, P, P, P),
@@ -1798,9 +1799,15 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("dispatch_set_context", V, P, P),
     sig!("dispatch_source_cancel", V, P),
     sig!("dispatch_source_create", P, P, U64, U64, P),
+    // `uintptr_t` answers, and `testcancel`'s `intptr_t` is non-zero once
+    // cancelled.
+    sig!("dispatch_source_get_data", U64, P),
+    sig!("dispatch_source_get_handle", U64, P),
+    sig!("dispatch_source_get_mask", U64, P),
     cbsig!([1], "dispatch_source_set_cancel_handler_f", V, P, P),
     cbsig!([1], "dispatch_source_set_event_handler_f", V, P, P),
     sig!("dispatch_source_set_timer", V, P, U64, U64, U64),
+    sig!("dispatch_source_testcancel", I64, P),
     sig!("dispatch_suspend", V, P),
     // `dispatch_time(dispatch_time_t base, int64_t delta)` - the base is an
     // opaque absolute time and the delta is signed nanoseconds, which is why

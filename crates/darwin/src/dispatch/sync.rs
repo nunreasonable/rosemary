@@ -247,6 +247,17 @@ pub unsafe extern "C" fn apply_f(iterations: usize, _queue: u64, context: u64, w
     }
 }
 
+/// `void dispatch_apply(size_t iterations, dispatch_queue_t, void (^block)(size_t))`.
+///
+/// The block form of [`apply_f`], run the same way and for the same reason. No
+/// copy: every iteration has run before this returns.
+pub unsafe extern "C" fn apply(iterations: usize, _queue: u64, block: u64) {
+    for index in 0..iterations {
+        // SAFETY: the guest's block, whose invoke takes the iteration index.
+        unsafe { super::block::invoke_with_index(block, index) };
+    }
+}
+
 /// `void dispatch_group_async(dispatch_group_t, dispatch_queue_t, dispatch_block_t)`.
 ///
 /// The block is copied, as `dispatch_async` copies one, and run through the
@@ -404,6 +415,32 @@ mod tests {
     unsafe extern "C" fn bump(context: *mut c_void) {
         // SAFETY: every caller below passes the address of a live `AtomicU32`.
         unsafe { &*(context as *const AtomicU32) }.fetch_add(1, Ordering::AcqRel);
+    }
+
+    #[test]
+    fn apply_hands_every_index_to_the_block_in_order() {
+        static SEEN: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
+        extern "C" fn body(_block: u64, index: usize) {
+            SEEN.lock().unwrap().push(index);
+        }
+        #[repr(C)]
+        struct Literal {
+            isa: u64,
+            flags: u32,
+            reserved: u32,
+            invoke: u64,
+            descriptor: u64,
+        }
+        let literal = Literal {
+            isa: 0,
+            flags: 0,
+            reserved: 0,
+            invoke: body as *const () as usize as u64,
+            descriptor: 0,
+        };
+        // SAFETY: a live literal whose invoke takes the block and an index.
+        unsafe { apply(4, 0, &literal as *const Literal as u64) };
+        assert_eq!(*SEEN.lock().unwrap(), [0, 1, 2, 3]);
     }
 
     fn wait_for(counter: &AtomicU32, what: &str) {

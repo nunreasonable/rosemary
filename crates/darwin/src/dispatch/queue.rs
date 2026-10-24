@@ -108,6 +108,8 @@ struct State {
     /// Held by the one worker allowed to run this serial queue's work. Unused for a
     /// concurrent queue, which has no such restriction.
     draining: bool,
+    /// `dispatch_suspend` count. Work already running finishes; nothing new starts.
+    suspended: u32,
 }
 
 /// The queue a handle names, if it names a live one.
@@ -133,6 +135,7 @@ fn new(label: &str, concurrent: bool, main: bool) -> u64 {
         state: Mutex::new(State {
             pending: VecDeque::new(),
             draining: false,
+            suspended: 0,
         }),
     });
     Box::into_raw(queue) as u64
@@ -221,13 +224,14 @@ pub fn drain_main() {
         .pending
         .len();
     while budget > 0 {
-        let Some(item) = main
-            .state
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .pending
-            .pop_front()
-        else {
+        let item = {
+            let mut state = main.state.lock().unwrap_or_else(|e| e.into_inner());
+            if state.suspended > 0 {
+                return;
+            }
+            state.pending.pop_front()
+        };
+        let Some(item) = item else {
             return;
         };
         budget -= 1;
@@ -390,6 +394,10 @@ fn run_one(handle: u64) {
         if !q.concurrent && state.draining {
             return;
         }
+        // `resume` reschedules whatever is still pending.
+        if state.suspended > 0 {
+            return;
+        }
         match state.pending.pop_front() {
             None => return,
             Some(item) => {
@@ -442,6 +450,11 @@ fn submit(handle: u64, item: Item) {
 /// Submit work from outside, as the entry points below do.
 fn enqueue(handle: u64, work: Work) {
     submit(handle, Item { work, done: None });
+}
+
+/// Submit a host function and its context to `handle`.
+pub(crate) fn enqueue_function(handle: u64, f: Function, context: u64) {
+    enqueue(handle, Work::Function(f, context));
 }
 
 /// `dispatch_queue_t dispatch_queue_create(const char *label, dispatch_queue_attr_t)`.
@@ -514,6 +527,45 @@ pub unsafe extern "C" fn queue_get_label(handle: u64) -> *const c_char {
     match unsafe { queue(handle) } {
         Some(q) => q.label.as_ptr(),
         None => c"".as_ptr(),
+    }
+}
+
+/// `dispatch_suspend` of a queue.
+///
+/// The process's own queues ignore it, as Darwin's global queues do.
+pub(crate) fn suspend(handle: u64) {
+    // SAFETY: the guest holds a reference for the duration of the call.
+    let Some(q) = (unsafe { queue(handle) }) else {
+        return;
+    };
+    if q.header.is_global() {
+        return;
+    }
+    let mut state = q.state.lock().unwrap_or_else(|e| e.into_inner());
+    state.suspended = state.suspended.saturating_add(1);
+}
+
+/// `dispatch_resume` of a queue: the last one lets pending work start again.
+pub(crate) fn resume(handle: u64) {
+    // SAFETY: the guest holds a reference for the duration of the call.
+    let Some(q) = (unsafe { queue(handle) }) else {
+        return;
+    };
+    let restart = {
+        let mut state = q.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.suspended == 0 {
+            return;
+        }
+        state.suspended -= 1;
+        state.suspended == 0 && !state.pending.is_empty()
+    };
+    if !restart {
+        return;
+    }
+    if q.main {
+        wake_main();
+    } else {
+        schedule(handle);
     }
 }
 
@@ -649,6 +701,7 @@ struct Timer {
     deadline: u64,
     /// Breaks ties so that two timers with one deadline keep submission order.
     seq: u64,
+    /// Zero for a callback that runs on the timer thread itself; see [`arm_callback`].
     queue: u64,
     work: Work,
 }
@@ -728,6 +781,11 @@ fn timer_thread() {
         // one pass run in the order a caller would expect.
         due.sort_by_key(|t| (t.deadline, t.seq));
         for timer in due {
+            if timer.queue == 0 {
+                // SAFETY: a host function [`arm_callback`] was given, with its context.
+                unsafe { timer.work.run() };
+                continue;
+            }
             enqueue(timer.queue, timer.work);
             // SAFETY: the reference taken when the timer was armed.
             unsafe { object::release(timer.queue) };
@@ -746,6 +804,19 @@ fn arm(deadline: u64, handle: u64, work: Work) {
     }
     // SAFETY: the queue must outlive the wait, so the timer holds a reference.
     object::retain(handle);
+    push_timer(deadline, handle, work);
+}
+
+/// Call `f(context)` on the timer thread at `deadline`.
+///
+/// For a dispatch source, which decides what to submit when the deadline comes
+/// rather than when it is armed. `f` must be short and must not block: every
+/// other timer in the process waits behind it.
+pub(crate) fn arm_callback(deadline: u64, f: Function, context: u64) {
+    push_timer(deadline, 0, Work::Function(f, context));
+}
+
+fn push_timer(deadline: u64, handle: u64, work: Work) {
     start_timer_thread();
     let timers = timers();
     let mut state = timers.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -946,6 +1017,29 @@ mod tests {
         };
         std::thread::sleep(std::time::Duration::from_millis(10));
         assert_eq!(counter.load(Ordering::Acquire), 0, "fired early");
+        wait_for(&counter, 1);
+        // SAFETY: giving up the create reference.
+        unsafe { object::release(q) };
+    }
+
+    #[test]
+    fn a_suspended_queue_holds_its_work_until_resumed() {
+        let counter = AtomicU32::new(0);
+        let q = create_serial("suspend test");
+        // SAFETY: a live queue, a host function, and a counter that outlives the wait.
+        unsafe {
+            object::suspend_entry(q);
+            object::suspend_entry(q);
+            async_f(
+                q,
+                &counter as *const _ as u64,
+                bump as *const () as usize as u64,
+            );
+            object::resume_entry(q);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        assert_eq!(counter.load(Ordering::Acquire), 0, "ran while suspended");
+        unsafe { object::resume_entry(q) };
         wait_for(&counter, 1);
         // SAFETY: giving up the create reference.
         unsafe { object::release(q) };
