@@ -625,6 +625,7 @@ name = "coremedia"
 version = "0.4.1"
 dependencies = [
  "corefoundation",
+ "corevideo",
  "exports",
  "foundation",
  "objc",
@@ -649,6 +650,7 @@ dependencies = [
  "corefoundation",
  "darwin",
  "exports",
+ "iosurface",
  "objc",
  "sdl3",
 ]
@@ -3047,7 +3049,11 @@ version = "0.4.1"
 dependencies = [
  "corefoundation",
  "coremedia",
+ "corevideo",
  "exports",
+ "iosurface",
+ "libc",
+ "objc",
 ]
 
 [[package]]

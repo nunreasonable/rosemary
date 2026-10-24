@@ -1,5 +1,13 @@
+//! CoreVideo: the display link, and the pixel buffers decoded video and
+//! Metal textures are made of.
+
 #![allow(clippy::manual_dangling_ptr, clippy::missing_safety_doc)]
 #![allow(non_snake_case)]
+
+pub mod buffer;
+pub mod format;
+pub mod metaltexture;
+pub mod pixelbuffer;
 
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -362,12 +370,84 @@ exports::exports! {
         "CVDisplayLinkRelease" => CVDisplayLinkRelease,
         "CVDisplayLinkIsRunning" => CVDisplayLinkIsRunning,
     }
+    groups { buffer, pixelbuffer, metaltexture }
+}
+
+/// The keys and values a pixel buffer's attributes and attachments use, as
+/// `(Mach-O name, text)`. The texts are Apple's.
+const KEYS: &[(&str, &str)] = &[
+    ("_kCVPixelBufferPixelFormatTypeKey", "PixelFormatType"),
+    ("_kCVPixelBufferWidthKey", "Width"),
+    ("_kCVPixelBufferHeightKey", "Height"),
+    (
+        "_kCVPixelBufferIOSurfacePropertiesKey",
+        "IOSurfaceProperties",
+    ),
+    ("_kCVPixelBufferMetalCompatibilityKey", "MetalCompatibility"),
+    (
+        "_kCVPixelBufferCGImageCompatibilityKey",
+        "CGImageCompatibility",
+    ),
+    (
+        "_kCVPixelBufferCGBitmapContextCompatibilityKey",
+        "CGBitmapContextCompatibility",
+    ),
+    (
+        "_kCVPixelBufferBytesPerRowAlignmentKey",
+        "BytesPerRowAlignment",
+    ),
+    ("_kCVImageBufferYCbCrMatrixKey", "CVImageBufferYCbCrMatrix"),
+    (
+        "_kCVImageBufferColorPrimariesKey",
+        "CVImageBufferColorPrimaries",
+    ),
+    (
+        "_kCVImageBufferTransferFunctionKey",
+        "CVImageBufferTransferFunction",
+    ),
+    ("_kCVImageBufferYCbCrMatrix_ITU_R_709_2", "ITU_R_709_2"),
+    ("_kCVImageBufferYCbCrMatrix_ITU_R_601_4", "ITU_R_601_4"),
+    ("_kCVImageBufferYCbCrMatrix_ITU_R_2020", "ITU_R_2020"),
+    ("_kCVImageBufferColorPrimaries_ITU_R_709_2", "ITU_R_709_2"),
+    ("_kCVImageBufferColorPrimaries_EBU_3213", "EBU_3213"),
+    ("_kCVImageBufferColorPrimaries_SMPTE_C", "SMPTE_C"),
+    ("_kCVImageBufferColorPrimaries_ITU_R_2020", "ITU_R_2020"),
+    ("_kCVImageBufferTransferFunction_ITU_R_709_2", "ITU_R_709_2"),
+    (
+        "_kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ",
+        "SMPTE_ST_2084_PQ",
+    ),
+    (
+        "_kCVImageBufferTransferFunction_ITU_R_2100_HLG",
+        "ITU_R_2100_HLG",
+    ),
+];
+
+/// The data symbols this crate publishes.
+pub fn data_symbols() -> Vec<(String, u64)> {
+    corefoundation::bootstrap();
+    corefoundation::base::string_globals(KEYS)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A name answered twice is one a later row shadows without a word.
+    #[test]
+    fn no_name_is_exported_twice() {
+        let mut names = names();
+        let count = names.len();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), count);
+        let symbols = data_symbols();
+        let mut data: Vec<&str> = symbols.iter().map(|(n, _)| n.as_str()).collect();
+        data.sort_unstable();
+        data.dedup();
+        assert_eq!(data.len(), symbols.len());
+    }
 
     static FIRED: AtomicUsize = AtomicUsize::new(0);
     static SEEN_CONTEXT: AtomicUsize = AtomicUsize::new(0);

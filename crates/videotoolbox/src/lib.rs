@@ -1,18 +1,25 @@
 //! VideoToolbox: hardware and system video codecs behind decompression and
 //! compression sessions.
 //!
-//! There is no codec here - no hardware one, and no software one standing in
-//! for Apple's - so no session can be made. Each create says so the way
-//! VideoToolbox does on a machine without the codec,
-//! `kVTCouldNotFindVideoDecoderErr` or `kVTCouldNotFindVideoEncoderErr`,
-//! which is the answer a program already handles by decoding or encoding
-//! some other way. What a session would be configured with, the
-//! specification and property keys, is published so that building the
-//! request works.
+//! H.264 decompression sessions decode through the first backend that works
+//! on this host (FFmpeg over Vulkan Video, VA-API or CUDA, loaded at run
+//! time; see `backend`), and hand the callback pixel buffers in the format
+//! the attributes ask for. Where no backend works, and for every other codec
+//! and every compression session, create says so the way VideoToolbox does
+//! on a machine without the codec, `kVTCouldNotFindVideoDecoderErr` or
+//! `kVTCouldNotFindVideoEncoderErr`, which is the answer a program already
+//! handles by decoding or encoding some other way. What a session would be
+//! configured with, the specification and property keys, is published so
+//! that building the request works.
 
 #![allow(non_snake_case, clippy::missing_safety_doc)]
 
 use std::ffi::c_void;
+
+mod backend;
+mod bitstream;
+mod output;
+mod session;
 
 use corefoundation::base::CFTypeRef;
 
@@ -78,11 +85,6 @@ const KEYS: &[(&str, &str)] = &[
         "_kVTCompressionPropertyKey_UsingHardwareAcceleratedVideoEncoder",
         "UsingHardwareAcceleratedVideoEncoder",
     ),
-    ("_kVTDecompressionPropertyKey_RealTime", "RealTime"),
-    (
-        "_kVTDecompressionPropertyKey_UsingHardwareAcceleratedVideoDecoder",
-        "UsingHardwareAcceleratedVideoDecoder",
-    ),
     ("_kVTVideoEncoderList_CodecType", "CodecType"),
     ("_kVTVideoEncoderList_EncoderName", "EncoderName"),
     ("_kVTEncodeFrameOptionKey_ForceKeyFrame", "ForceKeyFrame"),
@@ -103,7 +105,9 @@ const KEYS: &[(&str, &str)] = &[
 /// The data symbols this crate publishes.
 pub fn data_symbols() -> Vec<(String, u64)> {
     corefoundation::bootstrap();
-    corefoundation::base::string_globals(KEYS)
+    let mut out = corefoundation::base::string_globals(KEYS);
+    out.extend(corefoundation::base::string_globals(session::KEYS));
+    out
 }
 
 /// `OSStatus VTDecompressionSessionCreate(CFAllocatorRef,
@@ -113,9 +117,9 @@ pub fn data_symbols() -> Vec<(String, u64)> {
 pub unsafe extern "C" fn VTDecompressionSessionCreate(
     _allocator: CFTypeRef,
     format: CFTypeRef,
-    _specification: CFTypeRef,
-    _attributes: CFTypeRef,
-    _callback: *const std::ffi::c_void,
+    specification: CFTypeRef,
+    attributes: CFTypeRef,
+    callback: *const session::CallbackRecord,
     out: *mut CFTypeRef,
 ) -> i32 {
     // SAFETY: null or an object a guest received from this runtime.
@@ -124,9 +128,8 @@ pub unsafe extern "C" fn VTDecompressionSessionCreate(
     if out.is_null() || !video {
         return PARAMETER_ERR;
     }
-    // SAFETY: the caller's out-parameter, checked above.
-    unsafe { out.write(std::ptr::null()) };
-    COULD_NOT_FIND_VIDEO_DECODER
+    // SAFETY: the caller's arguments, `out` checked above.
+    unsafe { session::create(format, specification, attributes, callback, out) }
 }
 
 /// `OSStatus VTCompressionSessionCreate(CFAllocatorRef, int32_t width,
@@ -155,48 +158,10 @@ pub unsafe extern "C" fn VTCompressionSessionCreate(
     COULD_NOT_FIND_VIDEO_ENCODER
 }
 
-/// `Boolean VTIsHardwareDecodeSupported(CMVideoCodecType)`: no codec is.
-pub extern "C" fn VTIsHardwareDecodeSupported(_codec: u32) -> u8 {
-    0
-}
-
-/// `Boolean VTDecompressionSessionCanAcceptFormatDescription(
-/// VTDecompressionSessionRef, CMFormatDescriptionRef)`: never, since a
-/// decompression session is never anything but null or foreign (no create
-/// above ever hands one out).
-pub extern "C" fn VTDecompressionSessionCanAcceptFormatDescription(
-    _session: CFTypeRef,
-    _new_format_description: CFTypeRef,
-) -> u8 {
-    0
-}
-
-/// `OSStatus VTDecompressionSessionDecodeFrame(VTDecompressionSessionRef,
-/// CMSampleBufferRef, VTDecodeFrameFlags, void *sourceFrameRefCon,
-/// VTDecodeInfoFlags *infoFlagsOut)`.
-pub unsafe extern "C" fn VTDecompressionSessionDecodeFrame(
-    _session: CFTypeRef,
-    _sample_buffer: CFTypeRef,
-    _decode_flags: u32,
-    _source_frame_ref_con: *mut c_void,
-    _info_flags_out: *mut u32,
-) -> i32 {
-    INVALID_SESSION_ERR
-}
-
-/// `OSStatus VTDecompressionSessionFinishDelayedFrames(VTDecompressionSessionRef)`.
-pub extern "C" fn VTDecompressionSessionFinishDelayedFrames(_session: CFTypeRef) -> i32 {
-    INVALID_SESSION_ERR
-}
-
-/// `void VTDecompressionSessionInvalidate(VTDecompressionSessionRef)`: nothing
-/// to invalidate.
-pub extern "C" fn VTDecompressionSessionInvalidate(_session: CFTypeRef) {}
-
-/// `OSStatus VTDecompressionSessionWaitForAsynchronousFrames(
-/// VTDecompressionSessionRef)`.
-pub extern "C" fn VTDecompressionSessionWaitForAsynchronousFrames(_session: CFTypeRef) -> i32 {
-    INVALID_SESSION_ERR
+/// `Boolean VTIsHardwareDecodeSupported(CMVideoCodecType)`: H.264 where a
+/// hardware backend works.
+pub extern "C" fn VTIsHardwareDecodeSupported(codec: u32) -> u8 {
+    u8::from(backend::Registry::global().hardware_supports(codec))
 }
 
 /// `CVPixelBufferPoolRef VTCompressionSessionGetPixelBufferPool(
@@ -290,40 +255,11 @@ pub unsafe extern "C" fn VTCopyVideoEncoderList(_options: CFTypeRef, out: *mut C
 /// supplemental decoder exists to register.
 pub extern "C" fn VTRegisterSupplementalVideoDecoderIfAvailable(_codec_type: u32) {}
 
-/// `OSStatus VTSessionCopyProperty(VTSessionRef, CFStringRef, CFAllocatorRef,
-/// void *propertyValueOut)`: `propertyValueOut` is left as the caller passed
-/// it.
-pub extern "C" fn VTSessionCopyProperty(
-    _session: CFTypeRef,
-    _property_key: CFTypeRef,
-    _allocator: CFTypeRef,
-    _property_value_out: *mut CFTypeRef,
-) -> i32 {
-    INVALID_SESSION_ERR
-}
-
-/// `OSStatus VTSessionSetProperty(VTSessionRef, CFStringRef, CFTypeRef)`.
-pub extern "C" fn VTSessionSetProperty(
-    _session: CFTypeRef,
-    _property_key: CFTypeRef,
-    _property_value: CFTypeRef,
-) -> i32 {
-    INVALID_SESSION_ERR
-}
-
 exports::exports! {
     functions {
         "VTDecompressionSessionCreate" => VTDecompressionSessionCreate,
         "VTCompressionSessionCreate" => VTCompressionSessionCreate,
         "VTIsHardwareDecodeSupported" => VTIsHardwareDecodeSupported,
-        "VTDecompressionSessionCanAcceptFormatDescription" =>
-            VTDecompressionSessionCanAcceptFormatDescription,
-        "VTDecompressionSessionDecodeFrame" => VTDecompressionSessionDecodeFrame,
-        "VTDecompressionSessionFinishDelayedFrames" =>
-            VTDecompressionSessionFinishDelayedFrames,
-        "VTDecompressionSessionInvalidate" => VTDecompressionSessionInvalidate,
-        "VTDecompressionSessionWaitForAsynchronousFrames" =>
-            VTDecompressionSessionWaitForAsynchronousFrames,
         "VTCompressionSessionGetPixelBufferPool" => VTCompressionSessionGetPixelBufferPool,
         "VTCompressionSessionInvalidate" => VTCompressionSessionInvalidate,
         "VTCompressionSessionPrepareToEncodeFrames" =>
@@ -333,9 +269,8 @@ exports::exports! {
         "VTCopyVideoEncoderList" => VTCopyVideoEncoderList,
         "VTRegisterSupplementalVideoDecoderIfAvailable" =>
             VTRegisterSupplementalVideoDecoderIfAvailable,
-        "VTSessionCopyProperty" => VTSessionCopyProperty,
-        "VTSessionSetProperty" => VTSessionSetProperty,
     }
+    groups { session }
 }
 
 #[cfg(test)]
@@ -380,7 +315,12 @@ mod tests {
             );
             corefoundation::api::CFRelease(format);
         }
-        assert_eq!(VTIsHardwareDecodeSupported(coremedia::CODEC_H264), 0);
+        assert_eq!(VTIsHardwareDecodeSupported(u32::from_be_bytes(*b"mp4v")), 0);
+        assert_eq!(VTIsHardwareDecodeSupported(u32::from_be_bytes(*b"hvc1")), 0);
+        assert_eq!(
+            VTIsHardwareDecodeSupported(coremedia::CODEC_H264),
+            u8::from(backend::Registry::global().hardware_supports(coremedia::CODEC_H264))
+        );
     }
 
     #[test]
@@ -408,48 +348,6 @@ mod tests {
     /// A foreign, non-null pointer: every one of these entry points only ever
     /// receives this or `NULL`, since nothing here ever hands out a session.
     const FOREIGN_SESSION: CFTypeRef = 0x1234 as CFTypeRef;
-
-    #[test]
-    fn a_decompression_session_can_never_accept_a_format() {
-        assert_eq!(
-            VTDecompressionSessionCanAcceptFormatDescription(FOREIGN_SESSION, std::ptr::null()),
-            0
-        );
-        assert_eq!(
-            VTDecompressionSessionCanAcceptFormatDescription(std::ptr::null(), std::ptr::null()),
-            0
-        );
-    }
-
-    #[test]
-    fn a_decompression_session_call_without_a_real_session_is_invalid() {
-        let mut info_flags = 0u32;
-        // SAFETY: a live out-parameter the call never actually writes.
-        unsafe {
-            assert_eq!(
-                VTDecompressionSessionDecodeFrame(
-                    FOREIGN_SESSION,
-                    std::ptr::null(),
-                    0,
-                    std::ptr::null_mut(),
-                    &mut info_flags,
-                ),
-                INVALID_SESSION_ERR
-            );
-        }
-        assert_eq!(
-            VTDecompressionSessionFinishDelayedFrames(FOREIGN_SESSION),
-            INVALID_SESSION_ERR
-        );
-        assert_eq!(
-            VTDecompressionSessionWaitForAsynchronousFrames(FOREIGN_SESSION),
-            INVALID_SESSION_ERR
-        );
-        // Invalidating is a no-op either way: nothing panics or reads through
-        // the foreign pointer.
-        VTDecompressionSessionInvalidate(FOREIGN_SESSION);
-        VTDecompressionSessionInvalidate(std::ptr::null());
-    }
 
     #[test]
     fn a_compression_session_call_without_a_real_session_is_invalid() {
@@ -505,23 +403,5 @@ mod tests {
         // Nothing to assert beyond "does not panic": there is no registry for
         // it to touch.
         VTRegisterSupplementalVideoDecoderIfAvailable(coremedia::CODEC_H264);
-    }
-
-    #[test]
-    fn session_properties_are_always_invalid() {
-        assert_eq!(
-            VTSessionSetProperty(FOREIGN_SESSION, std::ptr::null(), std::ptr::null()),
-            INVALID_SESSION_ERR
-        );
-        let mut value: CFTypeRef = 1 as CFTypeRef;
-        assert_eq!(
-            VTSessionCopyProperty(
-                FOREIGN_SESSION,
-                std::ptr::null(),
-                std::ptr::null(),
-                &mut value
-            ),
-            INVALID_SESSION_ERR
-        );
     }
 }

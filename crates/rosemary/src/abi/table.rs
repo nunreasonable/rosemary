@@ -3592,6 +3592,27 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("CVPixelBufferGetPixelFormatType", U32, P),
     sig!("CVPixelBufferPoolCreatePixelBuffer", I32, P, P, P),
     sig!("CVPixelBufferRelease", V, P),
+    sig!("CMBlockBufferReplaceDataBytes", I32, P, P, U64, U64),
+    sig!("CMBlockBufferGetDataLength", U64, P),
+    sig!("CMBlockBufferGetTypeID", U64),
+    sig!("CMSampleBufferGetTypeID", U64),
+    sig!("CVPixelBufferRetain", P, P),
+    sig!("CVPixelBufferGetDataSize", U64, P),
+    sig!("CVPixelBufferGetIOSurface", P, P),
+    sig!("CVPixelBufferGetPlaneCount", U64, P),
+    sig!("CVPixelBufferIsPlanar", BOOL, P),
+    sig!("CVPixelBufferGetTypeID", U64),
+    sig!("CVMetalTextureCacheFlush", V, P, U64),
+    sig!("CVMetalTextureCacheGetTypeID", U64),
+    sig!("CVMetalTextureGetTypeID", U64),
+    sig!("IOSurfaceGetPlaneCount", U64, P),
+    sig!("IOSurfaceGetWidthOfPlane", U64, P, U64),
+    sig!("IOSurfaceGetHeightOfPlane", U64, P, U64),
+    sig!("IOSurfaceGetBytesPerRowOfPlane", U64, P, U64),
+    sig!("IOSurfaceGetBytesPerElementOfPlane", U64, P, U64),
+    sig!("IOSurfaceGetElementWidthOfPlane", U64, P, U64),
+    sig!("IOSurfaceGetElementHeightOfPlane", U64, P, U64),
+    sig!("IOSurfaceGetBaseAddressOfPlane", P, P, U64),
     // VideoToolbox.
     cbsig!(
         [7],
@@ -3618,17 +3639,11 @@ pub static SIGNATURES: &[FunctionAbi] = &[
         P,
         P
     ),
-    // The fifth argument is `const VTDecompressionOutputCallbackRecord *`: a
-    // pointer to a two-word record holding a guest callback, not a callback
-    // in argument position itself - a plain `P` leaves it exactly that, a
-    // pointer this crate's own `VTDecompressionSessionCreate` never follows,
-    // because no session - and so no decoded frame to call it with - is ever
-    // made.
-    sig!("VTDecompressionSessionCreate", I32, P, P, P, P, P, P),
     sig!("VTDecompressionSessionDecodeFrame", I32, P, P, U32, P, P),
     sig!("VTDecompressionSessionFinishDelayedFrames", I32, P),
     sig!("VTDecompressionSessionInvalidate", V, P),
     sig!("VTDecompressionSessionWaitForAsynchronousFrames", I32, P),
+    sig!("VTDecompressionSessionGetTypeID", U64),
     sig!("VTIsHardwareDecodeSupported", BOOL, U32),
     sig!("VTRegisterSupplementalVideoDecoderIfAvailable", V, U32),
     sig!("VTSessionCopyProperty", I32, P, P, P, P),
@@ -4171,6 +4186,18 @@ pub static REFUSED: &[(&str, &str)] = &[
     // refused here rather than guessed at.
     ("VTCompressionSessionCompleteFrames", AGGREGATE),
     ("VTCompressionSessionEncodeFrame", AGGREGATE),
+    // `CMTime` is twenty-four bytes, passed and returned in memory; `CGSize`
+    // comes back in two SSE registers. On macOS `shims::coremedia` answers
+    // these before the table is asked.
+    ("CMTimeMake", AGGREGATE),
+    ("CMTimeGetSeconds", AGGREGATE),
+    ("CMSampleBufferGetPresentationTimeStamp", AGGREGATE),
+    ("CVImageBufferGetEncodedSize", AGGREGATE),
+    // On macOS `shims::coremedia` substitutes the record's callback first.
+    (
+        "VTDecompressionSessionCreate",
+        "its output callback record holds guest code the table cannot describe",
+    ),
     ("kCFTypeArrayCallBacks", DATA),
     ("kUTTagClassFilenameExtension", DATA),
     ("kUTTagClassMIMEType", DATA),

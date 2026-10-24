@@ -8,10 +8,14 @@
 //! store decides whether a buffer is still on screen and it must draw into
 //! another one.
 //!
-//! Planar surfaces (`kIOSurfacePlaneInfo`) are refused rather than laid out as
-//! one plane.
+//! `IOSurfaceCreate` refuses planar surfaces (`kIOSurfacePlaneInfo`) rather
+//! than laying them out as one plane. CoreVideo makes planar surfaces itself,
+//! with the plane layout it worked out, through `planes::create_planar`; the
+//! compositor does not show them.
 
 #![allow(non_snake_case, clippy::missing_safety_doc)]
+
+pub mod planes;
 
 use std::alloc::Layout;
 use std::ffi::c_void;
@@ -109,6 +113,8 @@ struct State {
     cpu_access: Mutex<CpuAccess>,
     /// `IOSurfaceSetValue`'s pairs, both retained.
     values: Mutex<Vec<(usize, usize)>>,
+    /// Empty for a surface that is not planar.
+    planes: Vec<planes::Plane>,
 }
 
 struct CpuAccess {
@@ -305,42 +311,43 @@ pub unsafe extern "C" fn IOSurfaceCreate(properties: CFTypeRef) -> CFTypeRef {
         return refuse(&format!("{alloc_size} bytes could not be allocated"));
     }
     let pixel_format = number(properties, PIXEL_FORMAT).map_or(0, |v| v as u32);
+    publish(State {
+        id: 0,
+        width,
+        height,
+        bytes_per_element,
+        bytes_per_row,
+        element_width,
+        element_height,
+        pixel_format,
+        offset,
+        alloc_size,
+        memory,
+        layout,
+        use_count: AtomicI32::new(0),
+        seed: AtomicU32::new(0),
+        cpu_access: Mutex::new(CpuAccess {
+            locks: 0,
+            writers: 0,
+            write_epoch: 0,
+            generation: Some(0),
+            identity: Arc::new(()),
+            cached: None,
+        }),
+        values: Mutex::new(Vec::new()),
+        planes: Vec::new(),
+    })
+}
 
+/// A new surface holding `state`, under a fresh `IOSurfaceID`.
+fn publish(mut state: State) -> CFTypeRef {
     static NEXT_ID: AtomicU32 = AtomicU32::new(1);
     let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+    state.id = id;
     // SAFETY: `Surface` is the registered layout.
     let surface = unsafe { corefoundation::base::allocate::<Surface>(class()) };
     // SAFETY: a fresh, zeroed allocation whose state is written once here.
-    unsafe {
-        std::ptr::write(
-            &mut (*surface).state,
-            State {
-                id,
-                width,
-                height,
-                bytes_per_element,
-                bytes_per_row,
-                element_width,
-                element_height,
-                pixel_format,
-                offset,
-                alloc_size,
-                memory,
-                layout,
-                use_count: AtomicI32::new(0),
-                seed: AtomicU32::new(0),
-                cpu_access: Mutex::new(CpuAccess {
-                    locks: 0,
-                    writers: 0,
-                    write_epoch: 0,
-                    generation: Some(0),
-                    identity: Arc::new(()),
-                    cached: None,
-                }),
-                values: Mutex::new(Vec::new()),
-            },
-        );
-    }
+    unsafe { std::ptr::write(&mut (*surface).state, state) };
     IDS.lock()
         .unwrap_or_else(|e| e.into_inner())
         .push((id, surface as usize));
@@ -623,8 +630,10 @@ pub struct Pixels {
 ///
 /// The pointer is valid for `bytes_per_row * height` bytes for as long as the
 /// caller holds a reference to `object`.
+///
+/// `None` for a planar surface too, which the compositor does not show.
 pub fn pixels(object: CFTypeRef) -> Option<Pixels> {
-    let state = state(object)?;
+    let state = state(object).filter(|s| s.planes.is_empty())?;
     Some(Pixels {
         width: state.width,
         height: state.height,
@@ -980,6 +989,7 @@ exports::exports! {
         "IOSurfaceGetPropertyAlignment" => IOSurfaceGetPropertyAlignment,
         "IOSurfaceGetPropertyMaximum" => IOSurfaceGetPropertyMaximum,
     }
+    groups { planes }
 }
 
 #[cfg(test)]
