@@ -168,19 +168,107 @@ pub unsafe extern "C" fn CGImageSourceCreateImageAtIndex(
     {
         return std::ptr::null();
     }
-    // SAFETY: checked above to be an `ImageSource` with a retained CFData.
+    // SAFETY: checked above to be an `ImageSource` with a retained source.
     let data = unsafe { (*(source as *const ImageSource)).data };
-    let length = unsafe { corefoundation::api::CFDataGetLength(data) };
-    let Ok(length) = usize::try_from(length) else {
-        return std::ptr::null();
-    };
-    let bytes = unsafe { corefoundation::api::CFDataGetBytePtr(data) };
-    if bytes.is_null() {
+    source_bytes(data)
+        .and_then(crate::raster::decode)
+        .map_or(std::ptr::null(), image_from_bitmap)
+}
+
+/// Makes an ImageIO source over an already-decoded data provider, such as a
+/// `CGDataProvider` a guest built from its own in-memory bytes.
+pub unsafe extern "C" fn CGImageSourceCreateWithDataProvider(
+    provider: CFTypeRef,
+    _options: CFTypeRef,
+) -> CFTypeRef {
+    if provider_bytes(provider).is_none() {
         return std::ptr::null();
     }
+    let class = objc::class::lookup(c"__CGImageSource").expect("installed during bootstrap");
+    // SAFETY: `ImageSource` is the registered class layout and `provider` was
+    // checked above to be one of this runtime's data providers.
+    let source = unsafe { corefoundation::base::allocate::<ImageSource>(class) };
+    unsafe {
+        (*source).data = corefoundation::api::CFRetain(provider);
+    }
+    source as CFTypeRef
+}
+
+/// The encoded bytes behind a source, whether it was made over a `CFData` or
+/// a `CGDataProvider`.
+fn source_bytes(data: CFTypeRef) -> Option<&'static [u8]> {
+    if let Some(bytes) = provider_bytes(data) {
+        return Some(bytes);
+    }
+    let bytes = unsafe { corefoundation::api::CFDataGetBytePtr(data) };
+    if bytes.is_null() {
+        return None;
+    }
+    let length = unsafe { corefoundation::api::CFDataGetLength(data) };
+    let length = usize::try_from(length).ok()?;
     // SAFETY: the CFData owns at least `length` readable bytes.
-    let encoded = unsafe { std::slice::from_raw_parts(bytes, length) };
-    crate::raster::decode(encoded).map_or(std::ptr::null(), image_from_bitmap)
+    Some(unsafe { std::slice::from_raw_parts(bytes, length) })
+}
+
+/// `CFDictionaryRef CGImageSourceCopyPropertiesAtIndex(CGImageSourceRef,
+/// size_t, CFDictionaryRef)`.
+///
+/// FIXME (ACCURACY): decoding does not keep the source format's metadata, so
+/// `HasAlpha` reports whether the decoded buffer has a transparent pixel
+/// rather than the format's alpha capability, and `Orientation` is always
+/// "up" because EXIF orientation is not parsed.
+pub unsafe extern "C" fn CGImageSourceCopyPropertiesAtIndex(
+    source: CFTypeRef,
+    index: usize,
+    _options: CFTypeRef,
+) -> CFTypeRef {
+    let class = objc::class::lookup(c"__CGImageSource").expect("installed during bootstrap");
+    // SAFETY: null or an object supplied by the guest.
+    if index != 0 || source.is_null() || !unsafe { corefoundation::base::is_kind_of(source, class) }
+    {
+        return std::ptr::null();
+    }
+    // SAFETY: checked above to be an `ImageSource`.
+    let data = unsafe { (*(source as *const ImageSource)).data };
+    let Some(bitmap) = source_bytes(data).and_then(crate::raster::decode) else {
+        return std::ptr::null();
+    };
+    let has_alpha = bitmap.pixels.chunks_exact(4).any(|p| p[3] != 255);
+    let width = corefoundation::collections::new_number(
+        corefoundation::collections::Number::Integer(bitmap.width.into()),
+    );
+    let height = corefoundation::collections::new_number(
+        corefoundation::collections::Number::Integer(bitmap.height.into()),
+    );
+    let orientation =
+        corefoundation::collections::new_number(corefoundation::collections::Number::Integer(1));
+    let properties = corefoundation::collections::new_dictionary(
+        &[
+            (property_key("PixelWidth"), width),
+            (property_key("PixelHeight"), height),
+            (
+                property_key("HasAlpha"),
+                corefoundation::collections::boolean(has_alpha),
+            ),
+            (property_key("Orientation"), orientation),
+        ],
+        corefoundation::callbacks::Policy::from_type_callbacks(),
+        corefoundation::callbacks::Policy::from_type_callbacks(),
+        false,
+    );
+    // SAFETY: fresh numbers this call made; `new_dictionary` retained its own.
+    unsafe {
+        corefoundation::api::CFRelease(width);
+        corefoundation::api::CFRelease(height);
+        corefoundation::api::CFRelease(orientation);
+    }
+    properties
+}
+
+/// The canonical, immortal `kCGImageProperty...` key named `name`, matching
+/// the one published as a data symbol in `crate::STRING_GLOBALS`.
+fn property_key(name: &'static str) -> CFTypeRef {
+    corefoundation::base::interned_name(name) as usize as CFTypeRef
 }
 
 /// The bytes a data provider of this runtime's serves, or `None` for anything
@@ -736,6 +824,13 @@ pub unsafe extern "C" fn CGColorSpaceRelease(space: CFTypeRef) {
     }
 }
 
+pub unsafe extern "C" fn CGColorSpaceRetain(space: CFTypeRef) -> CFTypeRef {
+    if space.is_null() {
+        return space;
+    }
+    unsafe { corefoundation::api::CFRetain(space) }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -770,6 +865,52 @@ mod tests {
             assert_eq!((CGImageGetWidth(image), CGImageGetHeight(image)), (1, 1));
             assert!(!CGImageGetColorSpace(image).is_null());
             CGImageRelease(image);
+            corefoundation::api::CFRelease(source);
+        }
+    }
+
+    #[test]
+    fn a_source_over_a_data_provider_reports_its_properties() {
+        crate::bootstrap();
+        // The same one-pixel, opaque BMP as above, reached through a data
+        // provider rather than a `CFData`.
+        let mut bmp = vec![0u8; 58];
+        bmp[0..2].copy_from_slice(b"BM");
+        bmp[2..6].copy_from_slice(&58u32.to_le_bytes());
+        bmp[10..14].copy_from_slice(&54u32.to_le_bytes());
+        bmp[14..18].copy_from_slice(&40u32.to_le_bytes());
+        bmp[18..22].copy_from_slice(&1u32.to_le_bytes());
+        bmp[22..26].copy_from_slice(&1u32.to_le_bytes());
+        bmp[26..28].copy_from_slice(&1u16.to_le_bytes());
+        bmp[28..30].copy_from_slice(&24u16.to_le_bytes());
+        bmp[54..58].copy_from_slice(&[0, 0, 255, 0]);
+        // SAFETY: every object remains live until its matching release.
+        unsafe {
+            let provider = CGDataProviderCreateWithData(
+                std::ptr::null_mut(),
+                bmp.as_ptr().cast(),
+                bmp.len(),
+                None,
+            );
+            let source = CGImageSourceCreateWithDataProvider(provider, std::ptr::null());
+            CGDataProviderRelease(provider);
+            assert!(!source.is_null());
+            let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, std::ptr::null());
+            assert!(!properties.is_null());
+            let number_at = |key: &'static str| -> i64 {
+                let value =
+                    corefoundation::api::CFDictionaryGetValue(properties, property_key(key));
+                let mut out = 0i64;
+                corefoundation::api::CFNumberGetValue(
+                    value,
+                    corefoundation::collections::number_type::SINT64,
+                    (&raw mut out).cast(),
+                );
+                out
+            };
+            assert_eq!(number_at("PixelWidth"), 1);
+            assert_eq!(number_at("PixelHeight"), 1);
+            corefoundation::api::CFRelease(properties);
             corefoundation::api::CFRelease(source);
         }
     }
