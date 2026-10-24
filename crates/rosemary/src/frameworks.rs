@@ -136,7 +136,7 @@ static FRAMEWORKS: &[Framework] = &[
         version: 'A',
         umbrellas: &[],
         provide: Some(corevideo::provide),
-        data: None,
+        data: Some(corevideo::data_symbols),
         symbol: Some(corevideo::symbol),
     },
     Framework {
@@ -362,11 +362,8 @@ const MEDIA_CONSTANTS: &[(&str, &str)] = &[
     ("_AVMediaTypeVideo", "vide"),
     ("_AVMediaTypeAudio", "soun"),
     ("_AVMediaTypeText", "text"),
-    // Pixel buffer attribute keys, which SDL's camera puts in an AVFoundation
-    // settings dictionary.
-    ("_kCVPixelBufferPixelFormatTypeKey", "PixelFormatType"),
-    ("_kCVPixelBufferWidthKey", "Width"),
-    ("_kCVPixelBufferHeightKey", "Height"),
+    // The pixel buffer attribute keys SDL's camera puts in an AVFoundation
+    // settings dictionary are CoreVideo's, which publishes them.
 ];
 
 fn media_constants() -> Vec<(String, u64)> {

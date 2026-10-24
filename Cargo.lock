@@ -635,6 +635,7 @@ dependencies = [
  "corefoundation",
  "darwin",
  "exports",
+ "iosurface",
  "objc",
  "sdl3",
 ]
