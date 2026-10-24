@@ -1,7 +1,11 @@
-//! The few FFmpeg structure fields this backend touches, by offset, and the
+//! The FFmpeg structure fields this tree touches, by offset, and the
 //! constants it needs. They are libavcodec 62 / libavutil 60's (FFmpeg 8);
 //! [`super::api`] refuses any other major version rather than guess, and the
 //! test below checks the numbers against the installed headers.
+//!
+//! Shared by `videotoolbox` (H.264 through a hardware device context) and
+//! `coreaudio` (AAC through the software decoder): one set of offsets into
+//! `AVCodecContext`, `AVPacket` and `AVFrame`, derived once.
 
 use std::ffi::c_void;
 
@@ -12,8 +16,24 @@ pub const AVUTIL_MAJOR: u32 = 60;
 /// `AVCodecContext`.
 pub mod context {
     pub const OPAQUE: usize = 48;
+    pub const EXTRADATA: usize = 72;
+    pub const EXTRADATA_SIZE: usize = 80;
     pub const GET_FORMAT: usize = 192;
+    /// `AVCodecContext.sample_rate`, audio only.
+    pub const SAMPLE_RATE: usize = 344;
+    /// `AVCodecContext.ch_layout`, an `AVChannelLayout` (see [`super::ch_layout`]).
+    pub const CH_LAYOUT: usize = 352;
     pub const HW_DEVICE_CTX: usize = 560;
+}
+
+/// `AVChannelLayout`, offsets from the start of the structure (so from
+/// `context::CH_LAYOUT` for the one embedded in `AVCodecContext`).
+///
+/// It is `{ enum AVChannelOrder order; int nb_channels; union { uint64_t
+/// mask; AVChannelCustom *map; } u; void *opaque; }` - 24 bytes, not 16: the
+/// trailing `opaque` is easy to miss reading the header once.
+pub mod ch_layout {
+    pub const NB_CHANNELS: usize = 4;
 }
 
 /// `AVPacket`.
@@ -27,9 +47,14 @@ pub mod packet {
 pub mod frame {
     pub const DATA: usize = 0;
     pub const LINESIZE: usize = 64;
+    pub const EXTENDED_DATA: usize = 96;
     pub const WIDTH: usize = 104;
     pub const HEIGHT: usize = 108;
+    /// Both `enum AVPixelFormat` (video) and `enum AVSampleFormat` (audio):
+    /// the same field, read as whichever the stream is.
     pub const FORMAT: usize = 116;
+    /// Audio only: samples per channel in this frame.
+    pub const NB_SAMPLES: usize = 112;
     pub const PTS: usize = 136;
     pub const COLOR_RANGE: usize = 280;
     pub const COLOR_PRIMARIES: usize = 284;
@@ -52,6 +77,8 @@ pub const METHOD_HW_DEVICE_CTX: i32 = 1;
 pub const PIX_FMT_NONE: i32 = -1;
 /// `AV_HWDEVICE_TYPE_NONE`.
 pub const HWDEVICE_TYPE_NONE: i32 = 0;
+/// `AV_SAMPLE_FMT_NONE`.
+pub const SAMPLE_FMT_NONE: i32 = -1;
 /// `AVERROR(EAGAIN)`, `AVERROR_EOF` and `AVERROR_INVALIDDATA`.
 pub const EAGAIN: i32 = -11;
 pub const EOF: i32 = -541478725;
@@ -61,6 +88,11 @@ pub const RANGE_MPEG: i32 = 1;
 pub const RANGE_JPEG: i32 = 2;
 /// `AV_LOG_ERROR`.
 pub const LOG_ERROR: i32 = 16;
+/// `AV_INPUT_BUFFER_PADDING_SIZE`: a compressed buffer FFmpeg reads (such as
+/// `AVCodecContext.extradata`) must be allocated this many bytes larger than
+/// its real size, zeroed, so the decoder's bit reader can overrun into the
+/// padding instead of past the allocation.
+pub const INPUT_BUFFER_PADDING_SIZE: usize = 64;
 
 /// The field of type `T` at `offset` in the structure at `base`.
 ///
@@ -91,7 +123,18 @@ mod tests {
     fn expected() -> Vec<(&'static str, i64)> {
         vec![
             ("AVCodecContext.opaque", context::OPAQUE as i64),
+            ("AVCodecContext.extradata", context::EXTRADATA as i64),
+            (
+                "AVCodecContext.extradata_size",
+                context::EXTRADATA_SIZE as i64,
+            ),
             ("AVCodecContext.get_format", context::GET_FORMAT as i64),
+            ("AVCodecContext.sample_rate", context::SAMPLE_RATE as i64),
+            ("AVCodecContext.ch_layout", context::CH_LAYOUT as i64),
+            (
+                "AVChannelLayout.nb_channels",
+                ch_layout::NB_CHANNELS as i64,
+            ),
             (
                 "AVCodecContext.hw_device_ctx",
                 context::HW_DEVICE_CTX as i64,
@@ -101,8 +144,10 @@ mod tests {
             ("AVPacket.size", packet::SIZE as i64),
             ("AVFrame.data", frame::DATA as i64),
             ("AVFrame.linesize", frame::LINESIZE as i64),
+            ("AVFrame.extended_data", frame::EXTENDED_DATA as i64),
             ("AVFrame.width", frame::WIDTH as i64),
             ("AVFrame.height", frame::HEIGHT as i64),
+            ("AVFrame.nb_samples", frame::NB_SAMPLES as i64),
             ("AVFrame.format", frame::FORMAT as i64),
             ("AVFrame.pts", frame::PTS as i64),
             ("AVFrame.color_range", frame::COLOR_RANGE as i64),
@@ -117,12 +162,17 @@ mod tests {
             ("METHOD_HW_DEVICE_CTX", METHOD_HW_DEVICE_CTX as i64),
             ("PIX_FMT_NONE", PIX_FMT_NONE as i64),
             ("HWDEVICE_TYPE_NONE", HWDEVICE_TYPE_NONE as i64),
+            ("SAMPLE_FMT_NONE", SAMPLE_FMT_NONE as i64),
             ("EAGAIN", EAGAIN as i64),
             ("EOF", EOF as i64),
             ("INVALIDDATA", INVALIDDATA as i64),
             ("RANGE_MPEG", RANGE_MPEG as i64),
             ("RANGE_JPEG", RANGE_JPEG as i64),
             ("LOG_ERROR", LOG_ERROR as i64),
+            (
+                "INPUT_BUFFER_PADDING_SIZE",
+                INPUT_BUFFER_PADDING_SIZE as i64,
+            ),
             ("AVCODEC_MAJOR", AVCODEC_MAJOR as i64),
             ("AVUTIL_MAJOR", AVUTIL_MAJOR as i64),
         ]
@@ -133,23 +183,31 @@ mod tests {
 #include <stdio.h>
 #include <libavcodec/avcodec.h>
 #include <libavutil/frame.h>
+#include <libavutil/channel_layout.h>
 #include <libavutil/hwcontext.h>
+#include <libavutil/samplefmt.h>
 #include <libavutil/log.h>
 #define O(t, f) printf(#t "." #f " %lld\n", (long long)offsetof(t, f))
 #define V(n, v) printf(n " %lld\n", (long long)(v))
 int main(void) {
-    O(AVCodecContext, opaque); O(AVCodecContext, get_format); O(AVCodecContext, hw_device_ctx);
+    O(AVCodecContext, opaque); O(AVCodecContext, extradata); O(AVCodecContext, extradata_size);
+    O(AVCodecContext, get_format); O(AVCodecContext, sample_rate); O(AVCodecContext, ch_layout);
+    O(AVChannelLayout, nb_channels);
+    O(AVCodecContext, hw_device_ctx);
     O(AVPacket, pts); O(AVPacket, data); O(AVPacket, size);
-    O(AVFrame, data); O(AVFrame, linesize); O(AVFrame, width); O(AVFrame, height);
+    O(AVFrame, data); O(AVFrame, linesize); O(AVFrame, extended_data);
+    O(AVFrame, width); O(AVFrame, height); O(AVFrame, nb_samples);
     O(AVFrame, format); O(AVFrame, pts); O(AVFrame, color_range); O(AVFrame, color_primaries);
     O(AVFrame, color_trc); O(AVFrame, colorspace); O(AVFrame, crop_top); O(AVFrame, crop_left);
     O(AVCodecHWConfig, pix_fmt); O(AVCodecHWConfig, methods); O(AVCodecHWConfig, device_type);
     V("METHOD_HW_DEVICE_CTX", AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX);
     V("PIX_FMT_NONE", AV_PIX_FMT_NONE);
     V("HWDEVICE_TYPE_NONE", AV_HWDEVICE_TYPE_NONE);
+    V("SAMPLE_FMT_NONE", AV_SAMPLE_FMT_NONE);
     V("EAGAIN", AVERROR(EAGAIN)); V("EOF", AVERROR_EOF); V("INVALIDDATA", AVERROR_INVALIDDATA);
     V("RANGE_MPEG", AVCOL_RANGE_MPEG); V("RANGE_JPEG", AVCOL_RANGE_JPEG);
     V("LOG_ERROR", AV_LOG_ERROR);
+    V("INPUT_BUFFER_PADDING_SIZE", AV_INPUT_BUFFER_PADDING_SIZE);
     V("AVCODEC_MAJOR", LIBAVCODEC_VERSION_MAJOR); V("AVUTIL_MAJOR", LIBAVUTIL_VERSION_MAJOR);
     return 0;
 }

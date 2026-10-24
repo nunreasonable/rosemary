@@ -1,8 +1,8 @@
 //! libavcodec and libavutil, loaded when first needed.
 //!
 //! Never linked: a host without FFmpeg, or with another major version than
-//! the one [`super::abi`] describes, has no FFmpeg backends and decodes
-//! nothing, which is what it did before there were any.
+//! the one [`super::abi`] describes, decodes nothing through it, which is
+//! what happened before there was an FFmpeg backend at all.
 
 use std::ffi::{CStr, c_char, c_int, c_void};
 use std::sync::OnceLock;
@@ -174,7 +174,8 @@ impl Api {
     }
 }
 
-/// The host's FFmpeg 8, or why it cannot be used.
+/// The host's FFmpeg 8, shared by every backend that wants it - loaded once
+/// per process regardless of how many ask.
 pub fn global() -> Result<&'static Api, &'static str> {
     static API: OnceLock<Result<Api, String>> = OnceLock::new();
     API.get_or_init(|| Api::load(c"libavcodec.so.62", c"libavutil.so.60"))
@@ -183,7 +184,7 @@ pub fn global() -> Result<&'static Api, &'static str> {
 }
 
 /// A library that is never there, for the test that a missing FFmpeg
-/// leaves the backends unavailable.
+/// leaves a backend unavailable.
 #[cfg(test)]
 pub fn bogus() -> Result<&'static Api, &'static str> {
     static API: OnceLock<Result<Api, String>> = OnceLock::new();

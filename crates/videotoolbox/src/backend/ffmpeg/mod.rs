@@ -6,14 +6,13 @@
 //! backend that quietly decodes on the CPU is not what was asked for), and
 //! copies each picture back to main memory as NV12.
 
-pub(crate) mod abi;
-pub(crate) mod api;
-
 use std::ffi::{CString, c_int, c_void};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use self::api::Api;
+use ffmpeg::abi;
+use ffmpeg::api::{self, Api};
+
 use super::{
     AccessUnit, Backend, Colour, DecodeError, Decoder, Picture, Planes, StreamConfig, check_stream,
 };

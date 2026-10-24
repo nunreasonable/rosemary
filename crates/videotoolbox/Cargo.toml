@@ -13,3 +13,4 @@ corevideo.workspace = true
 iosurface.workspace = true
 objc.workspace = true
 libc.workspace = true
+ffmpeg.workspace = true
