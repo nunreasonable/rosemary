@@ -3619,6 +3619,7 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("VTDecompressionSessionFinishDelayedFrames", I32, P),
     sig!("VTDecompressionSessionInvalidate", V, P),
     sig!("VTDecompressionSessionWaitForAsynchronousFrames", I32, P),
+    sig!("VTDecompressionSessionGetTypeID", U64),
     sig!("VTIsHardwareDecodeSupported", BOOL, U32),
     sig!("VTRegisterSupplementalVideoDecoderIfAvailable", V, U32),
     sig!("VTSessionCopyProperty", I32, P, P, P, P),
@@ -4115,6 +4116,11 @@ pub static REFUSED: &[(&str, &str)] = &[
     ("CMTimeGetSeconds", AGGREGATE),
     ("CMSampleBufferGetPresentationTimeStamp", AGGREGATE),
     ("CVImageBufferGetEncodedSize", AGGREGATE),
+    // On macOS `shims::coremedia` substitutes the record's callback first.
+    (
+        "VTDecompressionSessionCreate",
+        "its output callback record holds guest code the table cannot describe",
+    ),
     ("kCFTypeArrayCallBacks", DATA),
     ("kUTTagClassFilenameExtension", DATA),
     ("kUTTagClassMIMEType", DATA),
