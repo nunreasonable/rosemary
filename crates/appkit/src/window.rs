@@ -98,6 +98,13 @@ pub struct Window {
     /// When this window was last ordered front, from [`ORDERED`]: the stacking
     /// order, which creation order is not.
     ordered: u64,
+    /// `-setExcludedFromWindowsMenu:`. Nothing here builds a Windows menu to
+    /// leave the window out of; stored only so a program's own read-back
+    /// agrees with what it set.
+    excluded_from_windows_menu: usize,
+    /// `-setDisplaysWhenScreenProfileChanges:`. Nothing here redraws for a
+    /// profile change SDL never reports; stored for the same reason.
+    displays_when_screen_profile_changes: usize,
 }
 
 pub const INSTANCE_SIZE: usize = size_of::<Window>();
@@ -2313,6 +2320,29 @@ unsafe extern "C" fn set_hides_on_deactivate(receiver: Id, _sel: Sel, value: u8)
     window_of(receiver).hides_on_deactivate = value as usize;
 }
 
+unsafe extern "C" fn is_excluded_from_windows_menu(receiver: Id, _sel: Sel) -> u8 {
+    (window_of(receiver).excluded_from_windows_menu != 0) as u8
+}
+
+unsafe extern "C" fn set_excluded_from_windows_menu(receiver: Id, _sel: Sel, value: u8) {
+    window_of(receiver).excluded_from_windows_menu = value as usize;
+}
+
+unsafe extern "C" fn displays_when_screen_profile_changes(receiver: Id, _sel: Sel) -> u8 {
+    (window_of(receiver).displays_when_screen_profile_changes != 0) as u8
+}
+
+unsafe extern "C" fn set_displays_when_screen_profile_changes(receiver: Id, _sel: Sel, value: u8) {
+    window_of(receiver).displays_when_screen_profile_changes = value as usize;
+}
+
+/// `-currentEvent`, deprecated on `NSWindow` in favour of `NSApp`'s, and
+/// documented to answer the same thing: the event inside the application's
+/// `-sendEvent:`, or nil outside it.
+unsafe extern "C" fn window_current_event(_receiver: Id, _sel: Sel) -> Id {
+    crate::application::current_event_value()
+}
+
 unsafe extern "C" fn is_key_window(receiver: Id, _sel: Sel) -> u8 {
     (key_window() == receiver) as u8
 }
@@ -3410,6 +3440,11 @@ pub(crate) fn install() {
         "setOpaque:" => ignored_flag, c"v20@0:8c16";
         "setHidesOnDeactivate:" => set_hides_on_deactivate, c"v20@0:8c16";
         "hidesOnDeactivate" => hides_on_deactivate, c"c16@0:8";
+        "setExcludedFromWindowsMenu:" => set_excluded_from_windows_menu, c"v20@0:8c16";
+        "isExcludedFromWindowsMenu" => is_excluded_from_windows_menu, c"c16@0:8";
+        "setDisplaysWhenScreenProfileChanges:" => set_displays_when_screen_profile_changes, c"v20@0:8c16";
+        "displaysWhenScreenProfileChanges" => displays_when_screen_profile_changes, c"c16@0:8";
+        "currentEvent" => window_current_event, c"@16@0:8";
         "orderBack:" => ignored_object, c"v24@0:8@16";
         "occlusionState" => visible_occlusion, c"Q16@0:8";
         "setToolbar:" => ignored_object, c"v24@0:8@16";
@@ -3642,6 +3677,91 @@ mod tests {
             assert_eq!(shows_toolbar_button(window, get), 1);
         }
         objc::arc::release(window);
+    }
+
+    /// Two more flags with no behaviour behind them: a program's read-back
+    /// must agree with what it set, which is the whole of their contract.
+    #[test]
+    fn a_window_keeps_its_windows_menu_and_profile_flags() {
+        crate::bootstrap();
+        let window =
+            objc::object::create_instance(objc::class::lookup(c"NSWindow").expect("NSWindow"), 0);
+        // SAFETY: each is the accessor its selector declares.
+        unsafe {
+            let (get, set) = (
+                objc::sel::get("isExcludedFromWindowsMenu"),
+                objc::sel::get("setExcludedFromWindowsMenu:"),
+            );
+            assert_eq!(is_excluded_from_windows_menu(window, get), 0);
+            set_excluded_from_windows_menu(window, set, 1);
+            assert_eq!(is_excluded_from_windows_menu(window, get), 1);
+
+            let (get, set) = (
+                objc::sel::get("displaysWhenScreenProfileChanges"),
+                objc::sel::get("setDisplaysWhenScreenProfileChanges:"),
+            );
+            assert_eq!(displays_when_screen_profile_changes(window, get), 0);
+            set_displays_when_screen_profile_changes(window, set, 1);
+            assert_eq!(displays_when_screen_profile_changes(window, get), 1);
+        }
+        objc::arc::release(window);
+    }
+
+    /// `-[NSWindow currentEvent]` is deprecated in favour of `NSApp`'s, and
+    /// Apple's docs say it answers the same thing: non-nil only for the
+    /// duration of the application's own `-sendEvent:`, and the very event
+    /// passing through it.
+    #[test]
+    fn a_windows_current_event_is_the_applications() {
+        crate::bootstrap();
+        let window =
+            objc::object::create_instance(objc::class::lookup(c"NSWindow").expect("NSWindow"), 0);
+        let get = objc::sel::get("currentEvent");
+        // SAFETY: outside any `-sendEvent:`, there is none to answer.
+        unsafe {
+            assert!(window_current_event(window, get).is_null());
+        }
+
+        static SEEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        unsafe extern "C" fn record(_receiver: Id, _sel: Sel, _event: Id) {
+            let window = objc::object::create_instance(
+                objc::class::lookup(c"NSWindow").expect("NSWindow"),
+                0,
+            );
+            // SAFETY: `-currentEvent` is `id (id, SEL)`.
+            let seen = unsafe { window_current_event(window, objc::sel::get("currentEvent")) };
+            SEEN.store(seen as usize, std::sync::atomic::Ordering::SeqCst);
+            objc::arc::release(window);
+        }
+        let class = corefoundation::base::register(
+            c"RosemaryTestCurrentEventWindowApplication",
+            objc::class::lookup(c"NSApplication"),
+            crate::application::INSTANCE_SIZE,
+            false,
+        );
+        class.add_method(
+            objc::sel::get("sendEvent:"),
+            record as *const std::ffi::c_void,
+            c"v24@0:8@16",
+        );
+        let app = objc::object::create_instance(class, 0);
+        let event = crate::nsevent::make(crate::nsevent::Fields {
+            kind: crate::nsevent::kind::KEY_DOWN,
+            ..Default::default()
+        });
+        // SAFETY: a live application and the event it is about to send.
+        unsafe { crate::application::send_event_through(app, event) };
+        assert_eq!(
+            SEEN.load(std::sync::atomic::Ordering::SeqCst) as Id,
+            event,
+            "seen while sending"
+        );
+        // SAFETY: outside any `-sendEvent:` again, once it has returned.
+        unsafe {
+            assert!(window_current_event(window, get).is_null());
+        }
+        objc::arc::release(window);
+        objc::arc::release(app);
     }
 
     /// An immovable window refuses the drag, and a window with no SDL window

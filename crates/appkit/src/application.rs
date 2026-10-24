@@ -701,6 +701,21 @@ unsafe extern "C" fn windows(_receiver: Id, _sel: Sel) -> Id {
     unsafe { corefoundation::api::CFAutorelease(array) as Id }
 }
 
+/// `-orderedWindows`: this application's windows, frontmost first.
+unsafe extern "C" fn ordered_windows(_receiver: Id, _sel: Sel) -> Id {
+    let objects: Vec<corefoundation::base::CFTypeRef> = crate::window::front_to_back()
+        .into_iter()
+        .map(|w| w as corefoundation::base::CFTypeRef)
+        .collect();
+    let array = corefoundation::collections::new_array(
+        &objects,
+        corefoundation::callbacks::Policy::from_type_callbacks(),
+        false,
+    );
+    // SAFETY: a fresh array.
+    unsafe { corefoundation::api::CFAutorelease(array) as Id }
+}
+
 unsafe extern "C" fn enumerate_windows(_receiver: Id, _sel: Sel, options: u64, block: Id) {
     // SAFETY: `void (^)(NSWindow *, BOOL *)`, as the selector declares.
     let Some(invoke) = (unsafe { crate::animation::invoke(block) }) else {
@@ -829,8 +844,52 @@ pub(crate) unsafe fn send_event_through(receiver: Id, event: Id) {
     CURRENT_EVENT.store(outer, Ordering::Release);
 }
 
+/// `-discardEventsMatchingMask:beforeEvent:`: drop every queued event
+/// matching `mask` that precedes `last_event`, or every matching one in the
+/// queue if it is nil.
+///
+/// FIXME (ACCURACY): this only reaches `POSTED_EVENTS`, the queue
+/// `-nextEventMatchingMask:` already draws from. Window-system input that
+/// `event::pump` delivers straight to its window, documented above
+/// `next_event`, never sits in that queue and so cannot be discarded from it.
+unsafe extern "C" fn discard_events_matching_mask(
+    _receiver: Id,
+    _sel: Sel,
+    mask: u64,
+    last_event: Id,
+) {
+    let mut queue = posted_events();
+    // Events at or after `last_event` are untouched; those before it shift
+    // left as matches ahead of them are removed, so the limit shrinks with them.
+    let mut limit = match last_event.is_null() {
+        true => queue.len(),
+        false => queue
+            .iter()
+            .position(|event| *event as Id == last_event)
+            .unwrap_or(queue.len()),
+    };
+    let mut i = 0;
+    while i < limit {
+        if event_matches_mask(queue[i] as Id, mask) {
+            let event = queue.remove(i).expect("index in range") as Id;
+            objc::arc::release(event);
+            limit -= 1;
+        } else {
+            i += 1;
+        }
+    }
+}
+
 /// `-currentEvent`, the event inside `-sendEvent:`, and nil outside it.
 unsafe extern "C" fn current_event(_receiver: Id, _sel: Sel) -> Id {
+    current_event_value()
+}
+
+/// The event inside the application's `-sendEvent:`, and nil outside it.
+///
+/// Shared with `NSWindow`'s own deprecated `-currentEvent`, which Apple's docs
+/// say answers `NSApp`'s current event rather than keeping one of its own.
+pub(crate) fn current_event_value() -> Id {
     CURRENT_EVENT.load(Ordering::Acquire) as Id
 }
 
@@ -1123,6 +1182,7 @@ pub(crate) fn install() {
         "setPresentationOptions:" => set_presentation_options, c"v24@0:8Q16";
         "nextEventMatchingMask:untilDate:inMode:dequeue:" => next_event, c"@48@0:8Q16@24@32B40";
         "windows" => windows, c"@16@0:8";
+        "orderedWindows" => ordered_windows, c"@16@0:8";
         "enumerateWindowsWithOptions:usingBlock:" => enumerate_windows, c"v32@0:8Q16@?24";
         "windowWithWindowNumber:" => window_with_window_number, c"@24@0:8q16";
         "keyWindow" => key_window, c"@16@0:8";
@@ -1136,6 +1196,7 @@ pub(crate) fn install() {
         "dockMenu" => menu_for, c"@16@0:8";
         "setDockMenu:" => set_menu_for, c"v24@0:8@16";
         "postEvent:atStart:" => post_event, c"v28@0:8@16B24";
+        "discardEventsMatchingMask:beforeEvent:" => discard_events_matching_mask, c"v32@0:8Q16@24";
         "currentEvent" => current_event, c"@16@0:8";
         "sendEvent:" => send_event, c"v24@0:8@16";
         // Private: the window server's hit-testing cache, which this runtime
@@ -1172,6 +1233,12 @@ pub(crate) fn install() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `POSTED_EVENTS` is one real queue, shared process-wide exactly as
+    /// AppKit's is - so a test that posts to it and then drains the whole
+    /// queue must not race another one doing the same. Every such test locks
+    /// this first.
+    static POSTED_EVENTS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// No window has the number zero or a number nothing was given, and
     /// asking for one is nil rather than the first window.
@@ -1382,6 +1449,7 @@ mod tests {
     #[test]
     fn posted_events_honor_at_start_and_are_current_while_sent() {
         crate::bootstrap();
+        let _posted_events = POSTED_EVENTS_LOCK.lock().expect("no panic");
         static SEEN: std::sync::Mutex<Vec<u64>> = std::sync::Mutex::new(Vec::new());
 
         unsafe extern "C" fn record(receiver: Id, _sel: Sel, event: Id) {
@@ -1428,6 +1496,88 @@ mod tests {
         );
         // SAFETY: outside `-sendEvent:` there is no current event.
         assert!(unsafe { current_event(app, objc::sel::get("currentEvent")) }.is_null());
+    }
+
+    /// `-orderedWindows` is `-windows` frontmost first, which `front_to_back`
+    /// already is: the method need only wrap what that answers.
+    #[test]
+    fn ordered_windows_matches_front_to_back() {
+        crate::bootstrap();
+        let app = objc::object::create_instance(
+            objc::class::lookup(c"NSApplication").expect("NSApplication"),
+            0,
+        );
+        // SAFETY: `-orderedWindows` is `id (id, SEL)`.
+        let array = unsafe { ordered_windows(app, objc::sel::get("orderedWindows")) };
+        assert!(!array.is_null());
+        // SAFETY: the array this call just made.
+        let items = unsafe { corefoundation::collections::array(array as *const c_void) }
+            .expect("an NSArray");
+        let got: Vec<Id> = items.values.iter().map(|v| *v as Id).collect();
+        assert_eq!(got, crate::window::front_to_back());
+        objc::arc::release(app);
+    }
+
+    /// `-discardEventsMatchingMask:beforeEvent:` drops a matching event ahead
+    /// of the named one, keeps a non-matching event ahead of it, and leaves
+    /// everything from the named event on untouched.
+    #[test]
+    fn discard_events_matching_mask_drops_matches_before_the_named_event() {
+        crate::bootstrap();
+        let _posted_events = POSTED_EVENTS_LOCK.lock().expect("no panic");
+        let app = objc::object::create_instance(
+            objc::class::lookup(c"NSApplication").expect("NSApplication"),
+            0,
+        );
+        let early = crate::nsevent::make(crate::nsevent::Fields {
+            kind: crate::nsevent::kind::KEY_DOWN,
+            ..Default::default()
+        });
+        let other_kind = crate::nsevent::make(crate::nsevent::Fields {
+            kind: crate::nsevent::kind::KEY_UP,
+            ..Default::default()
+        });
+        let marker = crate::nsevent::make(crate::nsevent::Fields {
+            kind: crate::nsevent::kind::KEY_DOWN,
+            ..Default::default()
+        });
+        let late = crate::nsevent::make(crate::nsevent::Fields {
+            kind: crate::nsevent::kind::KEY_DOWN,
+            ..Default::default()
+        });
+        // SAFETY: fresh events, each retained once by the queue they are
+        // posted to and read back without being dequeued.
+        unsafe {
+            let post = objc::sel::get("postEvent:atStart:");
+            post_event(app, post, early, 0);
+            post_event(app, post, other_kind, 0);
+            post_event(app, post, marker, 0);
+            post_event(app, post, late, 0);
+            discard_events_matching_mask(
+                app,
+                objc::sel::get("discardEventsMatchingMask:beforeEvent:"),
+                1 << crate::nsevent::kind::KEY_DOWN,
+                marker,
+            );
+        }
+        let remaining: Vec<Id> = posted_events().iter().map(|e| *e as Id).collect();
+        assert!(
+            !remaining.contains(&early),
+            "a matching event before the marker is discarded"
+        );
+        assert!(
+            remaining.contains(&other_kind),
+            "a non-matching event ahead of the marker is kept"
+        );
+        assert!(remaining.contains(&marker), "the named event is kept");
+        assert!(
+            remaining.contains(&late),
+            "a matching event after the marker is kept"
+        );
+        // SAFETY: draining what is left sends and releases it; `early` was
+        // already released by the discard above.
+        unsafe { dispatch_posted_events(app) };
+        objc::arc::release(app);
     }
 
     /// `-run` turns the run loop, and `-stop:` ends it.
