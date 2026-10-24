@@ -1906,6 +1906,7 @@ name = "opencl"
 version = "0.4.1"
 dependencies = [
  "exports",
+ "libc",
 ]
 
 [[package]]

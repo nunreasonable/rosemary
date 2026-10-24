@@ -1352,6 +1352,71 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("IOServiceGetMatchingServices", I32, U32, P, P),
     sig!("IOServiceMatching", P, P),
     sig!("KextManagerCopyLoadedKextInfo", P, P, P),
+    cbsig!([3], "clCreateContext", P, P, U32, P, P, P, P),
+    sig!("clCreateCommandQueue", P, P, P, U64, P),
+    sig!("clCreateBuffer", P, P, U64, U64, P, P),
+    sig!("clCreateProgramWithSource", P, P, U32, P, P, P),
+    cbsig!([4], "clBuildProgram", I32, P, U32, P, P, P, P),
+    sig!("clCreateKernel", P, P, P, P),
+    sig!("clSetKernelArg", I32, P, U32, U64, P),
+    sig!(
+        "clEnqueueMapBuffer",
+        P,
+        P,
+        P,
+        U32,
+        U64,
+        U64,
+        U64,
+        U32,
+        P,
+        P,
+        P
+    ),
+    sig!(
+        "clEnqueueReadBuffer",
+        I32,
+        P,
+        P,
+        U32,
+        U64,
+        U64,
+        P,
+        U32,
+        P,
+        P
+    ),
+    sig!(
+        "clEnqueueWriteBuffer",
+        I32,
+        P,
+        P,
+        U32,
+        U64,
+        U64,
+        P,
+        U32,
+        P,
+        P
+    ),
+    sig!("clEnqueueNDRangeKernel", I32, P, P, U32, P, P, P, U32, P, P),
+    sig!("clEnqueueUnmapMemObject", I32, P, P, P, U32, P, P),
+    sig!("clFinish", I32, P),
+    sig!("clGetCommandQueueInfo", I32, P, U32, U64, P, P),
+    sig!("clGetContextInfo", I32, P, U32, U64, P, P),
+    sig!("clGetKernelWorkGroupInfo", I32, P, P, U32, U64, P, P),
+    sig!("clRetainCommandQueue", I32, P),
+    sig!("clReleaseCommandQueue", I32, P),
+    sig!("clRetainContext", I32, P),
+    sig!("clReleaseContext", I32, P),
+    sig!("clRetainDevice", I32, P),
+    sig!("clReleaseDevice", I32, P),
+    sig!("clReleaseEvent", I32, P),
+    sig!("clRetainKernel", I32, P),
+    sig!("clReleaseKernel", I32, P),
+    sig!("clRetainMemObject", I32, P),
+    sig!("clReleaseMemObject", I32, P),
+    sig!("clReleaseProgram", I32, P),
     sig!("clGetPlatformIDs", I32, U32, P, P),
     sig!("clGetPlatformInfo", I32, P, U32, U64, P, P),
     sig!("clGetDeviceIDs", I32, P, U64, U32, P, P),
@@ -4624,6 +4689,15 @@ pub static REFUSED: &[(&str, &str)] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn opencl_notifications_are_guest_callbacks() {
+        for (name, callback) in [("clCreateContext", 3), ("clBuildProgram", 4)] {
+            let abi = SIGNATURES.iter().find(|abi| abi.name == name).unwrap();
+            assert_eq!(abi.callbacks, &[callback]);
+            assert_eq!(abi.types.len(), 7);
+        }
+    }
 
     /// Every signature in the table can actually be called.
     #[test]
