@@ -254,6 +254,44 @@ unsafe extern "C" fn thread_main(receiver: Id, _sel: Sel) {
     }
 }
 
+/// Mark a thread this crate started as finished and drop what it held, once
+/// its `-main` has returned or it has called `+exit`.
+fn finish(thread: Id) {
+    let (target, argument, block) = with_instance(thread, |i| {
+        i.executing = false;
+        i.finished = true;
+        (
+            std::mem::take(&mut i.target),
+            std::mem::take(&mut i.argument),
+            std::mem::take(&mut i.block),
+        )
+    });
+    objc::arc::release(target as Id);
+    objc::arc::release(argument as Id);
+    if block != 0 {
+        objc::block::release(block as Id);
+    }
+    objc::arc::release(thread);
+}
+
+/// The new thread's start routine. The unwind ABI because `+exit` ends the
+/// thread with `pthread_exit`, which glibc implements by unwinding through
+/// here; a `std::thread` would abort on that instead.
+extern "C-unwind" fn run(object: *mut std::ffi::c_void) -> *mut std::ffi::c_void {
+    let _darwin = darwin::tls::DarwinThread::enter();
+    let thread = object as Id;
+    CURRENT.with(|current| current.set(object as usize));
+    let pool = objc::arc::pool_push();
+    // SAFETY: `-main` is `void (id, SEL)`.
+    unsafe {
+        let send: unsafe extern "C" fn(Id, Sel) = std::mem::transmute(objc::msg::entry());
+        send(thread, objc::sel::get("main"));
+    }
+    objc::arc::pool_pop(pool);
+    finish(thread);
+    std::ptr::null_mut()
+}
+
 /// `-start`: a new thread that sends the receiver `-main`, so a subclass's own
 /// `-main` runs, with `+currentThread` answering the receiver there.
 unsafe extern "C" fn start(receiver: Id, _sel: Sel) {
@@ -265,44 +303,35 @@ unsafe extern "C" fn start(receiver: Id, _sel: Sel) {
         i.stack_size
     });
     MULTITHREADED.store(true, Ordering::Relaxed);
-    let object = objc::arc::retain(receiver) as usize;
-    let mut builder = std::thread::Builder::new();
-    if stack_size > 0 {
-        builder = builder.stack_size(stack_size as usize);
-    }
-    let spawned = builder.spawn(move || {
-        let _darwin = darwin::tls::DarwinThread::enter();
-        let thread = object as Id;
-        CURRENT.with(|current| current.set(object));
-        let pool = objc::arc::pool_push();
-        // SAFETY: `-main` is `void (id, SEL)`.
-        unsafe {
-            let send: unsafe extern "C" fn(Id, Sel) = std::mem::transmute(objc::msg::entry());
-            send(thread, objc::sel::get("main"));
-        }
-        objc::arc::pool_pop(pool);
-        let (target, argument, block) = with_instance(thread, |i| {
-            i.executing = false;
-            i.finished = true;
-            (
-                std::mem::take(&mut i.target),
-                std::mem::take(&mut i.argument),
-                std::mem::take(&mut i.block),
-            )
-        });
-        objc::arc::release(target as Id);
-        objc::arc::release(argument as Id);
-        if block != 0 {
-            objc::block::release(block as Id);
-        }
-        objc::arc::release(thread);
-    });
-    if spawned.is_err() {
+    let object = objc::arc::retain(receiver);
+    type Start = extern "C" fn(*mut std::ffi::c_void) -> *mut std::ffi::c_void;
+    type StartUnwind = extern "C-unwind" fn(*mut std::ffi::c_void) -> *mut std::ffi::c_void;
+    // SAFETY: the same signature, differing only in whether it may unwind,
+    // which glibc's own forced unwinding needs.
+    let routine = unsafe { std::mem::transmute::<StartUnwind, Start>(run) };
+    // SAFETY: plain pthread calls; the attributes live until the thread is made.
+    let spawned = unsafe {
+        let mut attributes: libc::pthread_attr_t = std::mem::zeroed();
+        libc::pthread_attr_init(&mut attributes);
+        libc::pthread_attr_setdetachstate(&mut attributes, libc::PTHREAD_CREATE_DETACHED);
+        // Apple's default for a secondary thread, and enough for a guest that
+        // never asked: Rust's own default is smaller.
+        let size = match stack_size {
+            0 => 512 * 1024,
+            size => size as usize,
+        };
+        libc::pthread_attr_setstacksize(&mut attributes, size.max(libc::PTHREAD_STACK_MIN));
+        let mut handle: libc::pthread_t = 0;
+        let made = libc::pthread_create(&mut handle, &attributes, routine, object.cast());
+        libc::pthread_attr_destroy(&mut attributes);
+        made == 0
+    };
+    if !spawned {
         with_instance(receiver, |i| {
             i.executing = false;
             i.finished = true;
         });
-        objc::arc::release(object as Id);
+        objc::arc::release(object);
     }
 }
 
@@ -409,6 +438,10 @@ unsafe extern "C-unwind" fn exit_thread(_class: Id, _sel: Sel) -> ! {
     // SAFETY: `+currentThread` is `id (Class, SEL)`.
     let thread = unsafe { current_thread(std::ptr::null_mut(), objc::sel::get("currentThread")) };
     crate::notification::post("NSThreadWillExitNotification", thread, std::ptr::null_mut());
+    // `-start`'s own bookkeeping after `-main` will not run: say it here.
+    if with_instance(thread, |i| i.started) {
+        finish(thread);
+    }
     // SAFETY: ends this thread; never returns.
     unsafe { libc::pthread_exit(std::ptr::null_mut()) }
 }
@@ -522,6 +555,35 @@ mod tests {
         }
         assert_eq!(RAN_ON.load(Ordering::SeqCst), thread as usize);
         assert!(!unsafe { is_executing(thread, objc::sel::get("isExecuting")) });
+        objc::arc::release(thread);
+    }
+
+    unsafe extern "C" fn exit_from_block(_block: Id) {
+        // SAFETY: `+exit` takes no arguments and does not return.
+        unsafe { exit_thread(std::ptr::null_mut(), objc::sel::get("exit")) };
+    }
+
+    #[test]
+    fn a_thread_that_exits_is_finished() {
+        crate::bootstrap();
+        let block = fake::block(exit_from_block as *const std::ffi::c_void);
+        let class = objc::class::lookup(c"NSThread").unwrap();
+        let thread = objc::object::create_instance(class, 0);
+        objc::arc::retain(thread);
+        // SAFETY: a fresh NSThread and a global block.
+        unsafe {
+            init_with_block(thread, objc::sel::get("initWithBlock:"), block.id());
+            start(thread, objc::sel::get("start"));
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while unsafe { is_executing(thread, objc::sel::get("isExecuting")) } {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the thread never stopped"
+            );
+            std::thread::yield_now();
+        }
+        assert!(unsafe { is_finished(thread, objc::sel::get("isFinished")) });
         objc::arc::release(thread);
     }
 }
