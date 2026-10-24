@@ -2059,8 +2059,95 @@ unsafe extern "C" fn flush_buffer(receiver: Id, _sel: Sel) {
         if sdl3::video::gl_current_window() == window {
             chrome_blit::mask_outside_logical_frame(drawable_window(context_of(receiver)), window);
         }
+        if sdl3::video::gl_current_window() == window {
+            dump_back_buffer(window);
+        }
         sdl3::video::swap_window(window);
     }
+}
+
+/// With `ROSEMARY_STORE_OUT` set, write what a GL window is about to show to
+/// `gl-<window>.ppm` there, at most once a second: the backing-store dump
+/// cannot see a window the guest draws with GL itself.
+fn dump_back_buffer(window: sdl3::Window) {
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+    static LAST: Mutex<Vec<(usize, Instant)>> = Mutex::new(Vec::new());
+
+    let Some(directory) = std::env::var_os("ROSEMARY_STORE_OUT") else {
+        return;
+    };
+    {
+        let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+        match last.iter_mut().find(|(key, _)| *key == window as usize) {
+            Some((_, at)) if at.elapsed() < Duration::from_secs(1) => return,
+            Some((_, at)) => *at = Instant::now(),
+            None => last.push((window as usize, Instant::now())),
+        }
+    }
+    let Some((width, height)) = sdl3::video::window_size_in_pixels(window) else {
+        return;
+    };
+    if width <= 0 || height <= 0 {
+        return;
+    }
+    let proc = |name: &std::ffi::CStr| sdl3::video::gl_proc_address(name);
+    let (Some(get), Some(bind), Some(read_buffer), Some(store), Some(read)) = (
+        proc(c"glGetIntegerv"),
+        proc(c"glBindFramebuffer"),
+        proc(c"glReadBuffer"),
+        proc(c"glPixelStorei"),
+        proc(c"glReadPixels"),
+    ) else {
+        return;
+    };
+    const READ_FRAMEBUFFER: u32 = 0x8CA8;
+    const READ_FRAMEBUFFER_BINDING: u32 = 0x8CAA;
+    const READ_BUFFER: u32 = 0x0C02;
+    const PACK_ALIGNMENT: u32 = 0x0D05;
+    const PIXEL_PACK_BUFFER: u32 = 0x88EB;
+    const PIXEL_PACK_BUFFER_BINDING: u32 = 0x88ED;
+    const BACK: u32 = 0x0405;
+    let mut pixels = vec![0_u8; width as usize * height as usize * 4];
+    // SAFETY: GL entry points of the current context, called with their C
+    // signatures; the guest's read state is put back as it was.
+    unsafe {
+        let get: unsafe extern "C" fn(u32, *mut i32) = std::mem::transmute(get);
+        let bind: unsafe extern "C" fn(u32, u32) = std::mem::transmute(bind);
+        let read_buffer: unsafe extern "C" fn(u32) = std::mem::transmute(read_buffer);
+        let store: unsafe extern "C" fn(u32, i32) = std::mem::transmute(store);
+        let read: unsafe extern "C" fn(i32, i32, i32, i32, u32, u32, *mut u8) =
+            std::mem::transmute(read);
+        let bind_buffer: Option<unsafe extern "C" fn(u32, u32)> =
+            proc(c"glBindBuffer").map(|f| std::mem::transmute(f));
+        let (mut framebuffer, mut buffer, mut alignment, mut pack) = (0, 0, 4, 0);
+        get(READ_FRAMEBUFFER_BINDING, &mut framebuffer);
+        get(READ_BUFFER, &mut buffer);
+        get(PACK_ALIGNMENT, &mut alignment);
+        get(PIXEL_PACK_BUFFER_BINDING, &mut pack);
+        bind(READ_FRAMEBUFFER, 0);
+        read_buffer(BACK);
+        store(PACK_ALIGNMENT, 1);
+        if let Some(bind_buffer) = bind_buffer {
+            bind_buffer(PIXEL_PACK_BUFFER, 0);
+        }
+        read(0, 0, width, height, 0x1908, 0x1401, pixels.as_mut_ptr()); // RGBA, UNSIGNED_BYTE
+        if let Some(bind_buffer) = bind_buffer {
+            bind_buffer(PIXEL_PACK_BUFFER, pack as u32);
+        }
+        store(PACK_ALIGNMENT, alignment);
+        bind(READ_FRAMEBUFFER, framebuffer as u32);
+        read_buffer(buffer as u32);
+    }
+    let mut out = format!("P6\n{width} {height}\n255\n").into_bytes();
+    // GL's rows run bottom to top.
+    for row in pixels.chunks_exact(width as usize * 4).rev() {
+        for texel in row.as_chunks::<4>().0 {
+            out.extend_from_slice(&texel[..3]);
+        }
+    }
+    let name = format!("gl-{:x}.ppm", window as usize);
+    let _ = std::fs::write(std::path::Path::new(&directory).join(name), out);
 }
 
 #[inline(always)]
