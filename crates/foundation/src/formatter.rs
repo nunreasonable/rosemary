@@ -1277,6 +1277,253 @@ fn calendar_class() -> &'static Class {
     unsafe { objc::class::from_ptr(p as *const Class).expect("a calendar class") }
 }
 
+//
+// NSCalendar
+//
+
+/// `NSCalendarUnit` bits, as `<Foundation/NSCalendar.h>` numbers them.
+mod unit {
+    pub const ERA: u64 = 1 << 1;
+    pub const YEAR: u64 = 1 << 2;
+    pub const MONTH: u64 = 1 << 3;
+    pub const DAY: u64 = 1 << 4;
+    pub const HOUR: u64 = 1 << 5;
+    pub const MINUTE: u64 = 1 << 6;
+    pub const SECOND: u64 = 1 << 7;
+    pub const WEEKDAY: u64 = 1 << 9;
+    pub const NANOSECOND: u64 = 1 << 15;
+    pub const CALENDAR: u64 = 1 << 20;
+    pub const TIME_ZONE: u64 = 1 << 21;
+}
+
+fn send_id(receiver: Id, selector: &str) -> Id {
+    // SAFETY: an `id (id, SEL)` method, sent through the dispatcher.
+    unsafe {
+        let f: unsafe extern "C" fn(Id, Sel) -> Id = std::mem::transmute(objc::msg::entry());
+        f(receiver, objc::sel::get(selector))
+    }
+}
+
+fn calendar_of<'a>(receiver: Id) -> Option<&'a mut Calendar> {
+    // SAFETY: an object this runtime allocated, checked by class.
+    unsafe { contents::<Calendar>(receiver as CFTypeRef, calendar_class()) }
+}
+
+/// A calendar, retained: the current one, or the one `identifier` names.
+fn new_calendar(identifier: CFTypeRef) -> CFTypeRef {
+    let timezone = unsafe { corefoundation::timezone::copy_system() };
+    let identifier = match identifier.is_null() {
+        true => corefoundation::string::from_bytes(b"gregorian", false),
+        false => objc::arc::retain(identifier as Id) as CFTypeRef,
+    };
+    make(
+        calendar_class(),
+        Calendar {
+            first_weekday: first_weekday(&crate::locale::country_code()),
+            identifier,
+            timezone,
+        },
+    )
+}
+
+/// Whether this tree computes dates in the calendar `identifier` names.
+fn is_gregorian(identifier: Id) -> bool {
+    // SAFETY: null or a string.
+    match unsafe { corefoundation::string::as_string(identifier as CFTypeRef) } {
+        Some(text) => matches!(&text.utf8()[..], b"gregorian" | b"iso8601"),
+        None => false,
+    }
+}
+
+/// `+currentCalendar` and `+autoupdatingCurrentCalendar`.
+unsafe extern "C" fn calendar_current(_class: Id, _sel: Sel) -> Id {
+    objc::arc::autorelease(new_calendar(std::ptr::null()) as Id)
+}
+
+/// `+calendarWithIdentifier:`: nil for a calendar this tree does not compute,
+/// as Apple answers nil for an identifier it does not know, rather than
+/// Gregorian dates that would be the wrong dates.
+unsafe extern "C" fn calendar_with_identifier(_class: Id, _sel: Sel, identifier: Id) -> Id {
+    if !is_gregorian(identifier) {
+        return std::ptr::null_mut();
+    }
+    objc::arc::autorelease(new_calendar(identifier as CFTypeRef) as Id)
+}
+
+/// `-initWithCalendarIdentifier:`, which answers a calendar of this runtime's
+/// in place of the receiver, the way a class cluster's initializer does.
+unsafe extern "C" fn calendar_init_with_identifier(receiver: Id, _sel: Sel, identifier: Id) -> Id {
+    objc::arc::release(receiver);
+    if !is_gregorian(identifier) {
+        return std::ptr::null_mut();
+    }
+    new_calendar(identifier as CFTypeRef) as Id
+}
+
+unsafe extern "C" fn calendar_identifier(receiver: Id, _sel: Sel) -> Id {
+    calendar_of(receiver).map_or(std::ptr::null_mut(), |c| c.identifier as Id)
+}
+
+unsafe extern "C" fn calendar_time_zone(receiver: Id, _sel: Sel) -> Id {
+    calendar_of(receiver).map_or(std::ptr::null_mut(), |c| c.timezone as Id)
+}
+
+unsafe extern "C" fn calendar_set_time_zone(receiver: Id, _sel: Sel, timezone: Id) {
+    let Some(calendar) = calendar_of(receiver) else {
+        return;
+    };
+    // A nil zone is the system's, as Apple resets it.
+    let held = match timezone.is_null() {
+        true => unsafe { corefoundation::timezone::copy_system() },
+        false => objc::arc::retain(timezone) as CFTypeRef,
+    };
+    objc::arc::release(calendar.timezone as Id);
+    calendar.timezone = held;
+}
+
+unsafe extern "C" fn calendar_first_weekday(receiver: Id, _sel: Sel) -> u64 {
+    calendar_of(receiver).map_or(1, |c| c.first_weekday as u64)
+}
+
+unsafe extern "C" fn calendar_set_first_weekday(receiver: Id, _sel: Sel, weekday: u64) {
+    if let Some(calendar) = calendar_of(receiver)
+        && (1..=7).contains(&weekday)
+    {
+        calendar.first_weekday = weekday as CFIndex;
+    }
+}
+
+// FIXME (ACCURACY): a calendar here has no locale of its own; it answers the
+// current one and forgets one it is given, which only affects its symbols.
+unsafe extern "C" fn calendar_locale(_receiver: Id, _sel: Sel) -> Id {
+    let class = objc::class::lookup(c"NSLocale")
+        .map_or(std::ptr::null_mut(), |c| objc::class::ptr(c) as Id);
+    send_id(class, "currentLocale")
+}
+
+unsafe extern "C" fn calendar_set_locale(_receiver: Id, _sel: Sel, _locale: Id) {}
+
+/// `-components:fromDate:`, the Gregorian fields `units` asks for.
+unsafe extern "C" fn calendar_components_from_date(
+    receiver: Id,
+    _sel: Sel,
+    units: u64,
+    date: Id,
+) -> Id {
+    let Some(calendar) = calendar_of(receiver) else {
+        return std::ptr::null_mut();
+    };
+    if date.is_null() {
+        return std::ptr::null_mut();
+    }
+    // SAFETY: `-timeIntervalSinceReferenceDate` is `double (id, SEL)`.
+    let at = unsafe {
+        let f: unsafe extern "C" fn(Id, Sel) -> f64 = std::mem::transmute(objc::msg::entry());
+        f(date, objc::sel::get("timeIntervalSinceReferenceDate"))
+    };
+    let timezone = calendar.timezone;
+    // SAFETY: null or a time zone.
+    let g = unsafe { corefoundation::calendar::absolute_time_get_gregorian_date(at, timezone) };
+    let mut c = DateComponents::default();
+    let want = |bit: u64| units & bit != 0;
+    if want(unit::ERA) {
+        c.era = i64::from(g.year > 0);
+    }
+    if want(unit::YEAR) {
+        c.year = i64::from(g.year);
+    }
+    if want(unit::MONTH) {
+        c.month = i64::from(g.month);
+    }
+    if want(unit::DAY) {
+        c.day = i64::from(g.day);
+    }
+    if want(unit::HOUR) {
+        c.hour = i64::from(g.hour);
+    }
+    if want(unit::MINUTE) {
+        c.minute = i64::from(g.minute);
+    }
+    if want(unit::SECOND) {
+        c.second = g.second.floor() as i64;
+    }
+    if want(unit::NANOSECOND) {
+        c.nanosecond = ((g.second - g.second.floor()) * 1e9) as i64;
+    }
+    if want(unit::WEEKDAY) {
+        // Sunday is one here and seven in CoreFoundation's day of week.
+        let day = unsafe { corefoundation::calendar::absolute_time_get_day_of_week(at, timezone) };
+        c.weekday = i64::from(day % 7 + 1);
+    }
+    if want(unit::CALENDAR) {
+        c.calendar = objc::arc::retain(receiver) as CFTypeRef;
+    }
+    if want(unit::TIME_ZONE) {
+        c.time_zone = objc::arc::retain(timezone as Id) as CFTypeRef;
+    }
+    objc::arc::autorelease(make(date_components_class(), c) as Id)
+}
+
+/// `-dateFromComponents:`; an undefined field takes its smallest value, as
+/// Apple fills one in.
+// FIXME (ACCURACY): week-based fields (weekday, week of year, ...) are ignored.
+unsafe extern "C" fn calendar_date_from_components(receiver: Id, _sel: Sel, components: Id) -> Id {
+    let Some(calendar) = calendar_of(receiver) else {
+        return std::ptr::null_mut();
+    };
+    // SAFETY: an `NSDateComponents` of this runtime's, checked by class.
+    let Some(c) =
+        (unsafe { contents::<DateComponents>(components as CFTypeRef, date_components_class()) })
+    else {
+        return std::ptr::null_mut();
+    };
+    let or = |value: i64, default: i64| if value == UNDEFINED { default } else { value };
+    let timezone = match c.time_zone.is_null() {
+        true => calendar.timezone,
+        false => c.time_zone,
+    };
+    // Out-of-range fields carry over, as `-dateFromComponents:` lets them:
+    // the month is normalized into the year and the rest are plain seconds.
+    let month0 = or(c.month, 1) - 1;
+    let year = or(c.year, 1) + month0.div_euclid(12);
+    let base = corefoundation::calendar::GregorianDate {
+        year: year as i32,
+        month: (month0.rem_euclid(12) + 1) as i8,
+        day: 1,
+        hour: 0,
+        minute: 0,
+        second: 0.0,
+    };
+    // SAFETY: null or a time zone.
+    let start =
+        unsafe { corefoundation::calendar::gregorian_date_get_absolute_time(base, timezone) };
+    let offset =
+        (or(c.day, 1) - 1) * 86_400 + or(c.hour, 0) * 3600 + or(c.minute, 0) * 60 + or(c.second, 0);
+    let at = start + offset as f64 + or(c.nanosecond, 0) as f64 / 1e9;
+    crate::timer::date(at)
+}
+
+fn install_calendar() {
+    let class = objc::class::lookup(c"NSCalendar").expect("registered by calendar_class");
+    crate::define::class_methods!(class, {
+        "currentCalendar" => calendar_current, c"@16@0:8";
+        "autoupdatingCurrentCalendar" => calendar_current, c"@16@0:8";
+        "calendarWithIdentifier:" => calendar_with_identifier, c"@24@0:8@16";
+    });
+    crate::define::methods!(class, {
+        "initWithCalendarIdentifier:" => calendar_init_with_identifier, c"@24@0:8@16";
+        "calendarIdentifier" => calendar_identifier, c"@16@0:8";
+        "timeZone" => calendar_time_zone, c"@16@0:8";
+        "setTimeZone:" => calendar_set_time_zone, c"v24@0:8@16";
+        "firstWeekday" => calendar_first_weekday, c"Q16@0:8";
+        "setFirstWeekday:" => calendar_set_first_weekday, c"v24@0:8Q16";
+        "locale" => calendar_locale, c"@16@0:8";
+        "setLocale:" => calendar_set_locale, c"v24@0:8@16";
+        "components:fromDate:" => calendar_components_from_date, c"@32@0:8Q16@24";
+        "dateFromComponents:" => calendar_date_from_components, c"@24@0:8@16";
+    });
+}
+
 /// Register the three classes, so that a guest binding `_OBJC_CLASS_$_NSCalendar`
 /// gets the same class this module allocates from.
 pub fn install() {
@@ -1284,6 +1531,7 @@ pub fn install() {
     date_class();
     calendar_class();
     install_date_components();
+    install_calendar();
     objc_api::install();
     number_api::install();
 }
@@ -1974,6 +2222,48 @@ pub mod cf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_calendar_decomposes_and_recomposes_a_utc_date() {
+        crate::bootstrap();
+        let calendar = unsafe { calendar_current(std::ptr::null_mut(), std::ptr::null()) };
+        let name = corefoundation::string::from_bytes(b"UTC", false);
+        let utc = unsafe { corefoundation::timezone::create_with_name(std::ptr::null(), name, 0) };
+        unsafe { calendar_set_time_zone(calendar, std::ptr::null(), utc as Id) };
+        // 2024-02-29 13:14:15 UTC.
+        let at = 730_905_255.0;
+        let date = crate::timer::date(at);
+        let units = unit::YEAR
+            | unit::MONTH
+            | unit::DAY
+            | unit::HOUR
+            | unit::MINUTE
+            | unit::SECOND
+            | unit::WEEKDAY;
+        let components =
+            unsafe { calendar_components_from_date(calendar, std::ptr::null(), units, date) };
+        let c =
+            unsafe { contents::<DateComponents>(components as CFTypeRef, date_components_class()) }
+                .unwrap();
+        assert_eq!(
+            (c.year, c.month, c.day, c.hour, c.minute, c.second),
+            (2024, 2, 29, 13, 14, 15)
+        );
+        // A Thursday, five with Sunday as one.
+        assert_eq!(c.weekday, 5);
+        assert_eq!(c.era, UNDEFINED);
+        let back = unsafe { calendar_date_from_components(calendar, std::ptr::null(), components) };
+        let interval = send_f64(back, "timeIntervalSinceReferenceDate");
+        assert_eq!(interval, at);
+    }
+
+    fn send_f64(receiver: Id, selector: &str) -> f64 {
+        // SAFETY: a `double (id, SEL)` method.
+        unsafe {
+            let f: unsafe extern "C" fn(Id, Sel) -> f64 = std::mem::transmute(objc::msg::entry());
+            f(receiver, objc::sel::get(selector))
+        }
+    }
 
     #[test]
     fn a_decimal_style_groups_by_thousands() {
