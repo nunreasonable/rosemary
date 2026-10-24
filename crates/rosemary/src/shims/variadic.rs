@@ -69,6 +69,96 @@ pub fn install() {
     }
     let _ = ORIGINALS.set(originals);
     install_object_lists();
+    install_va_list_formatters();
+}
+
+/// The `va_list` spellings of the format methods, as `(class, selector,
+/// variadic sibling, whether a locale comes before the list)`.
+///
+/// Each is added rather than swizzled, and answered by rendering the list and
+/// sending the sibling the result.
+const VA_LIST_FORMATTERS: &[(&str, &str, &str, bool)] = &[
+    (
+        "NSString",
+        "initWithFormat:arguments:",
+        "initWithFormat:",
+        false,
+    ),
+    (
+        "NSString",
+        "initWithFormat:locale:arguments:",
+        "initWithFormat:",
+        true,
+    ),
+];
+
+fn install_va_list_formatters() {
+    for (class, selector, _, locale) in VA_LIST_FORMATTERS {
+        let (Some(c), Some(s)) = (host::c_string(class), host::c_string(selector)) else {
+            continue;
+        };
+        let (imp, types) = match locale {
+            false => (with_arguments as Imp, c"@32@0:8@16^v24"),
+            true => (with_locale_and_arguments as Imp, c"@40@0:8@16@24^v32"),
+        };
+        // SAFETY: NUL-terminated strings that outlive the calls.
+        unsafe {
+            let cls = host::objc_lookUpClass(c.as_ptr());
+            if cls.is_null() {
+                continue;
+            }
+            let sel = host::sel_registerName(s.as_ptr());
+            host::class_addMethod(cls, sel, imp, types.as_ptr());
+        }
+    }
+}
+
+/// Render `format` against the `va_list` and send the variadic sibling of `sel`
+/// the result, which is what that method does with its own tail.
+unsafe fn format_with_list(receiver: u64, sel: Sel, format: u64, list: u64) -> u64 {
+    // SAFETY: `sel` is a live selector.
+    let name = unsafe { std::ffi::CStr::from_ptr(host::sel_getName(sel)) };
+    let Some((_, _, sibling, _)) = VA_LIST_FORMATTERS
+        .iter()
+        .find(|(_, s, _, _)| s.as_bytes() == name.to_bytes())
+    else {
+        objc::fail!("a va_list format method was reached under a selector it was not added for");
+    };
+    let Some(sibling) = host::c_string(sibling) else {
+        return 0;
+    };
+    // SAFETY: a NUL-terminated selector name.
+    let sibling = unsafe { host::sel_registerName(sibling.as_ptr()) };
+    let Some(original) = original(sibling) else {
+        objc::fail!("a va_list format method was reached before its sibling was recorded");
+    };
+    let rendered = super::nslog::native::render_escaped("initWithFormat:arguments:", format, list)
+        .unwrap_or(format);
+    // SAFETY: the sibling's `IMP`, `id (id, SEL, NSString *)`.
+    unsafe {
+        let f: unsafe extern "C" fn(u64, Sel, u64) -> u64 = core::mem::transmute(original);
+        f(receiver, sibling, rendered)
+    }
+}
+
+/// `-initWithFormat:arguments:`.
+unsafe extern "C" fn with_arguments(receiver: u64, sel: Sel, format: u64, list: u64) -> u64 {
+    // SAFETY: the method's own arguments.
+    unsafe { format_with_list(receiver, sel, format, list) }
+}
+
+/// `-initWithFormat:locale:arguments:`.
+// FIXME (ACCURACY): the locale is not consulted, as `NSLog`'s rendering does
+// not consult one either.
+unsafe extern "C" fn with_locale_and_arguments(
+    receiver: u64,
+    sel: Sel,
+    format: u64,
+    _locale: u64,
+    list: u64,
+) -> u64 {
+    // SAFETY: the method's own arguments.
+    unsafe { format_with_list(receiver, sel, format, list) }
 }
 
 /// The implementation `sel` had before [`install`].
