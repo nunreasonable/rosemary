@@ -464,6 +464,7 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("CFDictionaryAddValue", V, P, P, P),
     cbsig!([1], "CFDictionaryApplyFunction", V, P, P, P),
     sig!("CFDictionaryContainsKey", BOOL, P, P),
+    sig!("CFDictionaryContainsValue", BOOL, P, P),
     sig!("CFDictionaryGetCount", I64, P),
     sig!("CFDictionaryCreate", P, P, P, P, I64, P, P),
     sig!("CFDictionaryCreateMutable", P, P, I64, P, P),
@@ -494,6 +495,12 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("CFLocaleCopyCurrent", P),
     sig!("CFLocaleGetIdentifier", P, P),
     sig!("CFLocaleGetValue", P, P, P),
+    sig!(
+        "CFLocaleCreateCanonicalLanguageIdentifierFromString",
+        P,
+        P,
+        P
+    ),
     sig!("CFNetworkCopySystemProxySettings", P),
     //
     // The callback is argument two and the host calls it on whatever thread
@@ -530,6 +537,7 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     // through directly.
     sig!("CFPreferencesCopyAppValue", P, P, P),
     sig!("CFPropertyListCreateWithData", P, P, P, U64, P, P),
+    sig!("CFPropertyListCreateXMLData", P, P, P),
     sig!("CFPreferencesCopyValue", P, P, P, P, P),
     sig!("CFPreferencesCopyKeyList", P, P, P, P),
     sig!("CFPreferencesCopyMultiple", P, P, P, P, P),
@@ -564,6 +572,9 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     // - exactly the shape the two independent register counters exist for.
     sig!("CFRunLoopRunInMode", I32, P, F64, U8),
     sig!("CFRunLoopSourceSignal", V, P),
+    sig!("CFMachPortCreateRunLoopSource", P, P, P, I64),
+    sig!("CFStreamCreateBoundPair", V, P, P, P, I64),
+    sig!("CFAttributedStringCreate", P, P, P, P),
     sig!("CFRunLoopSourceInvalidate", V, P),
     sig!("CFRunLoopSourceIsValid", U8, P),
     sig!("CFRunLoopRemoveSource", V, P, P, P),
@@ -608,11 +619,15 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     cbsig!([1], "CFSetApplyFunction", V, P, P, P),
     sig!("CFSetGetCount", I64, P),
     sig!("CFSetGetValues", V, P, P),
+    sig!("CFSetCreateMutable", P, P, I64, P),
+    sig!("CFSetAddValue", V, P, P),
     sig!("CFStringAppendCharacters", V, P, P, I64),
     // `CFComparisonResult` is a `CFIndex`, so a signed doubleword, and
     // `CFStringCompareFlags` is a `CFOptionFlags` - both 64-bit on LP64.
     sig!("CFStringCompare", I64, P, P, U64),
     sig!("CFCopyDescription", P, P),
+    sig!("CFShow", V, P),
+    sig!("CFCharacterSetCreateBitmapRepresentation", P, P, P),
     sig!("CFErrorCopyDescription", P, P),
     sig!("CFErrorGetCode", I64, P),
     sig!("CFMakeCollectable", P, P),
@@ -621,6 +636,17 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     // `Boolean CFStringFindWithOptions(CFStringRef, CFStringRef, CFRange,
     // CFStringCompareFlags, CFRange *)`, with the range flattened.
     sig!("CFStringFindWithOptions", BOOL, P, P, I64, I64, U64, P),
+    sig!("CFStringCreateArrayBySeparatingStrings", P, P, P, P),
+    sig!("CFStringNormalize", BOOL, P, I64),
+    sig!(
+        "CFStringCreateMutableWithExternalCharactersNoCopy",
+        P,
+        P,
+        P,
+        I64,
+        I64,
+        P
+    ),
     sig!("CFStringConvertEncodingToIANACharSetName", P, U32),
     sig!("CFStringConvertEncodingToNSStringEncoding", U64, U32),
     sig!("CFStringConvertIANACharSetNameToEncoding", U32, P),
@@ -701,6 +727,7 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     // are - the two look interchangeable in a header and are not.
     sig!("CFURLCopyFileSystemPath", P, P, I64),
     sig!("CFURLCreateWithBytes", P, P, P, I64, U32, P),
+    sig!("CFURLWriteDataAndPropertiesToResource", BOOL, P, P, P, P),
     sig!(
         "CFURLCreateWithFileSystemPathRelativeToBase",
         P,
@@ -4062,6 +4089,11 @@ pub static REFUSED: &[(&str, &str)] = &[
     // than a doubleword to describe that with. Implemented all the same - the
     // native backend calls it directly, with no marshaller in the way.
     ("CFUUIDGetUUIDBytes", AGGREGATE),
+    // `CFRange CFStringFind(...)` and `CFRange
+    // CFStringGetRangeOfComposedCharactersAtIndex(...)`: as `CFUUIDGetUUIDBytes`
+    // above - see `crates/rosemary/src/shims/cfstring.rs`.
+    ("CFStringFind", AGGREGATE),
+    ("CFStringGetRangeOfComposedCharactersAtIndex", AGGREGATE),
     // Seventeen parameters: an allocator and the sixteen bytes of a UUID.
     (
         "CFUUIDGetConstantUUIDWithBytes",
@@ -4079,6 +4111,9 @@ pub static REFUSED: &[(&str, &str)] = &[
     ("CGDisplayCreateImageForRect", AGGREGATE),
     ("NSMouseInRect", AGGREGATE),
     ("NSRectFill", AGGREGATE),
+    ("NSEqualSizes", AGGREGATE),
+    ("NSIntersectsRect", AGGREGATE),
+    ("NSContainsRect", AGGREGATE),
     ("NSDrawNinePartImage", AGGREGATE),
     ("CTFontGetBoundingBox", AGGREGATE),
     ("CTFontGetBoundingRectsForGlyphs", AGGREGATE),
