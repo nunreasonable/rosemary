@@ -177,6 +177,14 @@ static FRAMEWORKS: &[Framework] = &[
         symbol: Some(corebluetooth::symbol),
     },
     Framework {
+        leaf: "UserNotifications",
+        version: 'A',
+        umbrellas: &[],
+        provide: None,
+        data: Some(usernotifications::data_symbols),
+        symbol: None,
+    },
+    Framework {
         leaf: "Contacts",
         version: 'A',
         umbrellas: &[],

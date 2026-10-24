@@ -2299,6 +2299,7 @@ dependencies = [
  "security",
  "server",
  "static_init",
+ "usernotifications",
  "webkit",
 ]
 
@@ -3033,6 +3034,16 @@ dependencies = [
  "idna",
  "percent-encoding",
  "serde",
+]
+
+[[package]]
+name = "usernotifications"
+version = "0.4.1"
+dependencies = [
+ "corefoundation",
+ "darwin",
+ "foundation",
+ "objc",
 ]
 
 [[package]]
