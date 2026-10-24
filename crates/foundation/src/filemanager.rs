@@ -534,8 +534,11 @@ unsafe extern "C" fn attributes_of_item(_receiver: Id, _sel: Sel, path: Id, erro
     let pairs: Vec<(CFTypeRef, CFTypeRef)> = values
         .iter()
         .map(|(key, value, _)| {
+            // Interned, the same way `_NSFileSize` and friends are published -
+            // see `attribute` below, which reads these dictionaries back with
+            // the identical object rather than a string merely equal to it.
             (
-                corefoundation::string::from_bytes(key.as_bytes(), false),
+                corefoundation::base::interned_name(key) as CFTypeRef,
                 *value,
             )
         })
@@ -645,11 +648,11 @@ fn since_1970(time: std::time::SystemTime) -> f64 {
 ///
 /// `receiver` must be an `NSDictionary`.
 unsafe fn attribute(receiver: Id, key: &str) -> Id {
-    let key = corefoundation::string::from_bytes(key.as_bytes(), false);
+    // Interned, not a one-off: the pool is kept forever, so there is nothing
+    // here to release.
+    let key = corefoundation::base::interned_name(key) as CFTypeRef;
     // SAFETY: a dictionary and a string key.
     let value = unsafe { corefoundation::api::CFDictionaryGetValue(receiver as CFTypeRef, key) };
-    // SAFETY: a string this function made and holds the only reference to.
-    unsafe { corefoundation::api::CFRelease(key) };
     value as Id
 }
 

@@ -311,6 +311,36 @@ pub unsafe extern "C" fn CFCharacterSetIsCharacterMember(set: Id, unit: u16) -> 
         .into()
 }
 
+/// `CFDataRef CFCharacterSetCreateBitmapRepresentation(CFAllocatorRef,
+/// CFCharacterSetRef theSet)`.
+///
+/// 8192 bytes, one bit per UTF-16 code unit from `0x0000` through `0xFFFF`,
+/// bit `n` of byte `n / 8` (little-endian within the byte) set when that code
+/// point is a member - the layout Apple documents for the Basic Multilingual
+/// Plane.
+///
+/// FIXME (ACCURACY): a real `CFCharacterSet` covering characters above the
+/// BMP extends the data past 8192 bytes with a table of per-plane bitmaps or
+/// annexes; this answers only for the BMP; every code point above `0xFFFF`
+/// reads as not a member.
+#[allow(non_snake_case)]
+pub unsafe extern "C" fn CFCharacterSetCreateBitmapRepresentation(_allocator: Id, set: Id) -> Id {
+    let mut bitmap = vec![0u8; 8192];
+    for code_point in 0u32..=0xFFFF {
+        // Surrogate code points name no character and are never members.
+        let Some(c) = char::from_u32(code_point) else {
+            continue;
+        };
+        if unsafe { contains_char(set, c) } {
+            bitmap[(code_point / 8) as usize] |= 1 << (code_point % 8);
+        }
+    }
+    // SAFETY: a fresh object.
+    unsafe {
+        corefoundation::api::CFAutorelease(corefoundation::collections::new_data(bitmap)) as Id
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -345,6 +375,22 @@ mod tests {
             assert!(!contains(newline, b' '));
             assert!(contains(whitespace, b' ') && contains(whitespace, b'\t'));
             assert!(!contains(whitespace, b'\n'));
+        }
+    }
+
+    #[test]
+    fn bitmap_representation_marks_exactly_the_members() {
+        crate::bootstrap();
+        let digits = standard(DECIMAL_DIGITS);
+        // SAFETY: a standard set, and the bitmap this call just made.
+        unsafe {
+            let data = CFCharacterSetCreateBitmapRepresentation(std::ptr::null_mut(), digits);
+            let bytes = corefoundation::collections::data(data as corefoundation::base::CFTypeRef)
+                .expect("a CFData");
+            let bit = |cp: u32| bytes[(cp / 8) as usize] & (1 << (cp % 8)) != 0;
+            assert!(bit(u32::from(b'0')));
+            assert!(bit(u32::from(b'9')));
+            assert!(!bit(u32::from(b'a')));
         }
     }
 }

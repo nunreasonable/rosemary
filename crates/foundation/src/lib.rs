@@ -37,9 +37,12 @@ pub mod paths;
 pub use corefoundation::plist;
 pub mod pool;
 pub mod processinfo;
+mod propertylistserialization;
 pub mod proxy;
+mod regularexpression;
 pub mod runtime;
 mod signature;
+mod sortdescriptor;
 pub mod string;
 pub mod strings;
 pub mod task;
@@ -49,6 +52,7 @@ mod timezone;
 pub mod unarchiver;
 pub mod url;
 mod urlcomponents;
+mod urlcredential;
 pub mod urlsession;
 pub mod value;
 
@@ -97,11 +101,16 @@ pub fn bootstrap() {
         filehandle::install();
         task::install();
         appleevent::install();
+        propertylistserialization::install();
+        regularexpression::install();
+        sortdescriptor::install();
+        urlcredential::install();
     });
 }
 
 exports::group! {
     paths,
+    geometry::cf,
     /// Bundle and search-path calls are CoreFoundation and Foundation spellings
     /// of questions only this crate can answer - `corefoundation` is underneath
     /// it and has neither an `NSBundle` nor a `$HOME`.
@@ -297,6 +306,13 @@ pub const CLASSES: &[&str] = &[
     "NSAppleEventManager",
     "NSAppleEventDescriptor",
     "NSMethodSignature",
+    "NSCalendar",
+    "NSDateComponents",
+    "NSPropertyListSerialization",
+    "NSSortDescriptor",
+    "NSURLCredential",
+    "NSRegularExpression",
+    "NSTextCheckingResult",
 ];
 
 // The image-resident number classes are `constant::CLASSES`, published the same
@@ -410,6 +426,18 @@ pub const STRING_GLOBALS: &[(&str, &str)] = &[
         "_NSURLVolumeAvailableCapacityForImportantUsageKey",
         "NSURLVolumeAvailableCapacityForImportantUsageKey",
     ),
+    ("_NSURLIsUbiquitousItemKey", "NSURLIsUbiquitousItemKey"),
+    // `-attributesOfItemAtPath:error:` and `-setAttributes:ofItemAtPath:error:`
+    // key their dictionaries by these same four, through
+    // `corefoundation::base::interned_name` - see `filemanager::attribute`.
+    ("_NSFileSize", "NSFileSize"),
+    ("_NSFileCreationDate", "NSFileCreationDate"),
+    ("_NSFileModificationDate", "NSFileModificationDate"),
+    ("_NSFileAppendOnly", "NSFileAppendOnly"),
+    // The old, un-prefixed spelling of `NSCalendarIdentifierGregorian` - same
+    // text, so a guest comparing the two constants gets identity as well as
+    // equality.
+    ("_NSGregorianCalendar", "gregorian"),
 ];
 
 pub const NOTIFICATION_NAMES: &[&str] = &[

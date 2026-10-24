@@ -621,6 +621,8 @@ dependencies = [
  "sdl3",
  "starnix",
  "static_init",
+ "unicode-general-category",
+ "unicode-normalization",
 ]
 
 [[package]]
@@ -1199,6 +1201,7 @@ dependencies = [
  "corefoundation",
  "darwin",
  "exports",
+ "fancy-regex",
  "libc",
  "objc",
  "prefix",
@@ -2958,6 +2961,15 @@ name = "unicode-joining-type"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d8d00a78170970967fdb83f9d49b92f959ab2bb829186b113e4f4604ad98e180"
+
+[[package]]
+name = "unicode-normalization"
+version = "0.1.26"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "75cd3fb03d5288b3ba9a1ee103ac7e9cbb59f0b03d64f8ddfcc04dd42758a85d"
+dependencies = [
+ "tinyvec",
+]
 
 [[package]]
 name = "untrusted"

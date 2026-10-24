@@ -18,6 +18,8 @@ exports::exports! {
         "NSGetUncaughtExceptionHandler" => NSGetUncaughtExceptionHandler,
         "CFCharacterSetGetPredefined" => crate::characterset::CFCharacterSetGetPredefined,
         "CFCharacterSetIsCharacterMember" => crate::characterset::CFCharacterSetIsCharacterMember,
+        "CFCharacterSetCreateBitmapRepresentation"
+            => crate::characterset::CFCharacterSetCreateBitmapRepresentation,
     }
 }
 

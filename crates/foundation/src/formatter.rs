@@ -5,6 +5,7 @@ use std::ffi::c_void;
 use corefoundation::base::{CFIndex, CFTypeRef};
 use objc::class::Class;
 use objc::object::Id;
+use objc::sel::Sel;
 
 /// The shape each formatter here shares: the object, and its settings.
 #[repr(C)]
@@ -940,6 +941,275 @@ mod number_api {
 }
 
 //
+// Date components
+//
+
+/// `NSDateComponentUndefined`: `NSIntegerMax`, the sentinel every numeric
+/// component starts as until something sets it.
+const UNDEFINED: i64 = i64::MAX;
+
+/// A `NSDateComponents`' fields, which are plain storage here - this runtime
+/// does no calendrical math over them beyond what `CFCalendarCompose/
+/// DecomposeAbsoluteTime` already does for [`Calendar`].
+struct DateComponents {
+    era: i64,
+    year: i64,
+    month: i64,
+    day: i64,
+    hour: i64,
+    minute: i64,
+    second: i64,
+    nanosecond: i64,
+    weekday: i64,
+    weekday_ordinal: i64,
+    quarter: i64,
+    week_of_month: i64,
+    week_of_year: i64,
+    year_for_week_of_year: i64,
+    /// Retained, or null.
+    calendar: CFTypeRef,
+    /// Retained, or null.
+    time_zone: CFTypeRef,
+    leap_month: bool,
+}
+
+impl Default for DateComponents {
+    fn default() -> Self {
+        DateComponents {
+            era: UNDEFINED,
+            year: UNDEFINED,
+            month: UNDEFINED,
+            day: UNDEFINED,
+            hour: UNDEFINED,
+            minute: UNDEFINED,
+            second: UNDEFINED,
+            nanosecond: UNDEFINED,
+            weekday: UNDEFINED,
+            weekday_ordinal: UNDEFINED,
+            quarter: UNDEFINED,
+            week_of_month: UNDEFINED,
+            week_of_year: UNDEFINED,
+            year_for_week_of_year: UNDEFINED,
+            calendar: std::ptr::null(),
+            time_zone: std::ptr::null(),
+            leap_month: false,
+        }
+    }
+}
+
+impl Drop for DateComponents {
+    fn drop(&mut self) {
+        objc::arc::release(self.calendar as Id);
+        objc::arc::release(self.time_zone as Id);
+    }
+}
+
+fn date_components_class() -> &'static Class {
+    static CLASS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let p = *CLASS
+        .get_or_init(|| objc::class::ptr(register::<DateComponents>(c"NSDateComponents")) as usize);
+    // SAFETY: a class registered above and kept for the process.
+    unsafe { objc::class::from_ptr(p as *const Class).expect("a date components class") }
+}
+
+/// `-init`: `+alloc` hands back a zeroed `Body`, so this is where the boxed
+/// defaults actually get allocated - once, the second call on an already
+/// initialized receiver just hands it back unchanged.
+unsafe extern "C" fn date_components_init(receiver: Id, _sel: Sel) -> Id {
+    // SAFETY: a fresh or already-initialized `NSDateComponents`.
+    unsafe {
+        let body = receiver as *mut Body<DateComponents>;
+        if (*body).contents.is_null() {
+            (*body).contents = Box::into_raw(Box::new(DateComponents::default()));
+        }
+    }
+    receiver
+}
+
+/// A signed-integer getter for one of [`DateComponents`]' plain fields.
+macro_rules! component_i64_accessors {
+    ($getter:ident, $setter:ident, $field:ident) => {
+        unsafe extern "C" fn $getter(receiver: Id, _sel: Sel) -> i64 {
+            // SAFETY: an `NSDateComponents`.
+            unsafe { contents::<DateComponents>(receiver as CFTypeRef, date_components_class()) }
+                .map_or(UNDEFINED, |c| c.$field)
+        }
+        unsafe extern "C" fn $setter(receiver: Id, _sel: Sel, value: i64) {
+            // SAFETY: an `NSDateComponents`.
+            if let Some(c) = unsafe {
+                contents::<DateComponents>(receiver as CFTypeRef, date_components_class())
+            } {
+                c.$field = value;
+            }
+        }
+    };
+}
+
+component_i64_accessors!(dc_get_era, dc_set_era, era);
+component_i64_accessors!(dc_get_year, dc_set_year, year);
+component_i64_accessors!(dc_get_month, dc_set_month, month);
+component_i64_accessors!(dc_get_day, dc_set_day, day);
+component_i64_accessors!(dc_get_hour, dc_set_hour, hour);
+component_i64_accessors!(dc_get_minute, dc_set_minute, minute);
+component_i64_accessors!(dc_get_second, dc_set_second, second);
+component_i64_accessors!(dc_get_nanosecond, dc_set_nanosecond, nanosecond);
+component_i64_accessors!(dc_get_weekday, dc_set_weekday, weekday);
+component_i64_accessors!(
+    dc_get_weekday_ordinal,
+    dc_set_weekday_ordinal,
+    weekday_ordinal
+);
+component_i64_accessors!(dc_get_quarter, dc_set_quarter, quarter);
+component_i64_accessors!(dc_get_week_of_month, dc_set_week_of_month, week_of_month);
+component_i64_accessors!(dc_get_week_of_year, dc_set_week_of_year, week_of_year);
+component_i64_accessors!(
+    dc_get_year_for_week_of_year,
+    dc_set_year_for_week_of_year,
+    year_for_week_of_year
+);
+
+unsafe extern "C" fn dc_get_leap_month(receiver: Id, _sel: Sel) -> bool {
+    // SAFETY: an `NSDateComponents`.
+    unsafe { contents::<DateComponents>(receiver as CFTypeRef, date_components_class()) }
+        .is_some_and(|c| c.leap_month)
+}
+
+unsafe extern "C" fn dc_set_leap_month(receiver: Id, _sel: Sel, value: bool) {
+    // SAFETY: an `NSDateComponents`.
+    if let Some(c) =
+        unsafe { contents::<DateComponents>(receiver as CFTypeRef, date_components_class()) }
+    {
+        c.leap_month = value;
+    }
+}
+
+unsafe extern "C" fn dc_get_calendar(receiver: Id, _sel: Sel) -> Id {
+    // SAFETY: an `NSDateComponents`.
+    match unsafe { contents::<DateComponents>(receiver as CFTypeRef, date_components_class()) } {
+        Some(c) if !c.calendar.is_null() => {
+            objc::arc::autorelease(objc::arc::retain(c.calendar as Id))
+        }
+        _ => std::ptr::null_mut(),
+    }
+}
+
+unsafe extern "C" fn dc_set_calendar(receiver: Id, _sel: Sel, value: Id) {
+    // SAFETY: an `NSDateComponents` and a calendar, or nil.
+    let Some(c) =
+        (unsafe { contents::<DateComponents>(receiver as CFTypeRef, date_components_class()) })
+    else {
+        return;
+    };
+    let held = objc::arc::retain(value) as CFTypeRef;
+    objc::arc::release(c.calendar as Id);
+    c.calendar = held;
+}
+
+unsafe extern "C" fn dc_get_time_zone(receiver: Id, _sel: Sel) -> Id {
+    // SAFETY: an `NSDateComponents`.
+    match unsafe { contents::<DateComponents>(receiver as CFTypeRef, date_components_class()) } {
+        Some(c) if !c.time_zone.is_null() => {
+            objc::arc::autorelease(objc::arc::retain(c.time_zone as Id))
+        }
+        _ => std::ptr::null_mut(),
+    }
+}
+
+unsafe extern "C" fn dc_set_time_zone(receiver: Id, _sel: Sel, value: Id) {
+    // SAFETY: an `NSDateComponents` and a time zone, or nil.
+    let Some(c) =
+        (unsafe { contents::<DateComponents>(receiver as CFTypeRef, date_components_class()) })
+    else {
+        return;
+    };
+    let held = objc::arc::retain(value) as CFTypeRef;
+    objc::arc::release(c.time_zone as Id);
+    c.time_zone = held;
+}
+
+fn install_date_components() {
+    let class = date_components_class();
+    crate::define::methods!(class, {
+        "init" => date_components_init, c"@16@0:8";
+        "era" => dc_get_era, c"q16@0:8";
+        "setEra:" => dc_set_era, c"v24@0:8q16";
+        "year" => dc_get_year, c"q16@0:8";
+        "setYear:" => dc_set_year, c"v24@0:8q16";
+        "month" => dc_get_month, c"q16@0:8";
+        "setMonth:" => dc_set_month, c"v24@0:8q16";
+        "day" => dc_get_day, c"q16@0:8";
+        "setDay:" => dc_set_day, c"v24@0:8q16";
+        "hour" => dc_get_hour, c"q16@0:8";
+        "setHour:" => dc_set_hour, c"v24@0:8q16";
+        "minute" => dc_get_minute, c"q16@0:8";
+        "setMinute:" => dc_set_minute, c"v24@0:8q16";
+        "second" => dc_get_second, c"q16@0:8";
+        "setSecond:" => dc_set_second, c"v24@0:8q16";
+        "nanosecond" => dc_get_nanosecond, c"q16@0:8";
+        "setNanosecond:" => dc_set_nanosecond, c"v24@0:8q16";
+        "weekday" => dc_get_weekday, c"q16@0:8";
+        "setWeekday:" => dc_set_weekday, c"v24@0:8q16";
+        "weekdayOrdinal" => dc_get_weekday_ordinal, c"q16@0:8";
+        "setWeekdayOrdinal:" => dc_set_weekday_ordinal, c"v24@0:8q16";
+        "quarter" => dc_get_quarter, c"q16@0:8";
+        "setQuarter:" => dc_set_quarter, c"v24@0:8q16";
+        "weekOfMonth" => dc_get_week_of_month, c"q16@0:8";
+        "setWeekOfMonth:" => dc_set_week_of_month, c"v24@0:8q16";
+        "weekOfYear" => dc_get_week_of_year, c"q16@0:8";
+        "setWeekOfYear:" => dc_set_week_of_year, c"v24@0:8q16";
+        "yearForWeekOfYear" => dc_get_year_for_week_of_year, c"q16@0:8";
+        "setYearForWeekOfYear:" => dc_set_year_for_week_of_year, c"v24@0:8q16";
+        "isLeapMonth" => dc_get_leap_month, c"B16@0:8";
+        "setLeapMonth:" => dc_set_leap_month, c"v24@0:8B16";
+        "calendar" => dc_get_calendar, c"@16@0:8";
+        "setCalendar:" => dc_set_calendar, c"v24@0:8@16";
+        "timeZone" => dc_get_time_zone, c"@16@0:8";
+        "setTimeZone:" => dc_set_time_zone, c"v24@0:8@16";
+    });
+}
+
+#[cfg(test)]
+mod date_components_tests {
+    use super::*;
+
+    /// `+alloc` hands back a zeroed body; `-init` is what plants the boxed
+    /// defaults, and every numeric component starts undefined until set.
+    #[test]
+    fn fresh_components_are_all_undefined() {
+        crate::bootstrap();
+        // SAFETY: a real class, sent its own `-init` directly rather than
+        // through a guest `objc_msgSend` - that marshaling is `tests/msgsend.rs`'s
+        // business, not this module's.
+        unsafe {
+            let class = objc::class::ptr(date_components_class()) as Id;
+            let instance = objc::object::create_instance(date_components_class(), 0);
+            let sel = objc::sel::get("init");
+            let _ = class; // the class pointer above is not otherwise used here
+            date_components_init(instance, sel);
+            assert_eq!(dc_get_year(instance, sel), UNDEFINED);
+            assert_eq!(dc_get_month(instance, sel), UNDEFINED);
+            assert!(!dc_get_leap_month(instance, sel));
+        }
+    }
+
+    /// A set component reads back exactly, and is independent of its siblings.
+    #[test]
+    fn a_set_component_reads_back() {
+        crate::bootstrap();
+        unsafe {
+            let instance = objc::object::create_instance(date_components_class(), 0);
+            let sel = objc::sel::get("init");
+            date_components_init(instance, sel);
+            dc_set_year(instance, sel, 2024);
+            dc_set_month(instance, sel, 3);
+            assert_eq!(dc_get_year(instance, sel), 2024);
+            assert_eq!(dc_get_month(instance, sel), 3);
+            assert_eq!(dc_get_day(instance, sel), UNDEFINED);
+        }
+    }
+}
+
+//
 // Calendars
 //
 
@@ -1013,6 +1283,7 @@ pub fn install() {
     number_class();
     date_class();
     calendar_class();
+    install_date_components();
     objc_api::install();
     number_api::install();
 }
