@@ -367,6 +367,20 @@ const MEDIA_CONSTANTS: &[(&str, &str)] = &[
     ("_kCVPixelBufferPixelFormatTypeKey", "PixelFormatType"),
     ("_kCVPixelBufferWidthKey", "Width"),
     ("_kCVPixelBufferHeightKey", "Height"),
+    // And the ones a VideoToolbox client asks its decoded frames to have.
+    (
+        "_kCVPixelBufferCGBitmapContextCompatibilityKey",
+        "CGBitmapContextCompatibility",
+    ),
+    (
+        "_kCVPixelBufferCGImageCompatibilityKey",
+        "CGImageCompatibility",
+    ),
+    (
+        "_kCVPixelBufferIOSurfacePropertiesKey",
+        "IOSurfaceProperties",
+    ),
+    ("_kCVPixelBufferMetalCompatibilityKey", "MetalCompatibility"),
 ];
 
 fn media_constants() -> Vec<(String, u64)> {

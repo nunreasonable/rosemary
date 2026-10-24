@@ -74,6 +74,17 @@ const KEYS: &[(&str, &str)] = &[
         "MaxFrameDelayCount",
     ),
     ("_kVTCompressionPropertyKey_ProfileLevel", "ProfileLevel"),
+    (
+        "_kVTCompressionPropertyKey_UsingHardwareAcceleratedVideoEncoder",
+        "UsingHardwareAcceleratedVideoEncoder",
+    ),
+    ("_kVTDecompressionPropertyKey_RealTime", "RealTime"),
+    (
+        "_kVTDecompressionPropertyKey_UsingHardwareAcceleratedVideoDecoder",
+        "UsingHardwareAcceleratedVideoDecoder",
+    ),
+    ("_kVTVideoEncoderList_CodecType", "CodecType"),
+    ("_kVTVideoEncoderList_EncoderName", "EncoderName"),
     ("_kVTEncodeFrameOptionKey_ForceKeyFrame", "ForceKeyFrame"),
     (
         "_kVTProfileLevel_H264_Baseline_AutoLevel",

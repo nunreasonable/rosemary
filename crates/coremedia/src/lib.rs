@@ -153,6 +153,8 @@ const KEYS: &[(&str, &str)] = &[
         "SMPTE_240M_1995",
     ),
     ("_kCMFormatDescriptionYCbCrMatrix_ITU_R_2020", "ITU_R_2020"),
+    // Sample attachments, which a decoder client reads per frame.
+    ("_kCMSampleAttachmentKey_NotSync", "NotSync"),
 ];
 
 const ATOMS: &str = "SampleDescriptionExtensionAtoms";
