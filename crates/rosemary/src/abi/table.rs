@@ -806,6 +806,9 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("CGContextSetTextDrawingMode", V, P, I32),
     sig!("CGContextSetGrayFillColor", V, P, F64, F64),
     sig!("CGContextSetShouldSmoothFonts", V, P, BOOL),
+    sig!("CGContextShowGlyphsAtPositions", V, P, P, P, U64),
+    // `CGGlyph` is `unsigned short`.
+    sig!("CGFontGetGlyphWithGlyphName", U16, P, P),
     sig!("CGDisplayBitsPerPixel", U64, U32),
     sig!("CGDisplayCopyAllDisplayModes", P, U32, P),
     sig!("CGDisplayCopyDisplayMode", P, U32),
@@ -919,6 +922,8 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     // `CGImageAlphaInfo` is a `uint32_t` enum; the index into a source is a
     // `size_t`.
     sig!("CGDataProviderCreateWithData", P, P, P, U64, P),
+    // `off_t size` is a 64-bit signed byte count.
+    sig!("CGDataProviderCreateDirect", P, P, I64, P),
     sig!("CGDataProviderRelease", V, P),
     // `CGImageCreate(size_t width, size_t height, size_t bitsPerComponent,
     // size_t bitsPerPixel, size_t bytesPerRow, CGColorSpaceRef,
@@ -4364,6 +4369,7 @@ pub static REFUSED: &[(&str, &str)] = &[
     ("CGRectInset", AGGREGATE),
     ("CGRectIntersection", AGGREGATE),
     ("CGContextConvertRectToUserSpace", AGGREGATE),
+    ("CGContextConvertRectToDeviceSpace", AGGREGATE),
     ("CGDisplayCreateImageForRect", AGGREGATE),
     ("NSMouseInRect", AGGREGATE),
     ("NSRectFill", AGGREGATE),

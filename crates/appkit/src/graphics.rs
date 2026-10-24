@@ -17,6 +17,41 @@ struct ColorSpace {
 /// `CGDataProviderReleaseDataCallback`.
 type ReleaseData = Option<unsafe extern "C" fn(*mut c_void, *const c_void, usize)>;
 
+/// `CGDataProviderGetBytePointerCallback`.
+type GetBytePointer = Option<unsafe extern "C" fn(*mut c_void) -> *const c_void>;
+/// `CGDataProviderReleaseBytePointerCallback`.
+type ReleaseBytePointer = Option<unsafe extern "C" fn(*mut c_void, *const c_void)>;
+/// `CGDataProviderGetBytesAtPositionCallback`: `off_t` is 64-bit on both
+/// architectures.
+type GetBytesAtPosition =
+    Option<unsafe extern "C" fn(*mut c_void, *mut c_void, i64, usize) -> usize>;
+/// `CGDataProviderReleaseInfoCallback`.
+type ReleaseInfo = Option<unsafe extern "C" fn(*mut c_void)>;
+
+/// `CGDataProviderDirectCallbacks`: part of the guest-facing ABI, laid out
+/// exactly as the real struct a caller fills in and passes by pointer.
+#[repr(C)]
+pub struct DirectCallbacks {
+    pub _version: u32,
+    pub get_byte_pointer: GetBytePointer,
+    pub release_byte_pointer: ReleaseBytePointer,
+    pub get_bytes_at_position: GetBytesAtPosition,
+    pub release_info: ReleaseInfo,
+}
+
+/// What a direct provider's dealloc calls beyond freeing the object itself -
+/// set only for one `CGDataProviderCreateDirect` made, never for
+/// [`CGDataProviderCreateWithData`]'s.
+struct DirectRelease {
+    release_byte_pointer: ReleaseBytePointer,
+    release_info: ReleaseInfo,
+    /// Whether `DataProvider::data` is this module's own copy (made when the
+    /// caller gave only `getBytesAtPosition`) rather than the pointer
+    /// `getBytePointer` handed back - the first is freed as a `Box<[u8]>`,
+    /// the second through `release_byte_pointer`.
+    owned_copy: bool,
+}
+
 #[repr(C)]
 struct DataProvider {
     isa: *const c_void,
@@ -24,6 +59,7 @@ struct DataProvider {
     data: *const u8,
     size: usize,
     release: ReleaseData,
+    direct: Option<DirectRelease>,
 }
 
 /// A `CGImage` over the bytes of a data provider, which it retains.
@@ -90,8 +126,28 @@ unsafe extern "C" fn provider_dealloc(receiver: objc::object::Id, _sel: objc::se
     // SAFETY: `-dealloc` of a `__CGDataProvider`, whose body is `DataProvider`.
     unsafe {
         let provider = &mut *(receiver as *mut DataProvider);
-        if let Some(release) = provider.release.take() {
-            release(provider.info, provider.data.cast(), provider.size);
+        match provider.direct.take() {
+            Some(direct) => {
+                if direct.owned_copy {
+                    if !provider.data.is_null() {
+                        // SAFETY: `CGDataProviderCreateDirect` leaked exactly
+                        // this many bytes into `data` for this `owned_copy`.
+                        let bytes: *mut [u8] =
+                            std::slice::from_raw_parts_mut(provider.data as *mut u8, provider.size);
+                        drop(Box::from_raw(bytes));
+                    }
+                } else if let Some(release_byte_pointer) = direct.release_byte_pointer {
+                    release_byte_pointer(provider.info, provider.data.cast());
+                }
+                if let Some(release_info) = direct.release_info {
+                    release_info(provider.info);
+                }
+            }
+            None => {
+                if let Some(release) = provider.release.take() {
+                    release(provider.info, provider.data.cast(), provider.size);
+                }
+            }
         }
         objc::arc::finalize(receiver);
     }
@@ -305,6 +361,66 @@ pub unsafe extern "C" fn CGDataProviderCreateWithData(
         (*provider).data = data.cast();
         (*provider).size = size;
         (*provider).release = release;
+        (*provider).direct = None;
+    }
+    provider as CFTypeRef
+}
+
+/// `CGDataProviderRef CGDataProviderCreateDirect(void *info, off_t size,
+/// const CGDataProviderDirectCallbacks *callbacks)`.
+///
+/// Read once, right here, through whichever callback the caller gave:
+/// `getBytePointer`, if present, kept live until release as its own contract
+/// allows - or else `getBytesAtPosition`, copied into a buffer this module
+/// owns. Either way the result is an ordinary [`DataProvider`] every other
+/// consumer in this file already knows how to read, through [`provider_bytes`].
+///
+/// # Safety
+///
+/// `callbacks` is null or points at a live `CGDataProviderDirectCallbacks`,
+/// and its callbacks, when present, are valid to call with `info`.
+pub unsafe extern "C" fn CGDataProviderCreateDirect(
+    info: *mut c_void,
+    size: i64,
+    callbacks: *const DirectCallbacks,
+) -> CFTypeRef {
+    if callbacks.is_null() || size < 0 {
+        return std::ptr::null();
+    }
+    let size = size as usize;
+    // SAFETY: checked non-null above; the rest is the caller's obligation.
+    let callbacks = unsafe { &*callbacks };
+    let (data, owned_copy) = if let Some(get_byte_pointer) = callbacks.get_byte_pointer {
+        // SAFETY: a guest-supplied callback, called with the `info` it gave.
+        let pointer = unsafe { get_byte_pointer(info) }.cast::<u8>();
+        if pointer.is_null() {
+            return std::ptr::null();
+        }
+        (pointer, false)
+    } else if let Some(get_bytes_at_position) = callbacks.get_bytes_at_position {
+        // Zero-filled already, so a short copy leaves an honest tail rather
+        // than whatever the allocator's memory used to hold.
+        let mut buffer = vec![0u8; size].into_boxed_slice();
+        // SAFETY: `buffer` covers `size` bytes, which is what is asked for.
+        unsafe { get_bytes_at_position(info, buffer.as_mut_ptr().cast(), 0, size) };
+        (Box::into_raw(buffer) as *const u8, true)
+    } else {
+        return std::ptr::null();
+    };
+    let class = objc::class::lookup(c"__CGDataProvider").expect("installed during bootstrap");
+    // SAFETY: `DataProvider` is the registered class layout.
+    let provider = unsafe { corefoundation::base::allocate::<DataProvider>(class) };
+    // SAFETY: a fresh allocation; `data` covers `size` bytes either way above.
+    unsafe {
+        (*provider).info = info;
+        (*provider).data = data;
+        (*provider).size = size;
+        (*provider).release = None;
+        (*provider).direct = Some(DirectRelease {
+            release_byte_pointer: callbacks.release_byte_pointer,
+            release_info: callbacks.release_info,
+            owned_copy,
+        });
     }
     provider as CFTypeRef
 }
@@ -956,6 +1072,95 @@ mod tests {
             assert_eq!(RELEASED.load(std::sync::atomic::Ordering::SeqCst), 0);
             CGImageRelease(copy);
             assert_eq!(RELEASED.load(std::sync::atomic::Ordering::SeqCst), 8);
+        }
+    }
+
+    #[test]
+    fn direct_provider_reads_through_get_byte_pointer() {
+        crate::bootstrap();
+        static BYTES: [u8; 4] = [1, 2, 3, 4];
+        static BYTE_POINTER_RELEASED: std::sync::atomic::AtomicBool =
+            std::sync::atomic::AtomicBool::new(false);
+        static INFO_RELEASED: std::sync::atomic::AtomicBool =
+            std::sync::atomic::AtomicBool::new(false);
+        unsafe extern "C" fn get_byte_pointer(_info: *mut c_void) -> *const c_void {
+            BYTES.as_ptr().cast()
+        }
+        unsafe extern "C" fn release_byte_pointer(_info: *mut c_void, pointer: *const c_void) {
+            assert_eq!(pointer, BYTES.as_ptr().cast());
+            BYTE_POINTER_RELEASED.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        unsafe extern "C" fn release_info(_info: *mut c_void) {
+            INFO_RELEASED.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        let callbacks = DirectCallbacks {
+            _version: 0,
+            get_byte_pointer: Some(get_byte_pointer),
+            release_byte_pointer: Some(release_byte_pointer),
+            get_bytes_at_position: None,
+            release_info: Some(release_info),
+        };
+        // SAFETY: `callbacks` is live for the call, and the provider is
+        // released before the test returns.
+        unsafe {
+            let provider =
+                CGDataProviderCreateDirect(std::ptr::null_mut(), BYTES.len() as i64, &callbacks);
+            assert!(!provider.is_null());
+            assert_eq!(provider_bytes(provider), Some(&BYTES[..]));
+            CGDataProviderRelease(provider);
+        }
+        assert!(BYTE_POINTER_RELEASED.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(INFO_RELEASED.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[test]
+    fn direct_provider_without_a_byte_pointer_copies_through_get_bytes_at_position() {
+        crate::bootstrap();
+        unsafe extern "C" fn get_bytes_at_position(
+            _info: *mut c_void,
+            buffer: *mut c_void,
+            position: i64,
+            count: usize,
+        ) -> usize {
+            assert_eq!(position, 0);
+            let source = [9u8, 8, 7];
+            let copied = count.min(source.len());
+            // SAFETY: the caller's buffer covers `count` bytes.
+            unsafe { std::ptr::copy_nonoverlapping(source.as_ptr(), buffer.cast(), copied) };
+            copied
+        }
+        let callbacks = DirectCallbacks {
+            _version: 0,
+            get_byte_pointer: None,
+            release_byte_pointer: None,
+            get_bytes_at_position: Some(get_bytes_at_position),
+            release_info: None,
+        };
+        // SAFETY: `callbacks` is live for the call, and the provider is
+        // released before the test returns.
+        unsafe {
+            let provider = CGDataProviderCreateDirect(std::ptr::null_mut(), 3, &callbacks);
+            assert!(!provider.is_null());
+            assert_eq!(provider_bytes(provider), Some(&[9u8, 8, 7][..]));
+            CGDataProviderRelease(provider);
+        }
+    }
+
+    #[test]
+    fn direct_provider_refuses_callbacks_with_no_reader() {
+        let callbacks = DirectCallbacks {
+            _version: 0,
+            get_byte_pointer: None,
+            release_byte_pointer: None,
+            get_bytes_at_position: None,
+            release_info: None,
+        };
+        // SAFETY: `callbacks` is live for the call, and null is a valid one.
+        unsafe {
+            assert!(CGDataProviderCreateDirect(std::ptr::null_mut(), 0, &callbacks).is_null());
+            assert!(
+                CGDataProviderCreateDirect(std::ptr::null_mut(), 0, std::ptr::null()).is_null()
+            );
         }
     }
 }

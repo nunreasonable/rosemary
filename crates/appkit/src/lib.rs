@@ -253,6 +253,7 @@ exports::exports! {
         "CGColorSpaceCopyPropertyList" => graphics::CGColorSpaceCopyPropertyList,
         "CGColorSpaceRetain" => graphics::CGColorSpaceRetain,
         "CGDataProviderCreateWithData" => graphics::CGDataProviderCreateWithData,
+        "CGDataProviderCreateDirect" => graphics::CGDataProviderCreateDirect,
         "CGDataProviderRelease" => graphics::CGDataProviderRelease,
         "CGImageCreate" => graphics::CGImageCreate,
         "CGImageMaskCreate" => graphics::CGImageMaskCreate,
