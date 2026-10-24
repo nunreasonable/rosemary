@@ -136,10 +136,14 @@ pub unsafe extern "C" fn AudioFormatGetProperty(
         unsafe { *size = size_of::<Format>() as u32 };
         return SUCCESS;
     }
-    // SAFETY: writable for `*size` bytes, at least a whole description:
-    // guaranteed above when `data_holds_format`, which is the only way to
-    // reach here with `data` non-null.
+    // SAFETY: the caller says `data` is writable for `*size` bytes, checked
+    // here to be a whole description. Not implied by reaching this point: a
+    // description read from `specifier` gets here with a short `data` too.
     unsafe {
+        if (*size as usize) < size_of::<Format>() {
+            *size = 0;
+            return PARAM_ERROR;
+        }
         *(data as *mut Format) = format;
         *size = size_of::<Format>() as u32;
     }

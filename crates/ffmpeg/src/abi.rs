@@ -56,12 +56,16 @@ pub mod frame {
     /// Audio only: samples per channel in this frame.
     pub const NB_SAMPLES: usize = 112;
     pub const PTS: usize = 136;
+    /// Audio only.
+    pub const SAMPLE_RATE: usize = 180;
     pub const COLOR_RANGE: usize = 280;
     pub const COLOR_PRIMARIES: usize = 284;
     pub const COLOR_TRC: usize = 288;
     pub const COLORSPACE: usize = 292;
     pub const CROP_TOP: usize = 344;
     pub const CROP_LEFT: usize = 360;
+    /// Audio only, an `AVChannelLayout` (see [`super::ch_layout`]).
+    pub const CH_LAYOUT: usize = 384;
 }
 
 /// `AVCodecHWConfig`.
@@ -150,6 +154,8 @@ mod tests {
             ("AVFrame.nb_samples", frame::NB_SAMPLES as i64),
             ("AVFrame.format", frame::FORMAT as i64),
             ("AVFrame.pts", frame::PTS as i64),
+            ("AVFrame.sample_rate", frame::SAMPLE_RATE as i64),
+            ("AVFrame.ch_layout", frame::CH_LAYOUT as i64),
             ("AVFrame.color_range", frame::COLOR_RANGE as i64),
             ("AVFrame.color_primaries", frame::COLOR_PRIMARIES as i64),
             ("AVFrame.color_trc", frame::COLOR_TRC as i64),
@@ -197,7 +203,8 @@ int main(void) {
     O(AVPacket, pts); O(AVPacket, data); O(AVPacket, size);
     O(AVFrame, data); O(AVFrame, linesize); O(AVFrame, extended_data);
     O(AVFrame, width); O(AVFrame, height); O(AVFrame, nb_samples);
-    O(AVFrame, format); O(AVFrame, pts); O(AVFrame, color_range); O(AVFrame, color_primaries);
+    O(AVFrame, format); O(AVFrame, pts); O(AVFrame, sample_rate); O(AVFrame, ch_layout);
+    O(AVFrame, color_range); O(AVFrame, color_primaries);
     O(AVFrame, color_trc); O(AVFrame, colorspace); O(AVFrame, crop_top); O(AVFrame, crop_left);
     O(AVCodecHWConfig, pix_fmt); O(AVCodecHWConfig, methods); O(AVCodecHWConfig, device_type);
     V("METHOD_HW_DEVICE_CTX", AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX);

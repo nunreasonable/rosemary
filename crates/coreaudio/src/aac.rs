@@ -3,11 +3,11 @@
 //! decoder (shared loader: [`ffmpeg`]).
 //!
 //! What this does *not* parse: a `ProgramConfigElement` (channel
-//! configuration 0), an extension `audioObjectType` signalling explicit
-//! SBR/PS, or anything past `frameLengthFlag` in `GASpecificConfig`. None of
-//! that changes a raw AAC LC or HE-AAC stream's sample rate, channel count or
-//! frame length, which is all this needs to know; a cookie that needs it is
-//! refused rather than guessed at.
+//! configuration 0), the extension rate of explicit SBR/PS signalling (only
+//! skipped, to reach the core), or anything past `frameLengthFlag` in
+//! `GASpecificConfig`. None of that changes a raw AAC LC or HE-AAC stream's
+//! sample rate, channel count or frame length, which is all this needs to
+//! know; a cookie that needs it is refused rather than guessed at.
 
 use std::ffi::c_void;
 use std::sync::Once;
@@ -103,18 +103,37 @@ fn channel_configuration(bits: &mut Bits) -> Option<u32> {
     }
 }
 
+/// `GetAudioObjectType()`: five bits, 31 escaping to 32 plus six more.
+fn audio_object_type(bits: &mut Bits) -> Option<u32> {
+    match bits.bits(5)? {
+        31 => Some(32 + bits.bits(6)?),
+        n => Some(n),
+    }
+}
+
 /// Parses a bare `AudioSpecificConfig`, i.e. already stripped of any MP4
 /// `esds` wrapper by [`strip_wrapper`].
 pub(crate) fn parse_asc(bytes: &[u8]) -> Option<AudioSpecificConfig> {
     let mut bits = Bits::new(bytes);
-    // `audioObjectType`, with the 31-escapes-to-6-more-bits extension; the
-    // value itself is not needed below, but the bits must still be consumed
-    // to keep the fields after it aligned.
-    if bits.bits(5)? == 31 {
-        bits.bits(6)?;
-    }
+    let mut object_type = audio_object_type(&mut bits)?;
     let sample_rate = sampling_frequency(&mut bits)?;
     let channels = channel_configuration(&mut bits)?;
+    // Explicit SBR (5) or PS (29) signalling puts the extension rate and the
+    // core's own object type between the channels and GASpecificConfig;
+    // without skipping them the frame-length bit below is read from the
+    // wrong place. The rate kept is the core's, the base-level format.
+    if object_type == 5 || object_type == 29 {
+        sampling_frequency(&mut bits)?;
+        object_type = audio_object_type(&mut bits)?;
+        if object_type == 22 {
+            bits.bits(4)?;
+        }
+    }
+    // Only these object types carry a GASpecificConfig; any other has no
+    // frameLengthFlag here to read, so it is refused rather than misread.
+    if !matches!(object_type, 1..=4 | 6 | 7 | 17 | 19..=23) {
+        return None;
+    }
     // `GASpecificConfig.frameLengthFlag`; `dependsOnCoreCoder` and whatever
     // follows it do not change the frame length and are not read.
     let frame_length_1024 = bits.bits(1)? == 0;
@@ -155,44 +174,93 @@ fn descriptor(data: &[u8]) -> Option<(u8, &[u8])> {
 /// parse it as a raw `AudioSpecificConfig` is then the caller's and
 /// [`parse_asc`]'s to refuse, not this function's to guess at.
 pub(crate) fn strip_wrapper(cookie: &[u8]) -> &[u8] {
-    if cookie.len() > 12 && cookie[4..8] == *b"esds" {
-        return strip_wrapper(&cookie[12..]);
-    }
-    match descriptor(cookie) {
-        // ES_Descriptor: ES_ID (2) + flags (1), then optionally
-        // dependsOn_ES_ID (2), a URL (length-prefixed) and OCR_ES_Id (2),
-        // then the DecoderConfigDescriptor this recurses into.
-        Some((0x03, payload)) if payload.len() >= 3 => {
-            let flags = payload[2];
-            let mut at = 3usize;
-            if flags & 0x80 != 0 {
-                at += 2;
-            }
-            if flags & 0x40 != 0 {
-                match payload.get(at) {
-                    Some(&len) => at += 1 + len as usize,
-                    None => return cookie,
-                }
-            }
-            if flags & 0x20 != 0 {
-                at += 2;
-            }
-            match payload.get(at..) {
-                Some(rest) => strip_wrapper(rest),
-                None => cookie,
-            }
+    // A loop, not recursion: a guest's cookie of nested descriptors would
+    // otherwise recurse once per five bytes, deep enough to overflow an
+    // audio thread's stack.
+    let mut cookie = cookie;
+    loop {
+        if cookie.len() > 12 && cookie[4..8] == *b"esds" {
+            cookie = &cookie[12..];
+            continue;
         }
-        // DecoderConfigDescriptor: objectTypeIndication (1), streamType and
-        // flags (1), bufferSizeDB (3), maxBitrate (4), avgBitrate (4), then
-        // the DecoderSpecificInfo this recurses into.
-        Some((0x04, payload)) => match payload.get(13..) {
-            Some(rest) => strip_wrapper(rest),
-            None => cookie,
-        },
-        // DecoderSpecificInfo: its payload already is the AudioSpecificConfig.
-        Some((0x05, payload)) => payload,
-        _ => cookie,
+        let rest = match descriptor(cookie) {
+            // ES_Descriptor: ES_ID (2) + flags (1), then optionally
+            // dependsOn_ES_ID (2), a URL (length-prefixed) and OCR_ES_Id (2),
+            // then the DecoderConfigDescriptor this descends into.
+            Some((0x03, payload)) if payload.len() >= 3 => {
+                let flags = payload[2];
+                let mut at = 3usize;
+                if flags & 0x80 != 0 {
+                    at += 2;
+                }
+                if flags & 0x40 != 0 {
+                    match payload.get(at) {
+                        Some(&len) => at += 1 + len as usize,
+                        None => return cookie,
+                    }
+                }
+                if flags & 0x20 != 0 {
+                    at += 2;
+                }
+                payload.get(at..)
+            }
+            // DecoderConfigDescriptor: objectTypeIndication (1), streamType
+            // and flags (1), bufferSizeDB (3), maxBitrate (4), avgBitrate
+            // (4), then the DecoderSpecificInfo this descends into.
+            Some((0x04, payload)) => payload.get(13..),
+            // DecoderSpecificInfo: its payload already is the
+            // AudioSpecificConfig.
+            Some((0x05, payload)) => return payload,
+            _ => return cookie,
+        };
+        match rest {
+            Some(rest) => cookie = rest,
+            None => return cookie,
+        }
     }
+}
+
+/// A two-byte AAC LC `AudioSpecificConfig` for a description that came
+/// without a magic cookie, which is how Roblox opens its converter: Apple's
+/// decoder starts from the description alone. `None` for what two bytes
+/// cannot say exactly - a rate outside the table (FFmpeg refuses the
+/// explicit-frequency escape) or a channel count with no
+/// `channelConfiguration` - so that is refused, not approximated.
+///
+/// HE-AAC's description gives the SBR-doubled rate and frame length; the
+/// core this describes is half of each, and FFmpeg finds the SBR (and
+/// HE-AAC v2's parametric stereo, over a mono core) in the stream itself.
+pub(crate) fn asc_for_description(
+    format_id: u32,
+    sample_rate: f64,
+    channels: u32,
+    frames_per_packet: u32,
+) -> Option<[u8; 2]> {
+    const RATES: [u32; 13] = [
+        96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050, 16000, 12000, 11025, 8000, 7350,
+    ];
+    let (rate, frames) = match is_sbr(format_id) {
+        true => (sample_rate / 2.0, frames_per_packet / 2),
+        false => (sample_rate, frames_per_packet),
+    };
+    let index = RATES.iter().position(|&r| f64::from(r) == rate)? as u8;
+    let channels = match format_id {
+        AAC_HE_V2 => 1,
+        _ => channels,
+    };
+    let configuration = match channels {
+        1..=6 => channels as u8,
+        8 => 7,
+        _ => return None,
+    };
+    let frame_length_flag = u8::from(frames == 960);
+    // audioObjectType 2 (5 bits), samplingFrequencyIndex (4),
+    // channelConfiguration (4), frameLengthFlag, dependsOnCoreCoder and
+    // extensionFlag (1 each, the last two clear).
+    Some([
+        (2 << 3) | (index >> 1),
+        ((index & 1) << 7) | (configuration << 3) | (frame_length_flag << 2),
+    ])
 }
 
 /// [`strip_wrapper`] then [`parse_asc`], for a cookie exactly as a guest
@@ -218,9 +286,6 @@ pub(crate) struct AacDecoder {
     /// Set once `avcodec_open2` has succeeded, which needs the
     /// `AudioSpecificConfig` as `extradata` first.
     opened: bool,
-    /// What the context reported after opening.
-    pub(crate) sample_rate: u32,
-    pub(crate) channels: u32,
     pub(crate) reported_first_packet: Once,
 }
 
@@ -259,8 +324,6 @@ impl AacDecoder {
                 packet: (api.av_packet_alloc)(),
                 frame: (api.av_frame_alloc)(),
                 opened: false,
-                sample_rate: 0,
-                channels: 0,
                 reported_first_packet: Once::new(),
             }
         };
@@ -282,45 +345,31 @@ impl AacDecoder {
     pub(crate) fn set_extradata(&mut self, cookie: &[u8]) -> Result<(), String> {
         let codec = self.reopen_context()?;
         let asc = strip_wrapper(cookie);
+        let Ok(size) = i32::try_from(asc.len()) else {
+            return Err("the magic cookie is too large".to_string());
+        };
         // SAFETY: a fresh context; `extradata` is `libc::malloc`ed with the
         // padding FFmpeg's own comment on the field asks for, so freeing it
         // with `free()` in `avcodec_free_context` is the same allocator on
         // both ends.
         let status = unsafe {
-            let size = asc.len() + abi::INPUT_BUFFER_PADDING_SIZE;
-            let buffer = libc::malloc(size).cast::<u8>();
+            let buffer = libc::malloc(asc.len() + abi::INPUT_BUFFER_PADDING_SIZE).cast::<u8>();
             if buffer.is_null() {
                 return Err("out of memory".to_string());
             }
             std::ptr::copy_nonoverlapping(asc.as_ptr(), buffer, asc.len());
             buffer.add(asc.len()).write_bytes(0, abi::INPUT_BUFFER_PADDING_SIZE);
             abi::write::<*mut u8>(self.context, abi::context::EXTRADATA, buffer);
-            abi::write::<i32>(
-                self.context,
-                abi::context::EXTRADATA_SIZE,
-                asc.len() as i32,
-            );
+            abi::write::<i32>(self.context, abi::context::EXTRADATA_SIZE, size);
             (self.api.avcodec_open2)(self.context, codec, std::ptr::null_mut())
         };
         if status < 0 {
             return Err(format!("FFmpeg did not open the aac decoder (error {status})"));
         }
-        // SAFETY: the context `avcodec_open2` just configured.
-        let (sample_rate, channels) = unsafe {
-            (
-                abi::read::<i32>(self.context, abi::context::SAMPLE_RATE),
-                abi::read::<i32>(
-                    self.context,
-                    abi::context::CH_LAYOUT + abi::ch_layout::NB_CHANNELS,
-                ),
-            )
-        };
-        if sample_rate <= 0 || channels <= 0 {
-            return Err("the aac decoder did not report a sample rate and channel count"
-                .to_string());
-        }
-        self.sample_rate = sample_rate as u32;
-        self.channels = channels as u32;
+        // Not the context's `sample_rate`: FFmpeg's aac decoder leaves it at
+        // zero until the first frame (it may yet find SBR and double it), so
+        // each frame's own rate and channel count are what the output is
+        // converted from.
         self.opened = true;
         Ok(())
     }
@@ -340,8 +389,6 @@ impl AacDecoder {
         // first open gets here.
         unsafe { (self.api.avcodec_free_context)(&mut self.context) };
         self.opened = false;
-        self.sample_rate = 0;
-        self.channels = 0;
         // SAFETY: `codec` just resolved.
         self.context = unsafe { (self.api.avcodec_alloc_context3)(codec) };
         if self.context.is_null() {
@@ -370,64 +417,91 @@ impl AacDecoder {
             std::ptr::copy_nonoverlapping(bytes.as_ptr(), data, bytes.len());
             (api.avcodec_send_packet)(self.context, self.packet)
         };
+        // Not `EAGAIN` as success: that means FFmpeg did not take the
+        // packet (one is already waiting), and the caller drains between
+        // packets so that it never happens; were it to, the packet would be
+        // lost silently.
         match status {
-            0 | abi::EAGAIN => Ok(()),
+            0 => Ok(()),
             other => Err(other),
         }
     }
 
     /// Pulls one decoded frame's samples, interleaved as `f32`, appended to
-    /// `out`. `Ok(false)` once FFmpeg has none ready now.
-    pub(crate) fn receive_interleaved(&mut self, out: &mut Vec<f32>) -> Result<bool, i32> {
+    /// `out`, with the frame's own sample rate and channel count - which
+    /// FFmpeg may change from one frame to the next (implicit SBR or PS is
+    /// only found by decoding). `Ok(None)` once FFmpeg has none ready now.
+    pub(crate) fn receive_interleaved(
+        &mut self,
+        out: &mut Vec<f32>,
+    ) -> Result<Option<(u32, u32)>, i32> {
         let api = self.api;
         // SAFETY: the open context and this decoder's frame.
         let status = unsafe { (api.avcodec_receive_frame)(self.context, self.frame) };
         match status {
-            abi::EAGAIN | abi::EOF => return Ok(false),
+            abi::EAGAIN | abi::EOF => return Ok(None),
             s if s < 0 => return Err(s),
             _ => {}
         }
         self.reported_first_packet.call_once(|| {
             eprintln!("rosemary: coreaudio: first AAC packet decoded through FFmpeg");
         });
-        let result = (|| -> Result<(), i32> {
-            // SAFETY: a frame `avcodec_receive_frame` just filled.
-            let format = unsafe { abi::read::<i32>(self.frame, abi::frame::FORMAT) };
-            if format != SAMPLE_FMT_FLTP {
-                return Err(-1);
-            }
-            // SAFETY: as above.
-            let nb_samples = unsafe { abi::read::<i32>(self.frame, abi::frame::NB_SAMPLES) };
-            let channels = self.channels.max(1) as usize;
-            let Ok(nb_samples) = usize::try_from(nb_samples) else {
-                return Err(-1);
-            };
-            let base = out.len();
-            out.resize(base + nb_samples * channels, 0.0);
-            for channel in 0..channels.min(8) {
-                // SAFETY: `AVFrame.data[channel]` for a planar format with up
-                // to 8 channels in the fixed array (more needs
-                // `extended_data`, which this backend does not read: AAC
-                // never has more than 8 channels in the configurations
-                // `channel_configuration` accepts).
-                let plane = unsafe {
-                    abi::read::<*const f32>(self.frame, abi::frame::DATA + channel * 8)
-                };
-                if plane.is_null() {
-                    return Err(-1);
-                }
-                // SAFETY: FFmpeg allocated this plane at least `nb_samples`
-                // floats long.
-                let plane = unsafe { std::slice::from_raw_parts(plane, nb_samples) };
-                for (frame, &sample) in plane.iter().enumerate() {
-                    out[base + frame * channels + channel] = sample;
-                }
-            }
-            Ok(())
-        })();
+        let result = self.interleave(out);
         // SAFETY: the frame, no longer needed once copied out.
         unsafe { (api.av_frame_unref)(self.frame) };
-        result.map(|()| true)
+        result.map(Some)
+    }
+
+    /// The frame `avcodec_receive_frame` just filled, appended to `out`
+    /// interleaved, and its sample rate and channel count.
+    fn interleave(&self, out: &mut Vec<f32>) -> Result<(u32, u32), i32> {
+        // SAFETY: a frame `avcodec_receive_frame` just filled.
+        let (format, nb_samples, rate, channels) = unsafe {
+            (
+                abi::read::<i32>(self.frame, abi::frame::FORMAT),
+                abi::read::<i32>(self.frame, abi::frame::NB_SAMPLES),
+                abi::read::<i32>(self.frame, abi::frame::SAMPLE_RATE),
+                abi::read::<i32>(self.frame, abi::frame::CH_LAYOUT + abi::ch_layout::NB_CHANNELS),
+            )
+        };
+        if format != SAMPLE_FMT_FLTP {
+            return Err(-1);
+        }
+        let (Ok(nb_samples), Ok(rate), Ok(channels)) = (
+            usize::try_from(nb_samples),
+            u32::try_from(rate),
+            usize::try_from(channels),
+        ) else {
+            return Err(-1);
+        };
+        if rate == 0 || channels == 0 {
+            return Err(-1);
+        }
+        // SAFETY: as above; for audio, `extended_data` always points at
+        // one plane per channel (at `data` itself up to eight).
+        let planes = unsafe {
+            abi::read::<*const *const f32>(self.frame, abi::frame::EXTENDED_DATA)
+        };
+        if planes.is_null() {
+            return Err(-1);
+        }
+        let base = out.len();
+        out.resize(base + nb_samples * channels, 0.0);
+        for channel in 0..channels {
+            // SAFETY: one of `channels` plane pointers.
+            let plane = unsafe { planes.add(channel).read() };
+            if plane.is_null() {
+                out.truncate(base);
+                return Err(-1);
+            }
+            // SAFETY: FFmpeg allocated this plane at least `nb_samples`
+            // floats long.
+            let plane = unsafe { std::slice::from_raw_parts(plane, nb_samples) };
+            for (frame, &sample) in plane.iter().enumerate() {
+                out[base + frame * channels + channel] = sample;
+            }
+        }
+        Ok((rate, channels as u32))
     }
 
     /// `AudioConverterReset`: drop whatever is in flight and let the decoder
@@ -545,6 +619,44 @@ mod tests {
         assert_eq!(asc.sample_rate, 12345);
         assert_eq!(asc.channels, 1);
         assert!(!asc.frame_length_1024);
+    }
+
+    /// Explicit SBR puts an extension rate and the core's object type before
+    /// GASpecificConfig; an extension index of 8 starts with a set bit, which
+    /// read as the frame-length flag would claim 960-sample frames.
+    #[test]
+    fn explicit_sbr_signalling_reads_the_core_config_after_it() {
+        let bytes = pack_bits(&[(5, 5), (11, 4), (2, 4), (8, 4), (2, 5), (0, 1)]);
+        let asc = parse_asc(&bytes).expect("explicit SBR parses");
+        assert_eq!(asc.sample_rate, 8000);
+        assert_eq!(asc.channels, 2);
+        assert!(asc.frame_length_1024);
+    }
+
+    /// Roblox's own cookie: each descriptor length written as four bytes.
+    #[test]
+    fn four_byte_descriptor_lengths_are_followed() {
+        let wrap = |tag: u8, body: &[u8]| {
+            let mut v = vec![tag, 0x80, 0x80, 0x80, body.len() as u8];
+            v.extend_from_slice(body);
+            v
+        };
+        let asc = stereo_44k_lc();
+        let mut dcd = vec![0x40, 0x15, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        dcd.extend_from_slice(&wrap(0x05, &asc));
+        let mut es = vec![0, 0, 0];
+        es.extend_from_slice(&wrap(0x04, &dcd));
+        assert_eq!(strip_wrapper(&wrap(0x03, &es)), asc.as_slice());
+    }
+
+    #[test]
+    fn a_description_without_a_cookie_becomes_the_matching_lc_config() {
+        let asc = asc_for_description(AAC_LC, 44100.0, 2, 1024).expect("a table rate, stereo");
+        assert_eq!(asc, [0x12, 0x10]);
+        // HE-AAC's description has the doubled rate; the core is 22050.
+        assert_eq!(asc_for_description(AAC_HE, 44100.0, 2, 2048), Some([0x13, 0x90]));
+        assert!(asc_for_description(AAC_LC, 44101.0, 2, 1024).is_none());
+        assert!(asc_for_description(AAC_LC, 44100.0, 7, 1024).is_none());
     }
 
     #[test]

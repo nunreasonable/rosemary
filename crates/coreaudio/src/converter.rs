@@ -62,6 +62,9 @@ struct Converter {
     /// Set for a compressed source; `None` for PCM-to-PCM, which SDL alone
     /// handles.
     aac: Option<Box<AacDecoder>>,
+    /// The `(rate, channels)` `stream` now converts from, for a compressed
+    /// source: the decoder's, which can change at a frame boundary.
+    decoded: Option<(u32, u32)>,
     /// The magic cookie last given through `kAudioConverterDecompressionMagicCookie`,
     /// kept only so `AudioConverterGetProperty` can hand the same bytes back.
     cookie: Vec<u8>,
@@ -117,14 +120,28 @@ pub unsafe extern "C" fn AudioConverterNew(
         if sdl_spec(&destination).is_none() {
             return FORMAT_NOT_SUPPORTED;
         }
-        let Ok(decoder) = AacDecoder::new() else {
+        let Ok(mut decoder) = AacDecoder::new() else {
             return FORMAT_NOT_SUPPORTED;
         };
+        // Apple's decoder starts from the description alone, and Roblox never
+        // sets a magic cookie on its converter: open from the description
+        // now, and let a cookie set later reopen it. A description that does
+        // not say enough is left for a cookie to complete.
+        if let Some(asc) = aac::asc_for_description(
+            source.format_id,
+            source.sample_rate,
+            source.channels_per_frame,
+            source.frames_per_packet,
+        ) && decoder.set_extradata(&asc).is_err()
+        {
+            return FORMAT_NOT_SUPPORTED;
+        }
         Converter {
             source,
             destination,
             stream: std::ptr::null_mut(),
             aac: Some(Box::new(decoder)),
+            decoded: None,
             cookie: Vec::new(),
             held: Vec::new(),
             scratch: Vec::new(),
@@ -141,6 +158,7 @@ pub unsafe extern "C" fn AudioConverterNew(
             destination,
             stream,
             aac: None,
+            decoded: None,
             cookie: Vec::new(),
             held: Vec::new(),
             scratch: Vec::new(),
@@ -545,33 +563,40 @@ fn feed(converter: &mut Converter, input: InputProc, input_data: *mut c_void) ->
     }
 }
 
-/// Creates the SDL stream that converts the AAC decoder's own output (always
-/// interleaved `f32`, at whatever rate and channel count it reports) to the
-/// destination format, the first time there is a rate and channel count to
-/// make it with. `false` for a destination SDL cannot produce, or for a
-/// decoder that has not opened yet (no magic cookie set).
+/// Points the SDL stream at the AAC decoder's output for one frame (always
+/// interleaved `f32`, at the frame's rate and channel count): made on the
+/// first frame, and re-pointed when a later frame differs, which SDL applies
+/// to data put from then on only. `false` for a spec SDL cannot convert.
 fn ensure_decoded_stream(converter: &mut Converter, rate: u32, channels: u32) -> bool {
-    if !converter.stream.is_null() {
+    if converter.decoded == Some((rate, channels)) && !converter.stream.is_null() {
         return true;
     }
-    if rate == 0 || channels == 0 {
+    let (Ok(freq), Ok(channels_i32)) = (i32::try_from(rate), i32::try_from(channels)) else {
         return false;
-    }
+    };
     let from = sdl3::AudioSpec {
         format: sdl3::audio::format::F32,
-        channels: channels as i32,
-        freq: rate as i32,
+        channels: channels_i32,
+        freq,
     };
     let Some(to) = sdl_spec(&converter.destination) else {
         return false;
     };
-    match sdl3::audio::create_converter(from, to) {
-        Some(stream) => {
-            converter.stream = stream;
-            true
-        }
-        None => false,
+    let made = match converter.stream.is_null() {
+        true => match sdl3::audio::create_converter(from, to) {
+            Some(stream) => {
+                converter.stream = stream;
+                true
+            }
+            None => false,
+        },
+        // SAFETY: a stream this crate made.
+        false => unsafe { sdl3::audio::set_format(converter.stream, from, to) },
+    };
+    if made {
+        converter.decoded = Some((rate, channels));
     }
+    made
 }
 
 /// `f32` samples as the native-endian bytes SDL's stream takes.
@@ -583,27 +608,39 @@ fn f32_bytes(samples: &[f32]) -> Vec<u8> {
     bytes
 }
 
-/// Drains every frame FFmpeg has ready now into `out`, interleaved.
-fn drain_decoded(aac: &mut AacDecoder, out: &mut Vec<f32>) {
+/// Moves every frame FFmpeg has ready now into the SDL stream, one frame at
+/// a time so each goes in under its own spec.
+fn drain_decoded(converter: &mut Converter) {
     loop {
-        match aac.receive_interleaved(out) {
-            Ok(true) => continue,
-            Ok(false) | Err(_) => break,
+        let mut samples = Vec::new();
+        let Some(aac) = converter.aac.as_deref_mut() else {
+            return;
+        };
+        let Ok(Some((rate, channels))) = aac.receive_interleaved(&mut samples) else {
+            return;
+        };
+        if !ensure_decoded_stream(converter, rate, channels) {
+            // Dropped, not converted as if it were some other spec.
+            continue;
         }
+        let bytes = f32_bytes(&samples);
+        // SAFETY: a stream this crate made (or just made, above).
+        unsafe { sdl3::audio::put(converter.stream, &bytes) };
     }
 }
 
-/// [`feed`] for a compressed source: pulls one or more AAC access units from
-/// the caller's input procedure, sends each through FFmpeg, and puts
-/// whatever comes out - interleaved `f32` - into the SDL stream that brings
-/// it to the destination format.
+/// [`feed`] for a compressed source: pulls AAC packets from the caller's
+/// input procedure and decodes each through FFmpeg into the SDL stream
+/// that brings it to the destination format.
 ///
 /// `AudioStreamPacketDescription`s are read when the procedure supplies
 /// them, which is how a real CoreAudio caller marks where each packet
 /// starts in a buffer it may have concatenated several into. A procedure
 /// that supplies none is read as one packet, the one shape this can still
-/// make sense of without them; that is a degraded answer, not a refusal, so
-/// it is accepted rather than failed.
+/// make sense of without them.
+///
+/// Each packet is drained before the next is sent: FFmpeg holds only one
+/// unsent packet, and refuses (`EAGAIN`) a third before a receive.
 fn feed_aac(converter: &mut Converter, input: InputProc, input_data: *mut c_void) -> bool {
     let mut wanted = 32u32;
     let mut list = AudioBufferList {
@@ -626,25 +663,19 @@ fn feed_aac(converter: &mut Converter, input: InputProc, input_data: *mut c_void
             input_data,
         )
     };
-    let Some(aac) = converter.aac.as_deref_mut() else {
+    if status != SUCCESS {
+        // Apple's contract: an error with no packets is "nothing more for
+        // now", not end of stream - Roblox's procedure answers that way
+        // after every packet. Nothing is flushed, so the resampler's tail
+        // stays queued for the packets still to come.
         return false;
-    };
-    if status != SUCCESS || list.count == 0 || wanted == 0 || list.buffers[0].data.is_null() {
-        // End of stream: nothing more will ever be sent, so whatever FFmpeg
-        // is still holding back comes out now.
-        let mut decoded = Vec::new();
-        drain_decoded(aac, &mut decoded);
-        let (rate, channels) = (aac.sample_rate, aac.channels);
-        if !ensure_decoded_stream(converter, rate, channels) {
-            return false;
+    }
+    if list.count == 0 || wanted == 0 || list.buffers[0].data.is_null() {
+        // End of stream: the resampler hands back its tail now.
+        if !converter.stream.is_null() {
+            // SAFETY: a stream this crate made.
+            unsafe { sdl3::audio::flush(converter.stream) };
         }
-        if !decoded.is_empty() {
-            let bytes = f32_bytes(&decoded);
-            // SAFETY: a stream this crate made (or just made, above).
-            unsafe { sdl3::audio::put(converter.stream, &bytes) };
-        }
-        // SAFETY: as above.
-        unsafe { sdl3::audio::flush(converter.stream) };
         return false;
     }
 
@@ -664,30 +695,31 @@ fn feed_aac(converter: &mut Converter, input: InputProc, input_data: *mut c_void
             std::slice::from_raw_parts(descriptions.cast::<PacketDescription>(), wanted as usize)
         }
     };
-    let sent = match packets {
-        [] => aac.send(data).is_ok(),
-        _ => packets.iter().all(|d| {
-            let start = d.start_offset.max(0) as usize;
-            let end = start.saturating_add(d.data_byte_size as usize);
-            data.get(start..end).is_some_and(|slice| aac.send(slice).is_ok())
-        }),
+    let whole = [PacketDescription {
+        start_offset: 0,
+        variable_frames_in_packet: 0,
+        data_byte_size: buffer.byte_size,
+    }];
+    let packets = match packets {
+        [] => &whole[..],
+        some => some,
     };
-    if !sent {
-        return false;
-    }
-    let mut decoded = Vec::new();
-    drain_decoded(aac, &mut decoded);
-    let (rate, channels) = (aac.sample_rate, aac.channels);
-    if !ensure_decoded_stream(converter, rate, channels) {
-        // Not opened yet (no magic cookie set): the bytes were sent nowhere
-        // useful, but this is not end of stream - a caller is expected to
-        // set the cookie before the first fill, and retrying is cheap.
-        return true;
-    }
-    if !decoded.is_empty() {
-        let bytes = f32_bytes(&decoded);
-        // SAFETY: a stream this crate made (or just made, above).
-        unsafe { sdl3::audio::put(converter.stream, &bytes) };
+    for description in packets {
+        let start = usize::try_from(description.start_offset).unwrap_or(usize::MAX);
+        let end = start.saturating_add(description.data_byte_size as usize);
+        let Some(packet) = data.get(start..end) else {
+            // A description outside the buffer it describes: the caller's
+            // data is wrong, and nothing after it can be trusted either.
+            return false;
+        };
+        let Some(aac) = converter.aac.as_deref_mut() else {
+            return false;
+        };
+        // A packet FFmpeg cannot decode is skipped, as a decoder conceals a
+        // damaged access unit; it is not the end of the stream. Drained
+        // either way, so nothing is left in front of the next packet.
+        let _ = aac.send(packet);
+        drain_decoded(converter);
     }
     true
 }
