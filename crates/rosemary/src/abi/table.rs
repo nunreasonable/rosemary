@@ -182,10 +182,10 @@ const F32: T = T::SinglePrecisionFp;
 const F64: T = T::DoublePrecisionFp;
 const P: T = T::Pointer;
 const U8: T = T::UnsignedByte;
+const I8: T = T::SignedByte;
 const I16: T = T::SignedHalfword;
 const U16: T = T::UnsignedHalfword;
 const BOOL: T = U8;
-const I8: T = T::SignedByte;
 
 /// Known signatures, in no particular order - [`index`] builds the lookup. Names must
 /// be unique; `signatures_are_unique` says so.
@@ -1518,6 +1518,98 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("HLock", V, P),
     sig!("HUnlock", V, P),
     sig!("TickCount", U32),
+    // The Memory Manager's `Ptr`/`Handle` allocator; see
+    // `coreservices::memory`. `Size`/`long` are sixty-four bits on this ABI,
+    // the same as `CFIndex` above.
+    sig!("NewPtr", P, I64),
+    sig!("NewPtrClear", P, I64),
+    sig!("DisposePtr", V, P),
+    sig!("GetPtrSize", I64, P),
+    sig!("SetPtrSize", V, P, I64),
+    sig!("NewHandle", P, I64),
+    sig!("NewHandleClear", P, I64),
+    sig!("DisposeHandle", V, P),
+    sig!("GetHandleSize", I64, P),
+    sig!("SetHandleSize", V, P, I64),
+    sig!("HGetState", I8, P),
+    sig!("PtrAndHand", I16, P, P, I64),
+    sig!("MemError", I16),
+    // Toolbox Utilities' bit tests, the one geographic-location record this
+    // host answers, and Multiprocessing Services' critical regions; see
+    // `coreservices::osutils`.
+    sig!("BitAnd", I64, I64, I64),
+    sig!("BitOr", I64, I64, I64),
+    sig!("BitTst", U8, P, I64),
+    sig!("ReadLocation", V, P),
+    sig!("MPCreateCriticalRegion", I32, P),
+    sig!("MPDeleteCriticalRegion", I32, P),
+    sig!("MPEnterCriticalRegion", I32, P, I32),
+    sig!("MPExitCriticalRegion", I32, P),
+    // The Text Utilities' remaining legacy calls, and the Unicode Converter's
+    // high-level `TextToUnicodeInfo`/`UnicodeToTextInfo` objects, both beside
+    // the `TEC*` converter in `coreservices::textencoding`.
+    sig!("GetTextEncodingBase", U32, U32),
+    sig!("CharacterByteType", I16, P, I16, I16),
+    sig!("NumToString", V, I64, P),
+    sig!("GetScriptManagerVariable", I32, I16),
+    sig!("CreateTextToUnicodeInfo", I32, P, P),
+    sig!("CreateUnicodeToTextInfo", I32, P, P),
+    sig!("DisposeTextToUnicodeInfo", I32, P),
+    sig!("DisposeUnicodeToTextInfo", I32, P),
+    sig!(
+        "ConvertFromTextToUnicode",
+        I32,
+        P,
+        U64,
+        P,
+        U32,
+        U64,
+        P,
+        P,
+        P,
+        U64,
+        P,
+        P,
+        P
+    ),
+    sig!(
+        "ConvertFromUnicodeToText",
+        I32,
+        P,
+        U64,
+        P,
+        U32,
+        U64,
+        P,
+        P,
+        P,
+        U64,
+        P,
+        P,
+        P
+    ),
+    // `UCConvertCFAbsoluteTimeToLongDateTime` and `GetUTCDateTime`, beside
+    // `UCConvertCFAbsoluteTimeToUTCDateTime` in `coreservices::datetime`.
+    sig!("UCConvertCFAbsoluteTimeToLongDateTime", I32, F64, P),
+    sig!("GetUTCDateTime", I32, P, U32),
+    // The Carbon odds and ends `coreservices::events` answers beside its
+    // existing Event Manager stubs: the current thread's event queue, a
+    // flush that never has anything queued to flush, the application's
+    // Mac-encoding fallback, the live keyboard state, and the legacy
+    // keycode-based key translator.
+    sig!("GetCurrentEventQueue", P),
+    sig!("FlushEventsMatchingListFromQueue", I32, P, U64, P),
+    sig!("GetApplicationTextEncoding", U32),
+    sig!("GetKeys", V, P),
+    sig!("KeyTranslate", U32, P, U16, P),
+    // The classic Window Manager calls `coreservices::windows` answers for a
+    // `WindowRef` that can never be valid - this tree has no such concept;
+    // see that module's note.
+    sig!("IsValidWindowPtr", U8, P),
+    sig!("GetWindowPortBounds", P, P, P),
+    sig!("GetWindowProperty", I32, P, U32, U32, U64, P, P),
+    sig!("SetWindowProperty", I32, P, U32, U32, U64, P),
+    sig!("GetDialogWindow", P, P),
     // The two keyboard low-memory globals, both `UInt8 (*)(void)` and both an
     // ordinary function on a 64-bit system: `LMGetKbdType` is what still backs
     // `UCKeyTranslate`'s keyboard-type argument, and `LMGetKbdLast` is the ADB

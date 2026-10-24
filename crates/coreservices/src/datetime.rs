@@ -112,11 +112,56 @@ pub unsafe extern "C" fn UCConvertCFAbsoluteTimeToSeconds(time: f64, out: *mut u
     0
 }
 
+/// `OSStatus UCConvertCFAbsoluteTimeToLongDateTime(CFAbsoluteTime,
+/// LongDateTime *)`. `LongDateTime` is whole seconds since 1904, with no
+/// fractional part - the sixty-four-bit successor to the `UInt32` seconds
+/// [`UCConvertCFAbsoluteTimeToSeconds`] answers.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn UCConvertCFAbsoluteTimeToLongDateTime(time: f64, out: *mut i64) -> i32 {
+    if out.is_null() {
+        return PARAM_ERR;
+    }
+    let since = (time + SINCE_1904).floor();
+    if since.is_nan() || since < 0.0 {
+        return UTC_UNDERFLOW_ERR;
+    }
+    // Every `f64` integer up to 2^53 round-trips through `i64` exactly; past
+    // that, the cast below would itself be the lossy step, not the Mac epoch.
+    if since > (1_i64 << 53) as f64 {
+        return UTC_OVERFLOW_ERR;
+    }
+    // SAFETY: the caller's pointer.
+    unsafe { out.write_unaligned(since as i64) };
+    0
+}
+
+/// `OSStatus GetUTCDateTime(UTCDateTime *utcDateTime, OptionBits options)`.
+///
+/// `options` only ever named `kUTCDefaultOptions`, so there is nothing to
+/// branch on.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn GetUTCDateTime(out: *mut UtcDateTime, _options: u32) -> i32 {
+    if out.is_null() {
+        return PARAM_ERR;
+    }
+    let now = unsafe { corefoundation::api::CFAbsoluteTimeGetCurrent() };
+    match to_utc(now) {
+        Ok(utc) => {
+            // SAFETY: the caller's `UTCDateTime`.
+            unsafe { out.write_unaligned(utc) };
+            0
+        }
+        Err(status) => status,
+    }
+}
+
 exports::exports! {
     functions {
         "UCConvertCFAbsoluteTimeToUTCDateTime" => UCConvertCFAbsoluteTimeToUTCDateTime,
         "UCConvertUTCDateTimeToCFAbsoluteTime" => UCConvertUTCDateTimeToCFAbsoluteTime,
         "UCConvertSecondsToCFAbsoluteTime" => UCConvertSecondsToCFAbsoluteTime,
+        "UCConvertCFAbsoluteTimeToLongDateTime" => UCConvertCFAbsoluteTimeToLongDateTime,
+        "GetUTCDateTime" => GetUTCDateTime,
         "UCConvertCFAbsoluteTimeToSeconds" => UCConvertCFAbsoluteTimeToSeconds,
     }
 }
@@ -159,5 +204,40 @@ mod tests {
             0
         );
         assert_eq!(seconds, 3_061_152_001);
+    }
+
+    #[test]
+    fn long_date_time_is_whole_seconds_since_1904() {
+        let mut long = 0_i64;
+        assert_eq!(
+            unsafe { UCConvertCFAbsoluteTimeToLongDateTime(1.5, &mut long) },
+            0
+        );
+        assert_eq!(long, 3_061_152_001);
+        assert_eq!(
+            unsafe { UCConvertCFAbsoluteTimeToLongDateTime(-SINCE_1904 - 1.0, &mut long) },
+            UTC_UNDERFLOW_ERR
+        );
+    }
+
+    /// The current time, read back through the CF-epoch conversion this file
+    /// already answers, lands within a tight window of `to_utc`'s own answer -
+    /// which is also how it is implemented, so this mostly guards against the
+    /// two drifting apart.
+    #[test]
+    fn get_utc_date_time_answers_roughly_now() {
+        let mut utc = UtcDateTime::default();
+        assert_eq!(unsafe { GetUTCDateTime(&mut utc, 0) }, 0);
+        let mut back = 0.0;
+        assert_eq!(
+            unsafe { UCConvertUTCDateTimeToCFAbsoluteTime(&utc, &mut back) },
+            0
+        );
+        let now = unsafe { corefoundation::api::CFAbsoluteTimeGetCurrent() };
+        assert!((now - back).abs() < 5.0, "{back} is not close to {now}");
+        assert_eq!(
+            unsafe { GetUTCDateTime(std::ptr::null_mut(), 0) },
+            PARAM_ERR
+        );
     }
 }

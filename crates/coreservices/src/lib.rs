@@ -9,11 +9,14 @@ pub mod datetime;
 pub mod events;
 pub mod files;
 pub mod icons;
+pub mod memory;
 pub mod metadata;
+pub mod osutils;
 pub mod process;
 pub mod resources;
 pub mod textencoding;
 pub mod uti;
+pub mod windows;
 
 exports::group! {
     collator,
@@ -21,11 +24,14 @@ exports::group! {
     events,
     files,
     icons,
+    memory,
     metadata,
+    osutils,
     process,
     resources,
     textencoding,
     uti,
+    windows,
 }
 
 /// The `kMDItem*` globals; see `metadata::ATTRIBUTE_NAMES`.

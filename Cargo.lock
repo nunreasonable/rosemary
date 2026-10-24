@@ -641,6 +641,7 @@ dependencies = [
 name = "coreservices"
 version = "0.4.1"
 dependencies = [
+ "appkit",
  "corefoundation",
  "darwin",
  "exports",

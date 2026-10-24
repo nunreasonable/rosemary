@@ -20,6 +20,10 @@ const EVENT_INVALID_PARAMETER: OSStatus = -50;
 static APPLICATION_TARGET: u8 = 0;
 static DISPATCHER_TARGET: u8 = 0;
 static MAIN_EVENT_LOOP: u8 = 0;
+/// [`GetCurrentEventQueue`]'s answer: one queue, since nothing here runs more
+/// than the one cooperative main thread a Carbon event queue would otherwise
+/// distinguish.
+static EVENT_QUEUE: u8 = 0;
 
 /// Handler and timer references handed out and not yet removed.
 ///
@@ -377,6 +381,188 @@ pub unsafe extern "C" fn TSMRemoveDocumentProperty(_document: *mut c_void, _tag:
 /// `tsmInvalidDocIDErr`.
 const TSM_INVALID_DOC_ID_ERR: OSStatus = -2507;
 
+/// `EventQueueRef GetCurrentEventQueue(void)`
+///
+/// "If the current thread is a cooperative thread, the main event queue is
+/// returned" - and every guest thread here is one, since nothing in this tree
+/// gives a thread its own Carbon event queue.
+pub unsafe extern "C" fn GetCurrentEventQueue() -> *mut c_void {
+    (&raw const EVENT_QUEUE).cast_mut().cast()
+}
+
+/// `OSStatus FlushEventsMatchingListFromQueue(EventQueueRef inQueue,
+/// ItemCount inNumTypes, const EventTypeSpec *inList)`
+///
+/// Nothing here ever posts an event onto a queue - see [`ReceiveNextEvent`] -
+/// so there is never one matching `inList` to flush; a non-null queue is the
+/// only thing worth checking.
+pub unsafe extern "C" fn FlushEventsMatchingListFromQueue(
+    queue: *mut c_void,
+    _num_types: u64,
+    _list: *const c_void,
+) -> OSStatus {
+    match queue.is_null() {
+        true => EVENT_INVALID_PARAMETER,
+        false => NO_ERR,
+    }
+}
+
+/// `TextEncoding GetApplicationTextEncoding(void)`
+///
+/// `kTextEncodingMacRoman`: the encoding this tree's own CFBundle/`'vers'`
+/// localization machinery would resolve to for an English US application with
+/// no other preference recorded - see `MacApplication.h`'s own list of
+/// fallbacks, the last of which is "the current localization of the operating
+/// system", which is what this host answers everywhere else.
+pub unsafe extern "C" fn GetApplicationTextEncoding() -> u32 {
+    corefoundation::string::encoding::MAC_ROMAN
+}
+
+/// A virtual key code's bit position within a [`GetKeys`] `KeyMap`: byte
+/// `code / 8`, bit `7 - code % 8` of that byte - the same numbering
+/// [`BitTst`](crate::osutils::BitTst) documents, which this is specialized to
+/// avoid a cross-module call for four keys.
+fn set_key_bit(map: &mut [u8; 16], code: u8) {
+    let byte = usize::from(code / 8);
+    let bit = 7 - (code % 8);
+    map[byte] |= 1 << bit;
+}
+
+/// `void GetKeys(KeyMap theKeys)`.
+///
+/// FIXME (ACCURACY): only the modifier keys' bits are answered, from the same
+/// live keyboard state `appkit`'s own event handling reads
+/// (`sdl3::video::keyboard_modifiers`) - mirrored here rather than taking a
+/// dependency on all of `appkit`, as `coreservices::events::GetCurrentButtonState`
+/// already does for the mouse buttons. Every other key's bit is always 0: SDL
+/// publishes no per-scancode *global* keyboard state (only a
+/// window-focus-relative one), so whether an ordinary key is down cannot be
+/// answered honestly without one, and guessing would be worse than admitting
+/// it. Caps Lock's bit reflects the lock being *engaged*, not the physical key
+/// being held, since that is the only signal SDL's modifier mask carries.
+///
+/// # Safety
+///
+/// `the_keys` is null or writable for 16 bytes (`sizeof(KeyMap)`).
+pub unsafe extern "C" fn GetKeys(the_keys: *mut u8) {
+    if the_keys.is_null() {
+        return;
+    }
+    use appkit_key_bits::*;
+    let mods = sdl3::video::keyboard_modifiers();
+    let mut map = [0_u8; 16];
+    if mods & sdl3::keycodes::keymod::LGUI != 0 {
+        set_key_bit(&mut map, COMMAND);
+    }
+    if mods & sdl3::keycodes::keymod::RGUI != 0 {
+        set_key_bit(&mut map, RIGHT_COMMAND);
+    }
+    if mods & sdl3::keycodes::keymod::LSHIFT != 0 {
+        set_key_bit(&mut map, SHIFT);
+    }
+    if mods & sdl3::keycodes::keymod::RSHIFT != 0 {
+        set_key_bit(&mut map, RIGHT_SHIFT);
+    }
+    if mods & sdl3::keycodes::keymod::CAPS != 0 {
+        set_key_bit(&mut map, CAPS_LOCK);
+    }
+    if mods & sdl3::keycodes::keymod::LALT != 0 {
+        set_key_bit(&mut map, OPTION);
+    }
+    if mods & sdl3::keycodes::keymod::RALT != 0 {
+        set_key_bit(&mut map, RIGHT_OPTION);
+    }
+    if mods & sdl3::keycodes::keymod::LCTRL != 0 {
+        set_key_bit(&mut map, CONTROL);
+    }
+    if mods & sdl3::keycodes::keymod::RCTRL != 0 {
+        set_key_bit(&mut map, RIGHT_CONTROL);
+    }
+    // SAFETY: the caller states this is writable for 16 bytes.
+    unsafe { std::ptr::copy_nonoverlapping(map.as_ptr(), the_keys, 16) };
+}
+
+/// `kVK_*` for the modifier keys [`GetKeys`] answers - transcribed from
+/// `appkit::keymap::vk`, which this module does not depend on for eight
+/// constants.
+mod appkit_key_bits {
+    pub const RIGHT_COMMAND: u8 = 0x36;
+    pub const COMMAND: u8 = 0x37;
+    pub const SHIFT: u8 = 0x38;
+    pub const CAPS_LOCK: u8 = 0x39;
+    pub const OPTION: u8 = 0x3a;
+    pub const CONTROL: u8 = 0x3b;
+    pub const RIGHT_SHIFT: u8 = 0x3c;
+    pub const RIGHT_OPTION: u8 = 0x3d;
+    pub const RIGHT_CONTROL: u8 = 0x3e;
+}
+
+/// `UInt32 KeyTranslate(const void *transData, UInt16 keycode, UInt32 *state)`.
+///
+/// `keycode` packs, as `KeyTrans` always has: bits 0-6 the virtual key code,
+/// bit 7 set for a key-up event, and the high byte the modifier state (the
+/// same byte `UCKeyTranslate`'s own `modifiers` argument takes in its low
+/// eight bits - Apple's docs for that call describe it as "the modifiers
+/// field of an event record, right shifted by 8 bits", which is exactly this
+/// keycode's high byte).
+///
+/// FIXME (ACCURACY): `transData` - the caller's own `'KCHR'` resource - is
+/// ignored. Parsing the classic `'KCHR'` binary format is not implemented;
+/// this always answers from the one built-in US layout `appkit::uchr` already
+/// provides for `UCKeyTranslate`, through the same dead-key state machine, so
+/// a caller using the default US layout (overwhelmingly the common case for
+/// `transData == GetScriptManagerVariable(smKCHRCache)`) gets the real
+/// character, while one that installed a custom `'KCHR'` does not.
+///
+/// # Safety
+///
+/// `state` is null or a writable/readable `UInt32`.
+pub unsafe extern "C" fn KeyTranslate(
+    _trans_data: *const c_void,
+    keycode: u16,
+    state: *mut u32,
+) -> u32 {
+    let vk = keycode & 0x7f;
+    let modifiers = u32::from(keycode >> 8);
+    let mut dead_state = match state.is_null() {
+        true => 0,
+        // SAFETY: the caller's contract.
+        false => unsafe { *state },
+    };
+    // SAFETY: `appkit::uchr::layout()` is this module's own static resource.
+    let chars = unsafe {
+        appkit::uchr::translate(
+            appkit::uchr::layout().as_ptr(),
+            vk,
+            0,
+            modifiers,
+            u32::from(appkit::textinput::LMGetKbdType()),
+            0,
+            &mut dead_state,
+        )
+    }
+    .unwrap_or_default();
+    if !state.is_null() {
+        // SAFETY: the caller's contract.
+        unsafe { *state = dead_state };
+    }
+    // A classic `'KCHR'` table can itself produce up to two characters for
+    // one key (an accent that did not combine, say); `appkit::uchr::translate`
+    // can too, and both land the same way in the result's low two bytes.
+    let mac_roman = |unit: u16| -> u8 {
+        corefoundation::eightbit::encode(unit, corefoundation::string::encoding::MAC_ROMAN)
+            .unwrap_or(b'?')
+    };
+    let mut result = 0_u32;
+    if let Some(&first) = chars.first() {
+        result |= u32::from(mac_roman(first));
+    }
+    if let Some(&second) = chars.get(1) {
+        result |= u32::from(mac_roman(second)) << 8;
+    }
+    result
+}
+
 exports::exports! {
     functions {
         "GetEventKind" => GetEventKind,
@@ -402,6 +588,11 @@ exports::exports! {
         "CallNextEventHandler" => CallNextEventHandler,
         "GetColor" => GetColor,
         "GetCurrentButtonState" => GetCurrentButtonState,
+        "GetCurrentEventQueue" => GetCurrentEventQueue,
+        "FlushEventsMatchingListFromQueue" => FlushEventsMatchingListFromQueue,
+        "GetApplicationTextEncoding" => GetApplicationTextEncoding,
+        "GetKeys" => GetKeys,
+        "KeyTranslate" => KeyTranslate,
     }
 }
 
@@ -582,5 +773,63 @@ mod tests {
         };
         assert_eq!(picked, 0);
         assert_eq!(color, before);
+    }
+
+    #[test]
+    fn flushing_the_current_event_queue_succeeds_and_null_is_refused() {
+        // SAFETY: nothing here reads through the queue reference.
+        unsafe {
+            let queue = GetCurrentEventQueue();
+            assert!(!queue.is_null());
+            assert_eq!(
+                FlushEventsMatchingListFromQueue(queue, 0, std::ptr::null()),
+                NO_ERR
+            );
+            assert_eq!(
+                FlushEventsMatchingListFromQueue(std::ptr::null_mut(), 0, std::ptr::null()),
+                EVENT_INVALID_PARAMETER
+            );
+        }
+    }
+
+    #[test]
+    fn application_text_encoding_is_mac_roman() {
+        assert_eq!(
+            unsafe { GetApplicationTextEncoding() },
+            corefoundation::string::encoding::MAC_ROMAN
+        );
+    }
+
+    /// Nothing in a test run is actually holding down a key, so every bit is
+    /// 0 - including the modifier bits this module does track, which is
+    /// still useful coverage of the write path and the bit numbering.
+    #[test]
+    fn get_keys_with_nothing_held_is_all_zero() {
+        let mut map = [0xaa_u8; 16];
+        // SAFETY: `map` is writable for 16 bytes.
+        unsafe { GetKeys(map.as_mut_ptr()) };
+        assert_eq!(map, [0_u8; 16]);
+        // SAFETY: null is accepted and does nothing.
+        unsafe { GetKeys(std::ptr::null_mut()) };
+    }
+
+    /// `vk::ANSI_A` with no modifiers types "a"; with the shift bit in the
+    /// keycode's high byte, "A" - the same layout `appkit::uchr`'s own tests
+    /// check, reached through the classic keycode packing instead of
+    /// `UCKeyTranslate`'s separate arguments.
+    #[test]
+    fn key_translate_answers_the_built_in_us_layout() {
+        let mut state = 0_u32;
+        // SAFETY: `state` is this test's own storage; `transData` is unread.
+        let plain = unsafe { KeyTranslate(std::ptr::null(), 0x0000, &mut state) };
+        assert_eq!(plain & 0xff, u32::from(b'a'));
+        let shifted = unsafe {
+            KeyTranslate(
+                std::ptr::null(),
+                u16::from(appkit::uchr::modifier::SHIFT) << 8,
+                &mut state,
+            )
+        };
+        assert_eq!(shifted & 0xff, u32::from(b'A'));
     }
 }
