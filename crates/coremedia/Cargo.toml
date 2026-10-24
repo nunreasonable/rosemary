@@ -1,0 +1,14 @@
+[package]
+name = "coremedia"
+description = "Reimplementation of CoreMedia.framework's video format descriptions"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+exports.workspace = true
+corefoundation.workspace = true
+objc.workspace = true
+
+[dev-dependencies]
+foundation.workspace = true
