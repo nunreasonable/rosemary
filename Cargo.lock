@@ -611,6 +611,7 @@ name = "coremedia"
 version = "0.3.0"
 dependencies = [
  "corefoundation",
+ "corevideo",
  "exports",
  "foundation",
  "objc",

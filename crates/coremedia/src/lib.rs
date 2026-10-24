@@ -6,10 +6,17 @@
 //! constructors only H.264's. A description holds its extensions dictionary
 //! as given, so everything a caller reads back with
 //! `CMFormatDescriptionGetExtension` is what it, or the constructor, put in.
+//!
+//! Also the pieces a decoder is fed with: `CMTime`, block buffers and sample
+//! buffers, in their own modules.
 
 #![allow(non_snake_case, clippy::missing_safety_doc)]
 
+pub mod attachment;
+pub mod block;
 pub mod h264;
+pub mod sample;
+pub mod time;
 
 use std::ffi::c_void;
 use std::sync::OnceLock;
@@ -165,6 +172,7 @@ const APERTURE_VERTICAL_OFFSET: &str = "VerticalOffset";
 
 /// `CMTime`: value, timescale, flags, epoch.
 #[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Time {
     pub value: i64,
     pub timescale: i32,
@@ -185,6 +193,7 @@ pub static TIME_INVALID: Time = Time {
 pub fn data_symbols() -> Vec<(String, u64)> {
     corefoundation::bootstrap();
     let mut out = corefoundation::base::string_globals(KEYS);
+    out.extend(corefoundation::base::string_globals(sample::KEYS));
     out.push((
         "_kCMTimeInvalid".to_string(),
         &TIME_INVALID as *const Time as usize as u64,
@@ -629,6 +638,7 @@ exports::exports! {
         "CMVideoFormatDescriptionGetH264ParameterSetAtIndex" =>
             CMVideoFormatDescriptionGetH264ParameterSetAtIndex,
     }
+    groups { time, block, sample, attachment }
 }
 
 #[cfg(test)]
