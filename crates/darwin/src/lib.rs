@@ -87,6 +87,7 @@ mod resolv;
 pub mod rlimit;
 pub mod sched;
 pub mod select;
+pub mod sem;
 pub mod shm;
 pub mod signal;
 pub mod sip;
@@ -390,6 +391,7 @@ static NONPORTABLE_MODULES: &[exports::Module] = &[
     callback::MODULE,
     rlimit::MODULE,
     shm::MODULE,
+    sem::MODULE,
     oslog::MODULE,
     backtrace::MODULE,
     #[cfg(target_arch = "x86_64")]

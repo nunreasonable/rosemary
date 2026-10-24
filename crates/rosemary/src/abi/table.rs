@@ -3513,6 +3513,9 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("pselect", I32, I32, P, P, P, P, P),
     // The named-semaphore surface. `sem_open` is `open`'s shape exactly.
     sig!("sem_close", I32, P),
+    sig!("sem_destroy", I32, P),
+    sig!("sem_getvalue", I32, P, P),
+    sig!("sem_init", I32, P, I32, U32),
     sig!("sem_open", P, P, I32, U32, U32),
     sig!("sem_post", I32, P),
     sig!("sem_trywait", I32, P),
