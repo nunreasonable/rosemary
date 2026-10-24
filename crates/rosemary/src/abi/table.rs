@@ -386,6 +386,7 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("CFArrayCreate", P, P, P, I64, P),
     sig!("CFArrayCreateMutable", P, P, I64, P),
     sig!("CFArrayCreateCopy", P, P, P),
+    sig!("CFArrayCreateMutableCopy", P, P, I64, P),
     sig!("CFArrayInsertValueAtIndex", V, P, I64, P),
     sig!("CFArrayRemoveValueAtIndex", V, P, I64),
     sig!("CFArrayRemoveAllValues", V, P),
@@ -489,6 +490,7 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("CFDictionaryGetValueIfPresent", BOOL, P, P, P),
     sig!("CFDictionarySetValue", V, P, P, P),
     sig!("CFEqual", BOOL, P, P),
+    sig!("CFGetAllocator", P, P),
     sig!("CFGetTypeID", U64, P),
     sig!("CFHTTPAuthenticationCopyMethod", P, P),
     sig!("CFHTTPAuthenticationCopyRealm", P, P),
@@ -650,6 +652,7 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     // CFStringCompareFlags, CFRange *)`, with the range flattened.
     sig!("CFStringFindWithOptions", BOOL, P, P, I64, I64, U64, P),
     sig!("CFStringCreateArrayBySeparatingStrings", P, P, P, P),
+    sig!("CFStringCreateByCombiningStrings", P, P, P, P),
     sig!("CFStringNormalize", BOOL, P, I64),
     sig!(
         "CFStringCreateMutableWithExternalCharactersNoCopy",
@@ -697,6 +700,7 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("CFTimeZoneGetName", P, P),
     sig!("CFStringGetCString", BOOL, P, P, I64, U32),
     sig!("CFStringGetCStringPtr", P, P, U32),
+    sig!("CFStringGetPascalString", BOOL, P, P, I64, U32),
     sig!("CFStringGetLength", I64, P),
     sig!("CFStringGetIntValue", I32, P),
     sig!("CFStringGetDoubleValue", F64, P),
