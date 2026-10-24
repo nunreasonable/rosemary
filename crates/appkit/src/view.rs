@@ -1622,6 +1622,7 @@ unsafe extern "C" fn dealloc(receiver: Id, _sel: Sel) {
     unsafe { crate::layer::set_view(layer, std::ptr::null_mut()) };
     objc::arc::release(layer);
     crate::cursor::discard_rects(receiver);
+    discard_tool_tips(receiver);
     objc::arc::finalize(receiver);
 }
 
@@ -1659,6 +1660,83 @@ unsafe extern "C" fn remove_tracking_area(receiver: Id, _sel: Sel, area: Id) {
     if let Some(array) = unsafe { corefoundation::collections::array(list as *const c_void) } {
         array.values.retain(|v| *v != area as *const c_void);
     }
+}
+
+/// One `-addToolTipRect:owner:userData:`, kept until removed, replaced by
+/// nothing - there is no "replaced" here, each call adds another - or the
+/// view that added it is freed.
+///
+/// Nothing here shows a tooltip, since nothing here tracks the pointer idly
+/// enough to decide when one would appear; a program's own read of
+/// `-view:stringForToolTip:point:userData:` is not something this runtime
+/// calls. The bookkeeping is kept anyway because a program that calls
+/// `-removeToolTip:` with the tag `-addToolTipRect:...` gave it expects that
+/// tag to mean something, and because a tag outliving the view it was added
+/// to would be a leak with no `-dealloc` to end it.
+/// `rect`, `owner` and `data` are not read back by anything yet - nothing
+/// here decides when to show a tooltip, so nothing consults where one would
+/// apply or who answers its string - but they are kept, not dropped, because
+/// showing one is the only reason `-addToolTipRect:owner:userData:` exists
+/// and a future implementation of that should not have to re-plumb them in.
+#[allow(dead_code)]
+struct ToolTip {
+    view: usize,
+    tag: isize,
+    rect: NSRect,
+    /// Weak: Apple's docs say "the view maintains a weak reference to
+    /// owner", so this is a raw address, not a retained reference.
+    owner: usize,
+    /// `userData`, kept as an address rather than the pointer itself so this
+    /// table stays `Sync`; nothing here ever dereferences it.
+    data: usize,
+}
+
+static TOOL_TIPS: std::sync::Mutex<Vec<ToolTip>> = std::sync::Mutex::new(Vec::new());
+static NEXT_TOOL_TIP_TAG: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(1);
+
+/// `-addToolTipRect:owner:userData:`.
+unsafe extern "C" fn add_tool_tip(
+    receiver: Id,
+    _sel: Sel,
+    rect: NSRect,
+    owner: Id,
+    data: *mut c_void,
+) -> isize {
+    let tag = NEXT_TOOL_TIP_TAG.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    TOOL_TIPS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(ToolTip {
+            view: receiver as usize,
+            tag,
+            rect,
+            owner: owner as usize,
+            data: data as usize,
+        });
+    tag
+}
+
+/// `-removeToolTip:`, the tag `-addToolTipRect:owner:userData:` answered.
+unsafe extern "C" fn remove_tool_tip(receiver: Id, _sel: Sel, tag: isize) {
+    TOOL_TIPS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .retain(|tip| !(tip.view == receiver as usize && tip.tag == tag));
+}
+
+unsafe extern "C" fn remove_all_tool_tips(receiver: Id, _sel: Sel) {
+    TOOL_TIPS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .retain(|tip| tip.view != receiver as usize);
+}
+
+/// Drop a dying view's own tooltips, from `-dealloc`.
+fn discard_tool_tips(view: Id) {
+    TOOL_TIPS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .retain(|tip| tip.view != view as usize);
 }
 
 /// `-addTrackingRect:owner:userData:assumeInside:`, the API tracking areas
@@ -1971,6 +2049,10 @@ pub(crate) fn install() {
         "addTrackingRect:owner:userData:assumeInside:" => add_tracking_rect,
             c"q68@0:8{CGRect={CGPoint=dd}{CGSize=dd}}16@48^v56c64";
         "removeTrackingRect:" => remove_tracking_rect, c"v24@0:8q16";
+        "addToolTipRect:owner:userData:" => add_tool_tip,
+            c"q64@0:8{CGRect={CGPoint=dd}{CGSize=dd}}16@48^v56";
+        "removeToolTip:" => remove_tool_tip, c"v24@0:8q16";
+        "removeAllToolTips" => remove_all_tool_tips, c"v16@0:8";
         "animator" => animator, c"@16@0:8";
         "setPostsFrameChangedNotifications:" => set_posts_frame_changed, c"v20@0:8c16";
         "setPostsBoundsChangedNotifications:" => set_posts_bounds_changed, c"v20@0:8c16";
@@ -2044,6 +2126,55 @@ mod tests {
         }
         assert_eq!(effective_alpha(subview), 0.25);
         objc::arc::release(superview);
+    }
+
+    /// `-addToolTipRect:owner:userData:` hands back a tag `-removeToolTip:`
+    /// and `-removeAllToolTips` can act on, each view's own and no other's.
+    #[test]
+    fn tool_tip_tags_are_removed_one_at_a_time_or_all_at_once() {
+        let a = view(rect(0.0, 0.0, 10.0, 10.0));
+        let b = view(rect(0.0, 0.0, 10.0, 10.0));
+        let add = objc::sel::get("addToolTipRect:owner:userData:");
+        // SAFETY: each call is `-addToolTipRect:owner:userData:`'s own
+        // prototype, with an owner that need not be a real object - it is
+        // kept only as an address, never sent to.
+        let (first, second, _third) = unsafe {
+            (
+                add_tool_tip(a, add, rect(0.0, 0.0, 1.0, 1.0), a, std::ptr::null_mut()),
+                add_tool_tip(a, add, rect(1.0, 0.0, 1.0, 1.0), a, std::ptr::null_mut()),
+                add_tool_tip(b, add, rect(0.0, 0.0, 1.0, 1.0), b, std::ptr::null_mut()),
+            )
+        };
+        assert_ne!(first, second);
+        let count_for = |which: Id| {
+            TOOL_TIPS
+                .lock()
+                .expect("no panic")
+                .iter()
+                .filter(|tip| tip.view == which as usize)
+                .count()
+        };
+        assert_eq!(count_for(a), 2);
+        assert_eq!(count_for(b), 1);
+
+        // SAFETY: `-removeToolTip:` is `void (id, SEL, NSInteger)`.
+        unsafe { remove_tool_tip(a, objc::sel::get("removeToolTip:"), first) };
+        assert_eq!(count_for(a), 1);
+        assert_eq!(count_for(b), 1, "b's tag is untouched by a's removal");
+
+        // SAFETY: `-removeAllToolTips` is `void (id, SEL)`.
+        unsafe { remove_all_tool_tips(a, objc::sel::get("removeAllToolTips")) };
+        assert_eq!(count_for(a), 0);
+        assert_eq!(count_for(b), 1, "b keeps its own tooltip");
+
+        objc::arc::release(a);
+        objc::arc::release(b);
+        assert_eq!(count_for(a), 0);
+        assert_eq!(
+            count_for(b),
+            0,
+            "-dealloc discards what -removeAllToolTips missed"
+        );
     }
 
     #[test]
