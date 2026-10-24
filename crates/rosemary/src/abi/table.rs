@@ -971,6 +971,10 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("CGWarpMouseCursorPosition", I32, F64, F64),
     sig!("CGSetLocalEventsSuppressionInterval", I32, F64),
     sig!("CGWindowLevelForKey", I32, I32),
+    // QuickDraw's `short` is `int16_t`, and a `Rect *` travels like any other
+    // pointer - the aggregate it points at is never passed or returned by value.
+    sig!("SetRect", V, P, I16, I16, I16, I16),
+    sig!("OffsetRect", V, P, I16, I16),
     // `CGDirectDisplayID` is `uint32_t`; a `ColorSyncProfileRef` is a pointer
     // like any other CF type.
     sig!("ColorSyncProfileCreateWithDisplayID", P, U32),

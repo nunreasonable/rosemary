@@ -1,5 +1,6 @@
 mod colorsync;
 mod printing;
+mod quickdraw;
 
 #[repr(i32)]
 enum CGWindowLevelKey {
@@ -18,5 +19,5 @@ exports::exports! {
     functions {
         "CGWindowLevelForKey" => CGWindowLevelForKey,
     }
-    groups { colorsync, printing }
+    groups { colorsync, printing, quickdraw }
 }
