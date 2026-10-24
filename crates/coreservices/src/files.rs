@@ -125,14 +125,23 @@ fn domain_root(volume: i16) -> Option<String> {
 /// The domain the two legacy "system disk" volumes mean for `kind`.
 ///
 /// Carbon answers `kOnSystemDisk` and `kOnAppropriateDisk` from whichever
-/// domain holds that kind of folder. For frameworks that is the system domain:
+/// domain holds that kind of folder: the user's for preferences and the other
+/// per-user folders, and the system domain for frameworks:
 /// Apple's CallMachOFramework sample finds `System.framework` through
 /// `FSFindFolder(kOnAppropriateDisk, kFrameworksFolderType)`, and programs that
 /// copied it look up `free` that way. Every other kind keeps the local domain.
 fn system_disk(volume: i16, kind: u32) -> i16 {
     const SYSTEM_DOMAIN: i16 = -32766;
+    const USER_DOMAIN: i16 = -32763;
     match (volume, &kind.to_be_bytes()) {
         (-32768 | -32767, b"fram") => SYSTEM_DOMAIN,
+        // The folders only a user has: there is no `/Library/Preferences` a
+        // Carbon program asking for "the" preferences folder means.
+        (
+            -32768 | -32767,
+            b"pref" | b"desk" | b"trsh" | b"docs" | b"down" | b"mdoc" | b"\xb5doc" | b"pdoc"
+            | b"pubb" | b"cusr",
+        ) => USER_DOMAIN,
         _ => volume,
     }
 }
@@ -534,18 +543,23 @@ mod tests {
     }
 
     /// `kOnAppropriateDisk` frameworks are the system's, which is where
-    /// `System.framework` is; every other kind stays on the local domain.
+    /// `System.framework` is; preferences and the other per-user folders are
+    /// the user's; every other kind stays on the local domain.
     #[test]
     fn system_disk_frameworks_are_the_system_domains() {
         const K_ON_SYSTEM_DISK: i16 = -32768;
         const K_ON_APPROPRIATE_DISK: i16 = -32767;
         const K_SYSTEM_DOMAIN: i16 = -32766;
+        const K_USER_DOMAIN: i16 = -32763;
         let fram = u32::from_be_bytes(*b"fram");
         let pref = u32::from_be_bytes(*b"pref");
+        let asup = u32::from_be_bytes(*b"asup");
         assert_eq!(system_disk(K_ON_APPROPRIATE_DISK, fram), K_SYSTEM_DOMAIN);
         assert_eq!(system_disk(K_ON_SYSTEM_DISK, fram), K_SYSTEM_DOMAIN);
+        assert_eq!(system_disk(K_ON_SYSTEM_DISK, pref), K_USER_DOMAIN);
+        assert_eq!(system_disk(K_ON_APPROPRIATE_DISK, pref), K_USER_DOMAIN);
         assert_eq!(
-            system_disk(K_ON_APPROPRIATE_DISK, pref),
+            system_disk(K_ON_APPROPRIATE_DISK, asup),
             K_ON_APPROPRIATE_DISK
         );
         assert_eq!(
