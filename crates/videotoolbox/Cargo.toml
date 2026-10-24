@@ -9,3 +9,7 @@ license.workspace = true
 exports.workspace = true
 corefoundation.workspace = true
 coremedia.workspace = true
+corevideo.workspace = true
+iosurface.workspace = true
+objc.workspace = true
+libc.workspace = true

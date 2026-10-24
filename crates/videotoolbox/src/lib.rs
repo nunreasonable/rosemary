@@ -1,16 +1,23 @@
 //! VideoToolbox: hardware and system video codecs behind decompression and
 //! compression sessions.
 //!
-//! There is no codec here - no hardware one, and no software one standing in
-//! for Apple's - so no session can be made. Each create says so the way
-//! VideoToolbox does on a machine without the codec,
-//! `kVTCouldNotFindVideoDecoderErr` or `kVTCouldNotFindVideoEncoderErr`,
-//! which is the answer a program already handles by decoding or encoding
-//! some other way. What a session would be configured with, the
-//! specification and property keys, is published so that building the
-//! request works.
+//! H.264 decompression sessions decode through the first backend that works
+//! on this host (FFmpeg over Vulkan Video, VA-API or CUDA, loaded at run
+//! time; see `backend`), and hand the callback pixel buffers in the format
+//! the attributes ask for. Where no backend works, and for every other codec
+//! and every compression session, create says so the way VideoToolbox does
+//! on a machine without the codec, `kVTCouldNotFindVideoDecoderErr` or
+//! `kVTCouldNotFindVideoEncoderErr`, which is the answer a program already
+//! handles by decoding or encoding some other way. What a session would be
+//! configured with, the specification and property keys, is published so
+//! that building the request works.
 
 #![allow(non_snake_case, clippy::missing_safety_doc)]
+
+mod backend;
+mod bitstream;
+mod output;
+mod session;
 
 use corefoundation::base::CFTypeRef;
 
@@ -85,7 +92,9 @@ const KEYS: &[(&str, &str)] = &[
 /// The data symbols this crate publishes.
 pub fn data_symbols() -> Vec<(String, u64)> {
     corefoundation::bootstrap();
-    corefoundation::base::string_globals(KEYS)
+    let mut out = corefoundation::base::string_globals(KEYS);
+    out.extend(corefoundation::base::string_globals(session::KEYS));
+    out
 }
 
 /// `OSStatus VTDecompressionSessionCreate(CFAllocatorRef,
@@ -95,9 +104,9 @@ pub fn data_symbols() -> Vec<(String, u64)> {
 pub unsafe extern "C" fn VTDecompressionSessionCreate(
     _allocator: CFTypeRef,
     format: CFTypeRef,
-    _specification: CFTypeRef,
-    _attributes: CFTypeRef,
-    _callback: *const std::ffi::c_void,
+    specification: CFTypeRef,
+    attributes: CFTypeRef,
+    callback: *const session::CallbackRecord,
     out: *mut CFTypeRef,
 ) -> i32 {
     // SAFETY: null or an object a guest received from this runtime.
@@ -106,9 +115,8 @@ pub unsafe extern "C" fn VTDecompressionSessionCreate(
     if out.is_null() || !video {
         return PARAMETER_ERR;
     }
-    // SAFETY: the caller's out-parameter, checked above.
-    unsafe { out.write(std::ptr::null()) };
-    COULD_NOT_FIND_VIDEO_DECODER
+    // SAFETY: the caller's arguments, `out` checked above.
+    unsafe { session::create(format, specification, attributes, callback, out) }
 }
 
 /// `OSStatus VTCompressionSessionCreate(CFAllocatorRef, int32_t width,
@@ -137,9 +145,10 @@ pub unsafe extern "C" fn VTCompressionSessionCreate(
     COULD_NOT_FIND_VIDEO_ENCODER
 }
 
-/// `Boolean VTIsHardwareDecodeSupported(CMVideoCodecType)`: no codec is.
-pub extern "C" fn VTIsHardwareDecodeSupported(_codec: u32) -> u8 {
-    0
+/// `Boolean VTIsHardwareDecodeSupported(CMVideoCodecType)`: H.264 where a
+/// hardware backend works.
+pub extern "C" fn VTIsHardwareDecodeSupported(codec: u32) -> u8 {
+    u8::from(backend::Registry::global().hardware_supports(codec))
 }
 
 exports::exports! {
@@ -148,6 +157,7 @@ exports::exports! {
         "VTCompressionSessionCreate" => VTCompressionSessionCreate,
         "VTIsHardwareDecodeSupported" => VTIsHardwareDecodeSupported,
     }
+    groups { session }
 }
 
 #[cfg(test)]
@@ -192,7 +202,12 @@ mod tests {
             );
             corefoundation::api::CFRelease(format);
         }
-        assert_eq!(VTIsHardwareDecodeSupported(coremedia::CODEC_H264), 0);
+        assert_eq!(VTIsHardwareDecodeSupported(u32::from_be_bytes(*b"mp4v")), 0);
+        assert_eq!(VTIsHardwareDecodeSupported(u32::from_be_bytes(*b"hvc1")), 0);
+        assert_eq!(
+            VTIsHardwareDecodeSupported(coremedia::CODEC_H264),
+            u8::from(backend::Registry::global().hardware_supports(coremedia::CODEC_H264))
+        );
     }
 
     #[test]
