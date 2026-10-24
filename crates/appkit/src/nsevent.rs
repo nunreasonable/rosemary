@@ -139,6 +139,44 @@ unsafe extern "C" fn event_ref(_receiver: Id, _sel: Sel) -> *mut c_void {
     std::ptr::null_mut()
 }
 
+/// `-CGEvent`: the event as Quartz describes it, at the same place in global
+/// top-left coordinates, with the mouse fields a program reads off it.
+///
+/// Autoreleased: Apple's belongs to the NSEvent and lives as long as it does,
+/// and an event is only kept past its dispatch by a program that retains it.
+// FIXME (ACCURACY): a fresh object per call rather than one per event, and no
+// tablet fields, since no pen reaches this runtime as a tablet event yet.
+unsafe extern "C" fn cg_event(receiver: Id, _sel: Sel) -> *const c_void {
+    // SAFETY: the caller sends to a live object.
+    let Some(event) = (unsafe { event_of(receiver) }) else {
+        return std::ptr::null();
+    };
+    let mut screen = event.location;
+    if !event.window.is_null() {
+        let frame = crate::window::frame_of(event.window);
+        screen.x += frame.origin.x;
+        screen.y += frame.origin.y;
+    }
+    let global = NSPoint {
+        x: screen.x,
+        y: crate::geometry::primary_height() - screen.y,
+    };
+    // SAFETY: the same receiver, for the method that answers the same question.
+    let pressure = unsafe { pressure(receiver, std::ptr::null()) };
+    // kCGMouseEventClickState, Pressure, ButtonNumber, DeltaX, DeltaY, Subtype.
+    let fields = [
+        (1, event.clicks as f64),
+        (2, f64::from(pressure)),
+        (3, event.button as f64),
+        (4, event.delta.x),
+        (5, event.delta.y),
+        (7, f64::from(event.subtype)),
+    ];
+    // NSEventType and CGEventType number the mouse and key events alike.
+    let made = crate::cgevent::with_fields(global, event.kind as u32, &fields);
+    objc::arc::autorelease(made as Id) as *const c_void
+}
+
 unsafe extern "C" fn zero_double(_receiver: Id, _sel: Sel) -> CGFloat {
     0.0
 }
@@ -570,6 +608,7 @@ pub(crate) fn install() {
         "hasPreciseScrollingDeltas" => no, c"c16@0:8";
         "isDirectionInvertedFromDevice" => no, c"c16@0:8";
         "pressure" => pressure, c"f16@0:8";
+        "CGEvent" => cg_event, c"^{__CGEvent=}16@0:8";
         "windowNumber" => window_number, c"q16@0:8";
         // An event number counts *tracking* sequences on a Mac, and nothing
         // here tracks one; zero is what an event outside any sequence carries.
@@ -593,6 +632,29 @@ pub(crate) fn install() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_mouse_event_describes_itself_as_a_quartz_event() {
+        crate::bootstrap();
+        let event = make(Fields {
+            kind: kind::LEFT_MOUSE_DOWN,
+            location: NSPoint { x: 10.0, y: 20.0 },
+            button: 0,
+            clicks: 2,
+            ..Default::default()
+        });
+        // SAFETY: an event this module made.
+        let quartz = unsafe { cg_event(event, std::ptr::null()) };
+        assert!(!quartz.is_null());
+        // SAFETY: the event `-CGEvent` returned.
+        unsafe {
+            let location = crate::cgevent::CGEventGetLocation(quartz);
+            assert_eq!(location.x, 10.0);
+            assert_eq!(location.y, crate::geometry::primary_height() - 20.0);
+            assert_eq!(crate::cgevent::CGEventGetIntegerValueField(quartz, 1), 2);
+            assert_eq!(crate::cgevent::CGEventGetDoubleValueField(quartz, 2), 1.0);
+        }
+    }
 
     #[test]
     fn an_event_reports_what_it_was_built_with() {

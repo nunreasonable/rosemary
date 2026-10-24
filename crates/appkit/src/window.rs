@@ -1455,6 +1455,12 @@ fn remake(receiver: Id, api: Api, want: Presentation) -> bool {
     true
 }
 
+/// [`frame`] for another module of this crate.
+pub(crate) fn frame_of(window: Id) -> NSRect {
+    // SAFETY: a window this crate made; the selector is not read.
+    unsafe { frame(window, std::ptr::null()) }
+}
+
 /// The window's frame, asked of SDL rather than remembered.
 ///
 /// A user can drag or resize a window, and a remembered rectangle would then be

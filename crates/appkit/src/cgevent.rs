@@ -109,6 +109,20 @@ fn new(location: NSPoint, kind: u32) -> CFTypeRef {
     body as CFTypeRef
 }
 
+/// An event the caller owns, with `fields` set: what `-[NSEvent CGEvent]`
+/// hands back for an AppKit event.
+pub(crate) fn with_fields(location: NSPoint, kind: u32, fields: &[(u32, f64)]) -> CFTypeRef {
+    let event = new(location, kind);
+    if let Some(body) = body_of(event) {
+        for &(field, value) in fields {
+            if let Some(i) = field_slot(field) {
+                body.fields[i] = value;
+            }
+        }
+    }
+    event
+}
+
 /// The event's body, or `None` for anything that is not an event this module
 /// made.
 fn body_of<'a>(event: CFTypeRef) -> Option<&'a mut Body> {
