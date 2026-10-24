@@ -177,6 +177,10 @@ unsafe extern "C" fn cg_event(receiver: Id, _sel: Sel) -> *const c_void {
     objc::arc::autorelease(made as Id) as *const c_void
 }
 
+unsafe extern "C" fn nil_object(_receiver: Id, _sel: Sel) -> Id {
+    std::ptr::null_mut()
+}
+
 unsafe extern "C" fn zero_double(_receiver: Id, _sel: Sel) -> CGFloat {
     0.0
 }
@@ -624,6 +628,8 @@ pub(crate) fn install() {
         "isDirectionInvertedFromDevice" => no, c"c16@0:8";
         "pressure" => pressure, c"f16@0:8";
         "CGEvent" => cg_event, c"^{__CGEvent=}16@0:8";
+        // Deprecated in 10.12, and nil there since: no event carries a context.
+        "context" => nil_object, c"@16@0:8";
         "windowNumber" => window_number, c"q16@0:8";
         // An event number counts *tracking* sequences on a Mac, and nothing
         // here tracks one; zero is what an event outside any sequence carries.
