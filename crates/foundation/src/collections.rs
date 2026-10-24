@@ -1217,6 +1217,30 @@ unsafe extern "C" fn contains_object(receiver: Id, _sel: Sel, object: Id) -> boo
         .any(|v| a.policy.equal(*v, object as CFTypeRef))
 }
 
+/// `-makeObjectsPerformSelector:withObject:`, over a copy so the selector may
+/// change the array.
+unsafe extern "C" fn make_objects_perform_with(
+    receiver: Id,
+    _sel: Sel,
+    selector: Sel,
+    argument: Id,
+) {
+    let Some(a) = (unsafe { collections::array(receiver as CFTypeRef) }) else {
+        return;
+    };
+    let values = a.values.clone();
+    // SAFETY: the selector takes at most one object, which Apple requires.
+    let send: unsafe extern "C" fn(Id, Sel, Id) =
+        unsafe { std::mem::transmute(objc::msg::entry()) };
+    for value in values {
+        unsafe { send(value as Id, selector, argument) };
+    }
+}
+
+unsafe extern "C" fn make_objects_perform(receiver: Id, sel: Sel, selector: Sel) {
+    unsafe { make_objects_perform_with(receiver, sel, selector, std::ptr::null_mut()) };
+}
+
 unsafe extern "C" fn index_of_object(receiver: Id, _sel: Sel, object: Id) -> usize {
     let Some(a) = (unsafe { collections::array(receiver as CFTypeRef) }) else {
         return NOT_FOUND;
@@ -2624,6 +2648,8 @@ pub(crate) fn install() {
         "containsObject:" => contains_object, c"B24@0:8@16";
         "indexOfObject:" => index_of_object, c"Q24@0:8@16";
         "indexOfObjectIdenticalTo:" => index_of_object_identical_to, c"Q24@0:8@16";
+        "makeObjectsPerformSelector:" => make_objects_perform, c"v24@0:8:16";
+        "makeObjectsPerformSelector:withObject:" => make_objects_perform_with, c"v32@0:8:16@24";
         "firstObject" => first_object, c"@16@0:8";
         "lastObject" => last_object, c"@16@0:8";
         "componentsJoinedByString:" => components_joined_by_string, c"@24@0:8@16";
