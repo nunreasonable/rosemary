@@ -6,8 +6,14 @@ use crate::nsevent::{self, Fields, kind};
 use crate::window;
 
 thread_local! {
-    static PUMPING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
+
+/// How deep pumps may nest. A guest callback run by the pump - a web view's
+/// delegate, a view drawing - may turn the run loop and wait for the pump to
+/// deliver what it waits for, as it can on a Mac; the limit only stops a
+/// runaway chain of such waits.
+const MAX_DEPTH: u32 = 8;
 
 /// Drain SDL's queue once, delivering what this tree can deliver.
 ///
@@ -15,15 +21,14 @@ thread_local! {
 /// about when the event names no window this crate made.
 pub fn pump(app: Id) {
     let _ = app;
-    // A hook or a drawn view can run guest code that turns the run loop, and the
-    // window-system source below brings that back here; one pump at a time.
-    if PUMPING.with(|pumping| pumping.replace(true)) {
+    if DEPTH.with(|depth| depth.get()) >= MAX_DEPTH {
         return;
     }
+    DEPTH.with(|depth| depth.set(depth.get() + 1));
     struct Done;
     impl Drop for Done {
         fn drop(&mut self) {
-            PUMPING.with(|pumping| pumping.set(false));
+            DEPTH.with(|depth| depth.set(depth.get() - 1));
         }
     }
     let _done = Done;

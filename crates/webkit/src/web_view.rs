@@ -48,6 +48,8 @@ struct View {
     modifier_flags: u64,
     /// The cursor the page asks for, by its CSS name.
     cursor: Option<&'static str>,
+    /// `-customUserAgent`, which replaces the configuration's agent.
+    custom_user_agent: Option<String>,
 }
 
 #[derive(Clone, PartialEq)]
@@ -841,6 +843,62 @@ unsafe fn user_agent(configuration: Id) -> String {
     agent
 }
 
+/// Send `agent` from the view's `WebKitWebView`, and show it to page scripts.
+///
+/// # Safety
+///
+/// `configuration` must be the view's configuration.
+unsafe fn apply_user_agent(engine: &Engine, gtk: Ptr, configuration: Id, agent: &str) {
+    let header = header_user_agent(agent);
+    let controller = unsafe { configuration::controller_of(configuration) };
+    // SAFETY: the view's content controller.
+    unsafe {
+        configuration::set_page_user_agent(
+            controller,
+            engine,
+            (header != agent).then(|| agent.to_string()),
+        )
+    };
+    let header = gtk::c_string(&header);
+    // SAFETY: the view's own settings, and a string they copy.
+    unsafe {
+        let settings = (engine.api.webkit_web_view_get_settings)(gtk);
+        (engine.api.webkit_settings_set_user_agent)(settings, header.as_ptr());
+    }
+}
+
+/// `-customUserAgent`: nil until one is set, as Apple's.
+unsafe extern "C" fn custom_user_agent(receiver: Id, _sel: Sel) -> Id {
+    match with_object(receiver, |v| v.custom_user_agent.clone()).flatten() {
+        Some(agent) => objc::arc::autorelease(foundation::string::from_str(&agent)),
+        None => std::ptr::null_mut(),
+    }
+}
+
+/// `-setCustomUserAgent:`: the agent sent from now on; nil or empty goes
+/// back to the configuration's.
+unsafe extern "C" fn set_custom_user_agent(receiver: Id, _sel: Sel, agent: Id) {
+    let agent = (!agent.is_null())
+        .then(|| engine::text_of(agent))
+        .filter(|a| !a.is_empty());
+    let Some(configuration) = with_object(receiver, |v| {
+        v.custom_user_agent = agent.clone();
+        v.configuration as Id
+    }) else {
+        return;
+    };
+    let Some((engine, gtk)) = gtk_of(receiver) else {
+        return;
+    };
+    // SAFETY: the view's configuration.
+    let agent = agent.unwrap_or_else(|| unsafe { user_agent(configuration) });
+    if engine::tracing() {
+        eprintln!("rosemary: webkit: custom user agent {agent}");
+    }
+    // SAFETY: as above.
+    unsafe { apply_user_agent(engine, gtk, configuration, &agent) };
+}
+
 /// `agent` as WebKitGTK accepts it for the `User-Agent` header.
 ///
 /// WebKitGTK refuses a user agent that is not a list of `product/version`
@@ -1091,6 +1149,7 @@ unsafe extern "C" fn init_with_frame_configuration(
             draws_background: true,
             modifier_flags: 0,
             cursor: None,
+            custom_user_agent: None,
         })
     });
     receiver
@@ -1948,6 +2007,8 @@ pub fn install() {
         "goForward" => go_forward, c"@16@0:8";
         "URL" => url, c"@16@0:8";
         "evaluateJavaScript:completionHandler:" => evaluate_javascript, c"v32@0:8@16@?24";
+        "customUserAgent" => custom_user_agent, c"@16@0:8";
+        "setCustomUserAgent:" => set_custom_user_agent, c"v24@0:8@16";
         "setValue:forKey:" => set_value_for_key, c"v32@0:8@16@24";
         "acceptsFirstResponder" => yes, c"c16@0:8";
         "becomeFirstResponder" => become_first_responder, c"c16@0:8";
