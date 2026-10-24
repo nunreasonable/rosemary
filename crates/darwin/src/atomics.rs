@@ -59,6 +59,49 @@ pub unsafe extern "C" fn OSAtomicAdd64Barrier(amount: i64, value: *mut c_void) -
         .wrapping_add(amount)
 }
 
+// The increment and decrement pairs are real exports since 10.10, where the SDK
+// stopped inlining them as `OSAtomicAdd*(+-1, ...)`; same result convention.
+
+#[allow(non_snake_case)]
+pub unsafe extern "C" fn OSAtomicIncrement32(value: *mut c_void) -> i32 {
+    unsafe { OSAtomicAdd32(1, value) }
+}
+
+#[allow(non_snake_case)]
+pub unsafe extern "C" fn OSAtomicIncrement32Barrier(value: *mut c_void) -> i32 {
+    unsafe { OSAtomicAdd32Barrier(1, value) }
+}
+
+#[allow(non_snake_case)]
+pub unsafe extern "C" fn OSAtomicDecrement32(value: *mut c_void) -> i32 {
+    unsafe { OSAtomicAdd32(-1, value) }
+}
+
+#[allow(non_snake_case)]
+pub unsafe extern "C" fn OSAtomicDecrement32Barrier(value: *mut c_void) -> i32 {
+    unsafe { OSAtomicAdd32Barrier(-1, value) }
+}
+
+#[allow(non_snake_case)]
+pub unsafe extern "C" fn OSAtomicIncrement64(value: *mut c_void) -> i64 {
+    unsafe { OSAtomicAdd64(1, value) }
+}
+
+#[allow(non_snake_case)]
+pub unsafe extern "C" fn OSAtomicIncrement64Barrier(value: *mut c_void) -> i64 {
+    unsafe { OSAtomicAdd64Barrier(1, value) }
+}
+
+#[allow(non_snake_case)]
+pub unsafe extern "C" fn OSAtomicDecrement64(value: *mut c_void) -> i64 {
+    unsafe { OSAtomicAdd64(-1, value) }
+}
+
+#[allow(non_snake_case)]
+pub unsafe extern "C" fn OSAtomicDecrement64Barrier(value: *mut c_void) -> i64 {
+    unsafe { OSAtomicAdd64Barrier(-1, value) }
+}
+
 #[inline]
 unsafe fn compare_and_swap32(old: i32, new: i32, value: *mut c_void, ordering: Ordering) -> bool {
     let failure = match ordering {
@@ -221,9 +264,57 @@ exports::exports! {
         "OSAtomicCompareAndSwapIntBarrier" => OSAtomicCompareAndSwapIntBarrier,
         "OSAtomicCompareAndSwapPtr" => OSAtomicCompareAndSwapPtr,
         "OSAtomicCompareAndSwapPtrBarrier" => OSAtomicCompareAndSwapPtrBarrier,
+        "OSAtomicDecrement32" => OSAtomicDecrement32,
+        "OSAtomicDecrement32Barrier" => OSAtomicDecrement32Barrier,
+        "OSAtomicDecrement64" => OSAtomicDecrement64,
+        "OSAtomicDecrement64Barrier" => OSAtomicDecrement64Barrier,
+        "OSAtomicIncrement32" => OSAtomicIncrement32,
+        "OSAtomicIncrement32Barrier" => OSAtomicIncrement32Barrier,
+        "OSAtomicIncrement64" => OSAtomicIncrement64,
+        "OSAtomicIncrement64Barrier" => OSAtomicIncrement64Barrier,
         "OSMemoryBarrier" => OSMemoryBarrier,
         "OSSpinLockLock" => OSSpinLockLock,
         "OSSpinLockTry" => OSSpinLockTry,
         "OSSpinLockUnlock" => OSSpinLockUnlock,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn increment_and_decrement_return_the_new_value() {
+        let mut word: i32 = 41;
+        let p = (&mut word as *mut i32).cast::<c_void>();
+        // SAFETY: a live, aligned int32_t owned by this test.
+        unsafe {
+            assert_eq!(OSAtomicIncrement32(p), 42);
+            assert_eq!(OSAtomicIncrement32Barrier(p), 43);
+            assert_eq!(OSAtomicDecrement32(p), 42);
+            assert_eq!(OSAtomicDecrement32Barrier(p), 41);
+        }
+        assert_eq!(word, 41);
+    }
+
+    #[test]
+    fn a_32_bit_increment_wraps_like_the_c_type() {
+        let mut word = i32::MAX;
+        // SAFETY: a live, aligned int32_t owned by this test.
+        let new = unsafe { OSAtomicIncrement32((&mut word as *mut i32).cast()) };
+        assert_eq!(new, i32::MIN);
+    }
+
+    #[test]
+    fn the_64_bit_pair_touches_all_eight_bytes() {
+        let mut word: i64 = 1 << 32;
+        let p = (&mut word as *mut i64).cast::<c_void>();
+        // SAFETY: a live, aligned int64_t owned by this test.
+        unsafe {
+            assert_eq!(OSAtomicDecrement64(p), (1 << 32) - 1);
+            assert_eq!(OSAtomicIncrement64Barrier(p), 1 << 32);
+            assert_eq!(OSAtomicIncrement64(p), (1 << 32) + 1);
+            assert_eq!(OSAtomicDecrement64Barrier(p), 1 << 32);
+        }
     }
 }

@@ -1388,6 +1388,15 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("OSAtomicCompareAndSwapIntBarrier", BOOL, I32, I32, P),
     sig!("OSAtomicCompareAndSwapPtr", BOOL, P, P, P),
     sig!("OSAtomicCompareAndSwapPtrBarrier", BOOL, P, P, P),
+    // Like the `Add` pair, these return the value *after* the change.
+    sig!("OSAtomicDecrement32", I32, P),
+    sig!("OSAtomicDecrement32Barrier", I32, P),
+    sig!("OSAtomicDecrement64", I64, P),
+    sig!("OSAtomicDecrement64Barrier", I64, P),
+    sig!("OSAtomicIncrement32", I32, P),
+    sig!("OSAtomicIncrement32Barrier", I32, P),
+    sig!("OSAtomicIncrement64", I64, P),
+    sig!("OSAtomicIncrement64Barrier", I64, P),
     sig!("OSMemoryBarrier", V),
     // `OSSpinLock` is a bare `int32_t` the guest allocates itself, and the
     // host's implementation operates on it in place - the same arrangement as
