@@ -1127,8 +1127,27 @@ unsafe extern "C" fn dc_set_time_zone(receiver: Id, _sel: Sel, value: Id) {
     c.time_zone = held;
 }
 
+/// `+[NSDateComponents alloc]` and `+allocWithZone:`: an instance of the
+/// concrete class, which is the one sized for the fields, as a class cluster's
+/// placeholder answers.
+unsafe extern "C" fn date_components_alloc(_class: Id, _sel: Sel) -> Id {
+    // SAFETY: `Body<DateComponents>` is the layout the class was registered with.
+    let body: *mut Body<DateComponents> =
+        unsafe { corefoundation::base::allocate(date_components_class()) };
+    if !body.is_null() {
+        // SAFETY: a live instance; `-init` fills this in.
+        unsafe { (*body).contents = std::ptr::null_mut() };
+    }
+    body as Id
+}
+
 fn install_date_components() {
     let class = date_components_class();
+    let base = objc::class::lookup(c"NSDateComponents").expect("registered by its class");
+    crate::define::class_methods!(base, {
+        "alloc" => date_components_alloc, c"@16@0:8";
+        "allocWithZone:" => date_components_alloc, c"@24@0:8^v16";
+    });
     crate::define::methods!(class, {
         "init" => date_components_init, c"@16@0:8";
         "era" => dc_get_era, c"q16@0:8";
@@ -2222,6 +2241,22 @@ pub mod cf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_allocated_date_components_answers_its_setters() {
+        crate::bootstrap();
+        let class = objc::class::lookup(c"NSDateComponents").unwrap();
+        let object = send_id(objc::class::ptr(class) as Id, "alloc");
+        let object = send_id(object, "init");
+        // SAFETY: `-setYear:` is `void (id, SEL, NSInteger)`.
+        unsafe {
+            let f: unsafe extern "C" fn(Id, Sel, i64) = std::mem::transmute(objc::msg::entry());
+            f(object, objc::sel::get("setYear:"), 2024);
+        }
+        let year = unsafe { dc_get_year(object, std::ptr::null()) };
+        assert_eq!(year, 2024);
+        objc::arc::release(object);
+    }
 
     #[test]
     fn a_calendar_decomposes_and_recomposes_a_utc_date() {
