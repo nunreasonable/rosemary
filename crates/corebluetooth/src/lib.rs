@@ -790,6 +790,14 @@ mod tests {
             assert_eq!(events[0].state, UNSUPPORTED);
             assert_ne!(events[0].thread, main_thread);
             assert_eq!(events[0].queue, "corebluetooth.tests");
+            // The worker drops the delivered item's queue reference after the
+            // barrier above may already have returned on this thread.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while darwin::dispatch::object::retain_count(queue) > 2
+                && std::time::Instant::now() < deadline
+            {
+                std::thread::yield_now();
+            }
             assert_eq!(darwin::dispatch::object::retain_count(queue), 2);
             objc::arc::release(object);
             assert_eq!(darwin::dispatch::object::retain_count(queue), 1);
