@@ -185,6 +185,7 @@ const U8: T = T::UnsignedByte;
 const I16: T = T::SignedHalfword;
 const U16: T = T::UnsignedHalfword;
 const BOOL: T = U8;
+const I8: T = T::SignedByte;
 
 /// Known signatures, in no particular order - [`index`] builds the lookup. Names must
 /// be unique; `signatures_are_unique` says so.
@@ -1455,6 +1456,45 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("FNNotify", I32, P, U32, U32),
     sig!("FSGetVolumeInfo", I32, I16, U32, P, U32, P, P, P),
     sig!("FSGetVolumeParms", I32, I16, P, U32),
+    // `OSErr FSCreateFork(const FSRef *, UniCharCount, const UniChar *)` and
+    // `OSErr FSOpenFork(const FSRef *, UniCharCount, const UniChar *, SInt8,
+    // FSIORefNum *)` - `FSIORefNum` is `int` on LP64, not the `SInt16` every
+    // other `FSVolumeRefNum` in this table is.
+    sig!("FSCreateFork", I32, P, U64, P),
+    sig!("FSOpenFork", I32, P, U64, P, I8, P),
+    sig!("FSCloseFork", I32, I32),
+    // `OSErr FSReadFork/FSWriteFork(FSIORefNum, UInt16, SInt64, ByteCount,
+    // void *, ByteCount *)` - `ByteCount` is `unsigned long`, 64 bits here.
+    sig!("FSReadFork", I32, I32, U16, I64, U64, P, P),
+    sig!("FSWriteFork", I32, I32, U16, I64, U64, P, P),
+    sig!("FSGetForkPosition", I32, I32, P),
+    sig!("FSSetForkPosition", I32, I32, U16, I64),
+    sig!("FSGetForkSize", I32, I32, P),
+    sig!("FSSetForkSize", I32, I32, U16, I64),
+    // `OSErr FSGetForkCBInfo(FSIORefNum, FSVolumeRefNum, SInt16 *,
+    // FSIORefNum *, FSForkInfo *, FSRef *, HFSUniStr255 *)`.
+    sig!("FSGetForkCBInfo", I32, I32, I16, P, P, P, P, P),
+    sig!("FSIterateForks", I32, P, P, P, P, P),
+    sig!("FSGetDataForkName", I32, P),
+    // `OSErr FSOpenIterator(const FSRef *, FSIteratorFlags, FSIterator *)`.
+    sig!("FSOpenIterator", I32, P, U32, P),
+    sig!("FSCloseIterator", I32, P),
+    // `OSErr FSGetCatalogInfoBulk(FSIterator, ItemCount, ItemCount *,
+    // Boolean *, FSCatalogInfoBitmap, FSCatalogInfo *, FSRef *, FSSpecPtr,
+    // HFSUniStr255 *)` - `ItemCount` is `unsigned long`, 64 bits here.
+    sig!("FSGetCatalogInfoBulk", I32, P, U64, P, P, U32, P, P, P, P),
+    // `OSErr FSCreateDirectoryUnicode(const FSRef *, UniCharCount, const
+    // UniChar *, FSCatalogInfoBitmap, const FSCatalogInfo *, FSRef *,
+    // FSSpecPtr, UInt32 *)`.
+    sig!("FSCreateDirectoryUnicode", I32, P, U64, P, U32, P, P, P, P),
+    sig!("FSMakeFSRefUnicode", I32, P, U64, P, U32, P),
+    sig!("PBMakeFSRefUnicodeSync", I32, P),
+    sig!("FSRenameUnicode", I32, P, U64, P, U32, P),
+    sig!("FSMoveObject", I32, P, P, P),
+    sig!("FSDeleteObject", I32, P),
+    // `OSStatus FSCopyObjectSync(const FSRef *, const FSRef *, CFStringRef,
+    // FSRef *, OptionBits)`.
+    sig!("FSCopyObjectSync", I32, P, P, P, P, U32),
     sig!("FSPathMoveObjectToTrashSync", I32, P, P, U32),
     sig!("FSFileOperationCreate", P, P),
     sig!("FSFileOperationScheduleWithRunLoop", V, P, P, P),
