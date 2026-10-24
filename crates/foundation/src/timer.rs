@@ -338,6 +338,63 @@ unsafe extern "C" fn perform_after_delay(
     let _ = make(delay, receiver, selector, object, false, true, false);
 }
 
+/// The delayed performs still scheduled for `target`, optionally only those
+/// with this selector and an argument equal to `argument`.
+fn pending_performs(target: Id, filter: Option<(Sel, Id)>) -> Vec<Id> {
+    let scheduled = SCHEDULED.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    scheduled
+        .into_iter()
+        .map(|t| t as Id)
+        .filter(|&object| {
+            let timer = timer_of(object);
+            if timer.passes_timer != 0 || timer.target != target {
+                return false;
+            }
+            let Some((selector, argument)) = filter else {
+                return true;
+            };
+            timer.selector == selector && objects_equal(timer.user_info, argument)
+        })
+        .collect()
+}
+
+/// Apple matches the argument with `-isEqual:`, not by identity.
+fn objects_equal(a: Id, b: Id) -> bool {
+    if a == b {
+        return true;
+    }
+    if a.is_null() || b.is_null() {
+        return false;
+    }
+    // SAFETY: `-isEqual:` is `BOOL (id, SEL, id)`.
+    unsafe {
+        let f: unsafe extern "C" fn(Id, Sel, Id) -> u8 = std::mem::transmute(objc::msg::entry());
+        f(a, objc::sel::get("isEqual:"), b) != 0
+    }
+}
+
+/// `+cancelPreviousPerformRequestsWithTarget:`.
+unsafe extern "C" fn cancel_performs(_class: Id, _sel: Sel, target: Id) {
+    for object in pending_performs(target, None) {
+        // SAFETY: a scheduled timer of this module's.
+        unsafe { invalidate(object, objc::sel::get("invalidate")) };
+    }
+}
+
+/// `+cancelPreviousPerformRequestsWithTarget:selector:object:`.
+unsafe extern "C" fn cancel_matching_performs(
+    _class: Id,
+    _sel: Sel,
+    target: Id,
+    selector: Sel,
+    argument: Id,
+) {
+    for object in pending_performs(target, Some((selector, argument))) {
+        // SAFETY: a scheduled timer of this module's.
+        unsafe { invalidate(object, objc::sel::get("invalidate")) };
+    }
+}
+
 /// The state owned by a `-performSelectorOnMainThread:...` queue entry.
 ///
 /// Both objects are retained before the entry is submitted. This is necessary
@@ -516,6 +573,11 @@ pub(crate) fn install() {
         "performSelectorOnMainThread:withObject:waitUntilDone:" => perform_on_main_thread,
             c"v40@0:8:16@24c32";
     });
+    class_methods!(nsobject, {
+        "cancelPreviousPerformRequestsWithTarget:" => cancel_performs, c"v24@0:8@16";
+        "cancelPreviousPerformRequestsWithTarget:selector:object:" => cancel_matching_performs,
+            c"v40@0:8@16:24@32";
+    });
 
     let date_class = corefoundation::base::register(c"NSDate", None, DATE_INSTANCE_SIZE, false);
     corefoundation::base::note_type_class(date_class);
@@ -634,6 +696,63 @@ mod tests {
             "tick:" => imp, c"v24@0:8@16";
         });
         objc::object::create_instance(class, 0)
+    }
+
+    #[test]
+    fn cancelled_delayed_performs_are_unscheduled() {
+        let receiver = target(c"RosemaryTestCancelledPerformTarget", once);
+        let tick = objc::sel::get("tick:");
+        let other = objc::sel::get("description");
+        // SAFETY: a live target; `tick:` takes one object.
+        unsafe {
+            perform_after_delay(
+                receiver,
+                std::ptr::null(),
+                tick,
+                std::ptr::null_mut(),
+                1000.0,
+            );
+            perform_after_delay(
+                receiver,
+                std::ptr::null(),
+                tick,
+                std::ptr::null_mut(),
+                1000.0,
+            );
+        }
+        assert_eq!(pending_performs(receiver, None).len(), 2);
+        // A different selector cancels nothing.
+        unsafe {
+            cancel_matching_performs(
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                receiver,
+                other,
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(pending_performs(receiver, None).len(), 2);
+        unsafe {
+            cancel_matching_performs(
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                receiver,
+                tick,
+                std::ptr::null_mut(),
+            )
+        };
+        assert!(pending_performs(receiver, None).is_empty());
+        unsafe {
+            perform_after_delay(
+                receiver,
+                std::ptr::null(),
+                tick,
+                std::ptr::null_mut(),
+                1000.0,
+            );
+            cancel_performs(std::ptr::null_mut(), std::ptr::null(), receiver);
+        }
+        assert!(pending_performs(receiver, None).is_empty());
     }
 
     /// A deferred main-thread perform owns its target and argument until the
