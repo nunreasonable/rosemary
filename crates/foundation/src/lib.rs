@@ -41,6 +41,7 @@ mod propertylistserialization;
 pub mod proxy;
 mod regularexpression;
 pub mod runtime;
+mod scanner;
 mod signature;
 mod sortdescriptor;
 pub mod string;
@@ -106,6 +107,7 @@ pub fn bootstrap() {
         propertylistserialization::install();
         regularexpression::install();
         sortdescriptor::install();
+        scanner::install();
         urlcredential::install();
         uttype::install();
         undomanager::install();
@@ -314,6 +316,7 @@ pub const CLASSES: &[&str] = &[
     "NSDateComponents",
     "NSPropertyListSerialization",
     "NSSortDescriptor",
+    "NSScanner",
     "NSURLCredential",
     "NSRegularExpression",
     "NSTextCheckingResult",

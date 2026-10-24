@@ -73,6 +73,13 @@ unsafe extern "C" fn whitespace_and_newline_character_set(_class: Id, _sel: Sel)
     standard(WHITESPACE_AND_NEWLINE)
 }
 
+/// `+[NSCharacterSet whitespaceAndNewlineCharacterSet]`, for `NSScanner`'s
+/// default `charactersToBeSkipped` - the same standard set, not sent a
+/// message, since nothing here needs the selector dispatch for it.
+pub(crate) fn whitespace_and_newline() -> Id {
+    standard(WHITESPACE_AND_NEWLINE)
+}
+
 /// Whether a byte of a UTF-8 string is a member of `set`.
 ///
 /// FIXME (ACCURACY): the standard whitespace and newline sets hold only their
