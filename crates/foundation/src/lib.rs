@@ -50,6 +50,7 @@ pub mod thread;
 pub mod timer;
 mod timezone;
 pub mod unarchiver;
+pub mod undomanager;
 pub mod url;
 mod urlcomponents;
 mod urlcredential;
@@ -107,6 +108,7 @@ pub fn bootstrap() {
         sortdescriptor::install();
         urlcredential::install();
         uttype::install();
+        undomanager::install();
     });
 }
 
@@ -316,6 +318,7 @@ pub const CLASSES: &[&str] = &[
     "NSRegularExpression",
     "NSTextCheckingResult",
     "UTType",
+    "NSUndoManager",
 ];
 
 // The image-resident number classes are `constant::CLASSES`, published the same
@@ -455,6 +458,14 @@ pub const NOTIFICATION_NAMES: &[&str] = &[
     "NSProcessInfoThermalStateDidChangeNotification",
     "NSProcessInfoPowerStateDidChangeNotification",
     "NSCurrentLocaleDidChangeNotification",
+    undomanager::CHECKPOINT,
+    undomanager::WILL_UNDO_CHANGE,
+    undomanager::DID_UNDO_CHANGE,
+    undomanager::WILL_REDO_CHANGE,
+    undomanager::DID_REDO_CHANGE,
+    undomanager::DID_OPEN_GROUP,
+    undomanager::WILL_CLOSE_GROUP,
+    undomanager::DID_CLOSE_GROUP,
 ];
 
 #[cfg(test)]
