@@ -3695,6 +3695,32 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("CTFontCreateCopyWithAttributes", P, P, F64, P, P),
     sig!("CTFontCreateWithGraphicsFont", P, P, F64, P, P),
     sig!("CTGetCoreTextVersion", U32),
+    sig!("CTFontCopyAvailableTables", P, P, U32),
+    sig!("CTFontCopyCharacterSet", P, P),
+    sig!("CTFontCopyFullName", P, P),
+    sig!("CTFontCopyLocalizedName", P, P, P, P),
+    sig!("CTFontCopyVariationAxes", P, P),
+    sig!("CTFontCopyVariation", P, P),
+    sig!("CTFontCreateCopyWithSymbolicTraits", P, P, F64, P, U32, U32),
+    // `CFRange` by value, flattened to its two `CFIndex` fields.
+    sig!("CTFontCreateForString", P, P, P, I64, I64),
+    sig!("CTFontCollectionCreateFromAvailableFonts", P, P),
+    sig!("CTFontCollectionCreateMatchingFontDescriptors", P, P),
+    sig!("CTFontManagerCopyAvailablePostScriptNames", P),
+    sig!("CTFontManagerRegisterFontsForURL", BOOL, P, U32, P),
+    sig!("CTFontManagerUnregisterFontsForURL", BOOL, P, U32, P),
+    sig!("CTTypesetterCreateWithAttributedString", P, P),
+    // `CFRange` by value again, flattened.
+    sig!("CTTypesetterCreateLine", P, P, I64, I64),
+    sig!("CTTypesetterSuggestLineBreak", I64, P, I64, F64),
+    sig!("CTLineGetGlyphRuns", P, P),
+    sig!("CTRunGetGlyphCount", I64, P),
+    // `CFRange` by value, flattened; the fourth argument is the output buffer.
+    sig!("CTRunGetGlyphs", V, P, I64, I64, P),
+    sig!("CTRunGetPositions", V, P, I64, I64, P),
+    sig!("CTRunGetAdvances", V, P, I64, I64, P),
+    sig!("CTRunGetStringIndices", V, P, I64, I64, P),
+    sig!("CTRunGetAttributes", P, P),
     sig!("NSColorSpaceFromDepth", P, I32),
     sig!("NSBestDepth", I32, P, I64, I64, BOOL, P),
     sig!("CGEventSourceKeyState", BOOL, I32, U16),
@@ -4025,6 +4051,10 @@ pub static REFUSED: &[(&str, &str)] = &[
     ("NSDrawNinePartImage", AGGREGATE),
     ("CTFontGetBoundingBox", AGGREGATE),
     ("CTFontGetBoundingRectsForGlyphs", AGGREGATE),
+    // `CFRange CTRunGetStringRange(CTRunRef)`: sixteen bytes in two integer
+    // registers, as `CFUUIDGetUUIDBytes` above - implemented all the same,
+    // the native backend calls it directly.
+    ("CTRunGetStringRange", AGGREGATE),
     // `NSApp` is data like the rest of this block, and the least obvious of
     // them.
     ("NSApp", DATA),
