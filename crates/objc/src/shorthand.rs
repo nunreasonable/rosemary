@@ -175,6 +175,45 @@ pub unsafe extern "C" fn objc_copyStruct(
     unsafe { std::ptr::copy(src as *const u8, dest as *mut u8, size as usize) };
 }
 
+/// Striped locks for [`objc_copyCppObjectAtomic`], keyed by address as
+/// libobjc's are.
+static CPP_OBJECT_LOCKS: [std::sync::Mutex<()>; 64] = [const { std::sync::Mutex::new(()) }; 64];
+
+fn cpp_object_lock(address: *const c_void) -> usize {
+    // Drop the low bits every object shares through alignment.
+    ((address as usize) >> 4) % CPP_OBJECT_LOCKS.len()
+}
+
+/// `void objc_copyCppObjectAtomic(void *dest, const void *src,
+/// void (*copyHelper)(void *dest, const void *source))`: the accessor of an
+/// `atomic` property of C++ class type. The helper is the class's copy
+/// assignment; the locks are what make it atomic against other accessors of
+/// either object.
+pub unsafe extern "C" fn objc_copyCppObjectAtomic(
+    dest: *mut c_void,
+    src: *const c_void,
+    helper: Option<unsafe extern "C" fn(*mut c_void, *const c_void)>,
+) {
+    let Some(helper) = helper else {
+        return;
+    };
+    let (a, b) = (cpp_object_lock(src), cpp_object_lock(dest));
+    // In index order, so two copies running in opposite directions cannot
+    // each hold the lock the other waits for.
+    let first = CPP_OBJECT_LOCKS[a.min(b)]
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let second = (a != b).then(|| {
+        CPP_OBJECT_LOCKS[a.max(b)]
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    });
+    // SAFETY: the compiler's helper for these two objects.
+    unsafe { helper(dest, src) };
+    drop(second);
+    drop(first);
+}
+
 /// # Safety
 ///
 /// `offset` must be an ivar offset of `receiver`'s own class.
@@ -219,4 +258,35 @@ pub unsafe extern "C" fn objc_enumerationMutation(object: Id) {
 /// The `std::terminate` an uncaught Objective-C exception reaches.
 pub unsafe extern "C" fn objc_terminate() -> ! {
     crate::fail!("objc_terminate");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    unsafe extern "C" fn assign(dest: *mut c_void, src: *const c_void) {
+        unsafe { *(dest as *mut [u64; 4]) = *(src as *const [u64; 4]) };
+    }
+
+    #[test]
+    fn a_cpp_object_copy_runs_the_helper_between_the_two_objects() {
+        let src = [1u64, 2, 3, 4];
+        let mut dest = [0u64; 4];
+        unsafe {
+            objc_copyCppObjectAtomic(
+                (&mut dest as *mut [u64; 4]).cast(),
+                (&src as *const [u64; 4]).cast(),
+                Some(assign),
+            )
+        };
+        assert_eq!(dest, src);
+    }
+
+    #[test]
+    fn a_cpp_object_copy_onto_itself_does_not_deadlock() {
+        let mut both = [5u64; 4];
+        let p = (&mut both as *mut [u64; 4]).cast::<c_void>();
+        unsafe { objc_copyCppObjectAtomic(p, p, Some(assign)) };
+        assert_eq!(both, [5; 4]);
+    }
 }
