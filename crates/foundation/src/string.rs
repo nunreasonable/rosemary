@@ -1179,6 +1179,38 @@ unsafe extern "C" fn get_characters(receiver: Id, sel: Sel, buffer: *mut u16) {
     }
 }
 
+/// The receiver in a Unicode normalization form, as `CFStringNormalize`'s
+/// `CFStringNormalizationForm` numbers them.
+fn normalized(receiver: Id, form: corefoundation::base::CFIndex) -> Id {
+    // SAFETY: an `NSString`, copied before it is changed.
+    unsafe {
+        let mutable = api::CFStringCreateMutableCopy(std::ptr::null(), 0, receiver as _);
+        if mutable.is_null() {
+            return std::ptr::null_mut();
+        }
+        api::CFStringNormalize(mutable, form);
+        let copy = api::CFStringCreateCopy(std::ptr::null(), mutable);
+        api::CFRelease(mutable);
+        api::CFAutorelease(copy) as Id
+    }
+}
+
+unsafe extern "C" fn decomposed_canonical(receiver: Id, _sel: Sel) -> Id {
+    normalized(receiver, 0)
+}
+
+unsafe extern "C" fn precomposed_canonical(receiver: Id, _sel: Sel) -> Id {
+    normalized(receiver, 1)
+}
+
+unsafe extern "C" fn decomposed_compatibility(receiver: Id, _sel: Sel) -> Id {
+    normalized(receiver, 2)
+}
+
+unsafe extern "C" fn precomposed_compatibility(receiver: Id, _sel: Sel) -> Id {
+    normalized(receiver, 3)
+}
+
 unsafe extern "C" fn lowercase(receiver: Id, _sel: Sel) -> Id {
     // SAFETY: an `NSString`.
     let mut whole = unsafe { bytes(receiver) };
@@ -1691,6 +1723,10 @@ pub(crate) fn install() {
         "componentsSeparatedByString:" => components_separated_by_string, c"@24@0:8@16";
         "componentsSeparatedByCharactersInSet:" => components_separated_by_characters, c"@24@0:8@16";
         "lowercaseString" => lowercase, c"@16@0:8";
+        "decomposedStringWithCanonicalMapping" => decomposed_canonical, c"@16@0:8";
+        "precomposedStringWithCanonicalMapping" => precomposed_canonical, c"@16@0:8";
+        "decomposedStringWithCompatibilityMapping" => decomposed_compatibility, c"@16@0:8";
+        "precomposedStringWithCompatibilityMapping" => precomposed_compatibility, c"@16@0:8";
         "uppercaseString" => uppercase, c"@16@0:8";
         "compare:" => compare, c"q24@0:8@16";
         "caseInsensitiveCompare:" => case_insensitive_compare, c"q24@0:8@16";
@@ -1782,6 +1818,19 @@ pub(crate) fn install() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn normalization_forms_compose_and_decompose_an_accent() {
+        crate::bootstrap();
+        let decomposed = from_str("e\u{301}");
+        let composed = unsafe { precomposed_canonical(decomposed as Id, std::ptr::null()) };
+        assert_eq!(unsafe { bytes(composed) }, "\u{e9}".as_bytes());
+        let back = unsafe { decomposed_canonical(composed, std::ptr::null()) };
+        assert_eq!(unsafe { bytes(back) }, "e\u{301}".as_bytes());
+        let ligature = from_str("\u{fb01}");
+        let folded = unsafe { precomposed_compatibility(ligature as Id, std::ptr::null()) };
+        assert_eq!(unsafe { bytes(folded) }, b"fi");
+    }
 
     #[test]
     fn joins_path_components_as_apple_does() {
