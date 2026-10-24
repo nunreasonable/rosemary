@@ -199,7 +199,9 @@ static NEEDS_DISPLAY: Mutex<Vec<usize>> = Mutex::new(Vec::new());
 /// The batches [`pump`] is drawing, innermost last, so a view freed by another
 /// view's `-drawRect:` is taken out of them too. A stack because a `-drawRect:`
 /// can run a nested event loop that pumps again. Zero marks a forgotten entry.
-static DRAWING: Mutex<Vec<Vec<usize>>> = Mutex::new(Vec::new());
+/// Each batch carries its own id: a guest exception thrown through a nested
+/// pump skips that pump's pop, and a position would then name another batch.
+static DRAWING: Mutex<Vec<(u64, Vec<usize>)>> = Mutex::new(Vec::new());
 
 /// Distinguish an unavailable GPU presenter from a busy window. The latter
 /// must not force a CPU fallback over content still being presented through
@@ -844,7 +846,7 @@ pub(crate) fn forget(view: Id) {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .retain(|(_, v)| *v != key);
-    for batch in DRAWING.lock().unwrap_or_else(|e| e.into_inner()).iter_mut() {
+    for (_, batch) in DRAWING.lock().unwrap_or_else(|e| e.into_inner()).iter_mut() {
         for entry in batch.iter_mut().filter(|entry| **entry == key) {
             *entry = 0;
         }
@@ -972,13 +974,20 @@ pub fn pump() {
     }
     let pending = std::mem::take(&mut *NEEDS_DISPLAY.lock().unwrap_or_else(|e| e.into_inner()));
     let count = pending.len();
-    let depth = {
-        let mut drawing = DRAWING.lock().unwrap_or_else(|e| e.into_inner());
-        drawing.push(pending);
-        drawing.len() - 1
-    };
+    static NEXT_BATCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let batch = NEXT_BATCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    DRAWING
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push((batch, pending));
     for at in 0..count {
-        let view = DRAWING.lock().unwrap_or_else(|e| e.into_inner())[depth][at] as Id;
+        let view = DRAWING
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .find(|(id, _)| *id == batch)
+            .and_then(|(_, views)| views.get(at).copied())
+            .unwrap_or(0) as Id;
         if view.is_null() {
             continue;
         }
@@ -988,7 +997,12 @@ pub fn pump() {
             display_view(view);
         }
     }
-    DRAWING.lock().unwrap_or_else(|e| e.into_inner()).pop();
+    // This batch, and any a nested pump left behind when an exception skipped
+    // its own removal.
+    DRAWING
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .retain(|(id, _)| *id < batch);
     damage_animating();
     for window in crate::window::all() {
         if crate::window::is_shown(window) {
