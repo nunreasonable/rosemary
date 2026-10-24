@@ -134,6 +134,10 @@ pub unsafe fn array<'a>(object: CFTypeRef) -> Option<&'a mut ArrayContents> {
 pub struct SetContents {
     pub values: Vec<CFTypeRef>,
     pub policy: Policy,
+    /// As [`ArrayContents::mutable`]: a CF-level guard for `CFSetAddValue`, kept
+    /// separate from the Objective-C class (`-addObject:` is only ever bound on
+    /// `NSMutableSet` in the first place).
+    pub mutable: bool,
 }
 
 impl Drop for SetContents {
@@ -156,7 +160,7 @@ pub fn set_class() -> &'static Class {
     unsafe { &*(p as *const Class) }
 }
 
-pub fn new_set(values: &[CFTypeRef], policy: Policy) -> CFTypeRef {
+pub fn new_set(values: &[CFTypeRef], policy: Policy, mutable: bool) -> CFTypeRef {
     let mut unique = Vec::with_capacity(values.len());
     for value in values {
         if !unique.iter().any(|v| policy.equal(*v, *value)) {
@@ -168,6 +172,7 @@ pub fn new_set(values: &[CFTypeRef], policy: Policy) -> CFTypeRef {
         SetContents {
             values: unique,
             policy,
+            mutable,
         },
     )
 }

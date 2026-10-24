@@ -2411,17 +2411,35 @@ unsafe extern "C" fn set_with_object(_class: Id, _sel: Sel, object: Id) -> Id {
         false => &[object as CFTypeRef],
     };
     // SAFETY: a fresh object.
-    unsafe { api::CFAutorelease(collections::new_set(values, Policy::from_type_callbacks())) as Id }
+    unsafe {
+        api::CFAutorelease(collections::new_set(
+            values,
+            Policy::from_type_callbacks(),
+            false,
+        )) as Id
+    }
 }
 
 unsafe extern "C" fn empty_set(_class: Id, _sel: Sel) -> Id {
     // SAFETY: a fresh object.
-    unsafe { api::CFAutorelease(collections::new_set(&[], Policy::from_type_callbacks())) as Id }
+    unsafe {
+        api::CFAutorelease(collections::new_set(
+            &[],
+            Policy::from_type_callbacks(),
+            false,
+        )) as Id
+    }
 }
 
 unsafe extern "C" fn set_with_capacity(_class: Id, _sel: Sel, _capacity: usize) -> Id {
     // SAFETY: a fresh object.
-    unsafe { api::CFAutorelease(collections::new_set(&[], Policy::from_type_callbacks())) as Id }
+    unsafe {
+        api::CFAutorelease(collections::new_set(
+            &[],
+            Policy::from_type_callbacks(),
+            false,
+        )) as Id
+    }
 }
 
 unsafe extern "C" fn set_with_array(_class: Id, _sel: Sel, array: Id) -> Id {
@@ -2430,7 +2448,13 @@ unsafe extern "C" fn set_with_array(_class: Id, _sel: Sel, array: Id) -> Id {
         .map(|array| array.values.as_slice())
         .unwrap_or(&[]);
     // SAFETY: the new set retains its elements.
-    unsafe { api::CFAutorelease(collections::new_set(values, Policy::from_type_callbacks())) as Id }
+    unsafe {
+        api::CFAutorelease(collections::new_set(
+            values,
+            Policy::from_type_callbacks(),
+            false,
+        )) as Id
+    }
 }
 
 unsafe extern "C" fn set_count(receiver: Id, _sel: Sel) -> usize {

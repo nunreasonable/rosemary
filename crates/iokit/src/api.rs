@@ -575,6 +575,7 @@ pub unsafe extern "C" fn IOHIDManagerCopyDevices(manager: CFTypeRef) -> CFTypeRe
     collections::new_set(
         &handles,
         corefoundation::callbacks::Policy::from_type_callbacks(),
+        false,
     )
 }
 
