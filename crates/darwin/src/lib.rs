@@ -96,6 +96,8 @@ pub mod stackprobe;
 pub mod stat;
 pub mod stdio;
 pub mod stdlib;
+#[cfg(not(target_os = "macos"))]
+pub mod strhash;
 pub mod strict;
 pub mod string;
 pub mod strtofp;
@@ -395,6 +397,7 @@ static NONPORTABLE_MODULES: &[exports::Module] = &[
     acl::MODULE,
     fmtcheck::MODULE,
     langinfo::MODULE,
+    strhash::MODULE,
     #[cfg(target_os = "linux")]
     utmpx::MODULE,
     vis::MODULE,
