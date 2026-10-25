@@ -544,6 +544,12 @@ pub(crate) unsafe extern "C" fn next_event(
     crate::event::pump(receiver);
     let event = queued_event(mask, dequeue != 0);
     if !event.is_null() {
+        if crate::event::tracing() && mask != u64::MAX {
+            eprintln!(
+                "rosemary: appkit: nextEvent mask {mask:#x} -> type {}",
+                crate::nsevent::kind_of(event)
+            );
+        }
         return event;
     }
     // Apple runs the run loop in `mode` until an event arrives or the deadline
