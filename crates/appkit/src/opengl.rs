@@ -692,6 +692,12 @@ unsafe extern "C" fn set_open_gl_context(receiver: Id, _sel: Sel, context: Id) {
 /// only on `-setView:` is nil at the moment it is first used.
 unsafe extern "C" fn set_view(receiver: Id, _sel: Sel, view: Id) {
     let context = context_of(receiver);
+    if gl_debug() {
+        eprintln!(
+            "rosemary: gl: {receiver:p} setView: {view:p} (was {:p})",
+            context.view
+        );
+    }
     objc::arc::release(context.view);
     context.view = objc::arc::retain(view);
 }
@@ -2045,6 +2051,13 @@ pub fn present_single_buffered() {
 unsafe extern "C" fn flush_buffer(receiver: Id, _sel: Sel) {
     restore_current_drawable(receiver);
     let window = drawable(context_of(receiver));
+    if gl_debug() {
+        eprintln!(
+            "rosemary: gl: {receiver:p} flushBuffer: view {:p}, window {window:p}, current {:p}",
+            context_of(receiver).view,
+            sdl3::video::gl_current_window()
+        );
+    }
     if !window.is_null() {
         // A fullscreen resize may happen while the context remains current.
         // Preserve explicit guest viewports; update only an auto-fitted one.
