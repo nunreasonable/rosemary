@@ -1,5 +1,7 @@
 use std::ffi::c_void;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
+
+use corefoundation::runloop::RunLoop;
 
 use objc::object::Id;
 use objc::sel::Sel;
@@ -27,6 +29,9 @@ pub struct Timer {
     /// The run loop timer this one drives, kept as a raw `Arc` so the object can
     /// own it across the C boundary.
     timer: *const c_void,
+    /// The loop the timer is scheduled on, as a raw `Weak`: a timer outliving
+    /// its thread must not keep that thread's loop alive.
+    run_loop: *const RunLoop,
     selector: Sel,
     interval: f64,
     repeats: usize,
@@ -232,7 +237,8 @@ unsafe extern "C" fn fire(_timer: *const c_void, info: *mut c_void) {
     }
 }
 
-/// Build a timer object, scheduling it on the main loop if asked.
+/// Build a timer object, scheduling it on the calling thread's loop if asked,
+/// which is where Apple's `+scheduledTimer...` and delayed performs go.
 fn make(
     interval: f64,
     target: Id,
@@ -258,23 +264,48 @@ fn make(
         (*object).repeats = repeats as usize;
         (*object).passes_timer = passes_timer as usize;
         (*object).timer = std::ptr::null();
+        (*object).run_loop = std::ptr::null();
     }
     let object = object as Id;
     if schedule {
-        add_to_main_loop(object);
+        schedule_on(object, &corefoundation::runloop::current());
     }
     objc::arc::autorelease(object)
 }
 
-/// Schedule an already-built timer on the main run loop.
-fn add_to_main_loop(object: Id) {
-    add_to_main_loop_in(object, &[corefoundation::runloop::DEFAULT_MODE.to_string()]);
+/// Schedule an already-built timer on `run_loop`.
+fn schedule_on(object: Id, run_loop: &Arc<RunLoop>) {
+    schedule_in(
+        object,
+        run_loop,
+        &[corefoundation::runloop::DEFAULT_MODE.to_string()],
+    );
 }
 
-/// Schedule an already-built timer on the main run loop in each of `modes`.
-fn add_to_main_loop_in(object: Id, modes: &[String]) {
+/// Schedule an already-built timer on `run_loop` in each of `modes`.
+///
+/// A timer already on that loop joins the further modes; one on another loop
+/// stays where it is, since a timer belongs to one loop only.
+fn schedule_in(object: Id, run_loop: &Arc<RunLoop>, modes: &[String]) {
     let timer = timer_of(object);
     if !timer.timer.is_null() {
+        if timer.run_loop.is_null() {
+            return;
+        }
+        // SAFETY: the `Weak` `schedule_in` leaked into the object, borrowed.
+        let scheduled = std::mem::ManuallyDrop::new(unsafe { Weak::from_raw(timer.run_loop) });
+        if scheduled
+            .upgrade()
+            .is_some_and(|l| Arc::ptr_eq(&l, run_loop))
+        {
+            // SAFETY: the `Arc` this module leaked into the object, borrowed.
+            let run_loop_timer = std::mem::ManuallyDrop::new(unsafe {
+                Arc::from_raw(timer.timer as *const corefoundation::runloop::Timer)
+            });
+            for mode in modes {
+                run_loop.add_timer(&run_loop_timer, mode);
+            }
+        }
         return;
     }
     let interval = std::time::Duration::from_secs_f64(timer.interval);
@@ -282,7 +313,7 @@ fn add_to_main_loop_in(object: Id, modes: &[String]) {
     let run_loop_timer =
         corefoundation::runloop::new_timer(interval, repeat, Some(fire), object as usize);
     for mode in modes {
-        corefoundation::runloop::main().add_timer(&run_loop_timer, mode);
+        run_loop.add_timer(&run_loop_timer, mode);
     }
     // Kept alive by the object, and by the table: a scheduled timer outlives
     // the reference the program holds.
@@ -292,6 +323,7 @@ fn add_to_main_loop_in(object: Id, modes: &[String]) {
         .unwrap_or_else(|e| e.into_inner())
         .push(object as usize);
     timer.timer = Arc::into_raw(run_loop_timer) as *const c_void;
+    timer.run_loop = Weak::into_raw(Arc::downgrade(run_loop));
 }
 
 unsafe extern "C" fn scheduled_timer(
@@ -429,7 +461,7 @@ unsafe extern "C" fn perform_after_delay_in_modes(
         return;
     }
     let timer = make(delay, receiver, selector, object, false, false, false);
-    add_to_main_loop_in(timer, &modes);
+    schedule_in(timer, &corefoundation::runloop::current(), &modes);
 }
 
 /// The state owned by a `-performSelectorOnMainThread:...` queue entry.
@@ -506,8 +538,15 @@ unsafe extern "C" fn invalidate(receiver: Id, _sel: Sel) {
     let run_loop_timer =
         unsafe { Arc::from_raw(timer.timer as *const corefoundation::runloop::Timer) };
     timer.timer = std::ptr::null();
-    corefoundation::runloop::main()
-        .remove_timer(&run_loop_timer, corefoundation::runloop::DEFAULT_MODE);
+    if !timer.run_loop.is_null() {
+        // SAFETY: the `Weak` `schedule_in` leaked into the object, taken back
+        // once with the timer above.
+        let run_loop = unsafe { Weak::from_raw(timer.run_loop) };
+        timer.run_loop = std::ptr::null();
+        if let Some(run_loop) = run_loop.upgrade() {
+            run_loop.remove_timer_everywhere(&run_loop_timer);
+        }
+    }
     run_loop_timer.invalidate();
     SCHEDULED
         .lock()
@@ -537,44 +576,113 @@ unsafe extern "C" fn fire_date(receiver: Id, _sel: Sel) -> Id {
     date(now() + timer_of(receiver).interval)
 }
 
-/// The one run loop object, which `+currentRunLoop` and `+mainRunLoop` answer.
+/// An `NSRunLoop`: the Core Foundation loop it fronts.
 ///
-/// One rather than one per thread: `corefoundation::runloop::main` is what every
-/// method here acts on, so two objects would be two names for the same loop and
-/// a program comparing them would be told they were different.
-static RUN_LOOP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-
-unsafe extern "C" fn current_run_loop(class: Id, _sel: Sel) -> Id {
-    *RUN_LOOP.get_or_init(|| {
-        // SAFETY: `class` is `NSRunLoop`, which this module registered.
-        let object = unsafe {
-            objc::object::create_instance(
-                objc::class::from_ptr(class as *const objc::class::Class).expect("a class"),
-                0,
-            )
-        };
-        objc::arc::retain(object);
-        object as usize
-    }) as Id
+/// Held weakly: the loop belongs to its thread, and an object a program kept
+/// after the thread ended must not keep the loop alive with it.
+#[repr(C)]
+struct RunLoopObject {
+    isa: *const c_void,
+    run_loop: *const RunLoop,
 }
 
-unsafe extern "C" fn add_timer_for_mode(_receiver: Id, _sel: Sel, timer: Id, _mode: Id) {
-    if !timer.is_null() {
-        add_to_main_loop(timer);
+/// An object for `run_loop`, never released: one per thread that asks, and a
+/// release from a thread-local destructor could run after the runtime's own
+/// thread-locals are gone.
+fn new_run_loop_object(run_loop: &Arc<RunLoop>) -> Id {
+    let class = objc::class::lookup(c"NSRunLoop").expect("registered by this module");
+    // SAFETY: `RunLoopObject` is the layout the class was registered with.
+    let object = unsafe { corefoundation::base::allocate::<RunLoopObject>(class) };
+    // SAFETY: freshly allocated.
+    unsafe { (*object).run_loop = Weak::into_raw(Arc::downgrade(run_loop)) };
+    object as Id
+}
+
+/// `+mainRunLoop`, the same object from every thread.
+fn main_run_loop_object() -> Id {
+    static MAIN: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *MAIN.get_or_init(|| new_run_loop_object(&corefoundation::runloop::main()) as usize) as Id
+}
+
+thread_local! {
+    static THREAD_RUN_LOOP: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// `+currentRunLoop`: the calling thread's own loop, as `CFRunLoopGetCurrent`
+/// answers it. A secondary thread that ran the main loop here would service
+/// the main thread's sources - window drawing among them - beside it.
+fn current_run_loop_object() -> Id {
+    // SAFETY: this asks about the calling thread.
+    if unsafe { darwin::pthread::main_np() } != 0 {
+        return main_run_loop_object();
+    }
+    THREAD_RUN_LOOP.with(|object| {
+        if object.get() == 0 {
+            object.set(new_run_loop_object(&corefoundation::runloop::current()) as usize);
+        }
+        object.get() as Id
+    })
+}
+
+/// The loop an `NSRunLoop` fronts, while its thread still has it.
+fn run_loop_of(receiver: Id) -> Option<Arc<RunLoop>> {
+    if receiver.is_null() {
+        return None;
+    }
+    // SAFETY: an `NSRunLoop` of this module's.
+    let weak = unsafe { (*(receiver as *const RunLoopObject)).run_loop };
+    if weak.is_null() {
+        return None;
+    }
+    // SAFETY: the `Weak` the object owns, borrowed rather than taken.
+    std::mem::ManuallyDrop::new(unsafe { Weak::from_raw(weak) }).upgrade()
+}
+
+unsafe extern "C" fn current_run_loop(_class: Id, _sel: Sel) -> Id {
+    current_run_loop_object()
+}
+
+unsafe extern "C" fn main_run_loop(_class: Id, _sel: Sel) -> Id {
+    main_run_loop_object()
+}
+
+/// A mode argument as a name: nil is the default mode.
+fn mode_name(mode: Id) -> String {
+    match mode.is_null() {
+        true => corefoundation::runloop::DEFAULT_MODE.to_string(),
+        // SAFETY: an `NSString`, as the methods taking a mode declare.
+        false => String::from_utf8_lossy(&unsafe { crate::string::bytes(mode) }).into_owned(),
     }
 }
 
-/// `-getCFRunLoop`: the loop every method here acts on.
-unsafe extern "C" fn get_cf_run_loop(_receiver: Id, _sel: Sel) -> Id {
-    // SAFETY: no arguments.
-    unsafe { corefoundation::api::CFRunLoopGetMain() as Id }
+/// `-addTimer:forMode:`, in that mode: a program adds a timer for the common
+/// modes or a tracking mode precisely so it fires while the default mode is
+/// not the one running.
+unsafe extern "C" fn add_timer_for_mode(receiver: Id, _sel: Sel, timer: Id, mode: Id) {
+    if let Some(run_loop) = run_loop_of(receiver)
+        && !timer.is_null()
+    {
+        schedule_in(timer, &run_loop, &[mode_name(mode)]);
+    }
+}
+
+/// `-getCFRunLoop`, borrowed as `CFRunLoopGetCurrent`'s answer is.
+unsafe extern "C" fn get_cf_run_loop(receiver: Id, _sel: Sel) -> Id {
+    run_loop_of(receiver).map_or(std::ptr::null_mut(), |run_loop| {
+        Arc::as_ptr(&run_loop) as Id
+    })
 }
 
 /// `-currentMode`: nil when the loop is not running.
-unsafe extern "C" fn current_mode(_receiver: Id, _sel: Sel) -> Id {
-    // SAFETY: the main loop, which is what every method here acts on.
+unsafe extern "C" fn current_mode(receiver: Id, _sel: Sel) -> Id {
+    let Some(run_loop) = run_loop_of(receiver) else {
+        return std::ptr::null_mut();
+    };
+    // SAFETY: a live loop, kept so by `run_loop` for the call.
     let mode = unsafe {
-        corefoundation::api::CFRunLoopCopyCurrentMode(corefoundation::api::CFRunLoopGetMain())
+        corefoundation::api::CFRunLoopCopyCurrentMode(
+            Arc::as_ptr(&run_loop) as corefoundation::base::CFTypeRef
+        )
     };
     if mode.is_null() {
         return std::ptr::null_mut();
@@ -583,17 +691,16 @@ unsafe extern "C" fn current_mode(_receiver: Id, _sel: Sel) -> Id {
     unsafe { corefoundation::api::CFAutorelease(mode) as Id }
 }
 
-/// `-runMode:beforeDate:`, which is `CFRunLoopRunInMode` under another name.
-unsafe extern "C" fn run_mode_before_date(_receiver: Id, _sel: Sel, _mode: Id, limit: Id) -> u8 {
+/// `-runMode:beforeDate:`, which is `CFRunLoopRunInMode` on the receiver's loop.
+unsafe extern "C" fn run_mode_before_date(receiver: Id, _sel: Sel, mode: Id, limit: Id) -> u8 {
+    let Some(run_loop) = run_loop_of(receiver) else {
+        return 0;
+    };
     let seconds = match limit.is_null() {
         true => 0.0,
         false => (date_of(limit) - now()).max(0.0),
     };
-    let result = corefoundation::runloop::main().run_in_mode(
-        corefoundation::runloop::DEFAULT_MODE,
-        seconds,
-        true,
-    );
+    let result = run_loop.run_in_mode(&mode_name(mode), seconds, true);
     (result != corefoundation::runloop::result::FINISHED) as u8
 }
 
@@ -659,10 +766,10 @@ pub(crate) fn install() {
     });
 
     let run_loop =
-        corefoundation::base::register(c"NSRunLoop", None, std::mem::size_of::<usize>(), false);
+        corefoundation::base::register(c"NSRunLoop", None, size_of::<RunLoopObject>(), false);
     class_methods!(run_loop, {
         "currentRunLoop" => current_run_loop, c"@16@0:8";
-        "mainRunLoop" => current_run_loop, c"@16@0:8";
+        "mainRunLoop" => main_run_loop, c"@16@0:8";
     });
     methods!(run_loop, {
         "addTimer:forMode:" => add_timer_for_mode, c"v32@0:8@16@24";
@@ -725,9 +832,8 @@ mod tests {
 
     /// A target of this test's own.
     ///
-    /// Two, one per test, because the tests share a process *and* the one run
-    /// loop: a timer another test scheduled fires while this one is turning the
-    /// loop, and a shared counter would count both.
+    /// Two, one per test, because the tests share a process: a shared counter
+    /// would count another test's firings too.
     fn target(name: &std::ffi::CStr, imp: unsafe extern "C" fn(Id, Sel, Id)) -> Id {
         crate::bootstrap();
         let class = corefoundation::base::register(name, None, std::mem::size_of::<usize>(), false);
@@ -846,7 +952,7 @@ mod tests {
             if REPEATED.load(Ordering::SeqCst) >= 2 {
                 break;
             }
-            corefoundation::runloop::main().run_in_mode(
+            corefoundation::runloop::current().run_in_mode(
                 corefoundation::runloop::DEFAULT_MODE,
                 0.01,
                 false,
@@ -862,7 +968,7 @@ mod tests {
         assert_eq!(unsafe { is_valid(timer, objc::sel::get("isValid")) }, 0);
         let after = REPEATED.load(Ordering::SeqCst);
         for _ in 0..5 {
-            corefoundation::runloop::main().run_in_mode(
+            corefoundation::runloop::current().run_in_mode(
                 corefoundation::runloop::DEFAULT_MODE,
                 0.01,
                 false,
@@ -897,7 +1003,7 @@ mod tests {
             if ONCE.load(Ordering::SeqCst) >= 1 {
                 break;
             }
-            corefoundation::runloop::main().run_in_mode(
+            corefoundation::runloop::current().run_in_mode(
                 corefoundation::runloop::DEFAULT_MODE,
                 0.01,
                 false,
@@ -929,6 +1035,195 @@ mod tests {
                 time_interval_since_reference(d, objc::sel::get("timeIntervalSinceReferenceDate")),
                 0.0
             );
+        }
+    }
+
+    /// Something unique to the calling thread while it runs.
+    fn thread_token() -> usize {
+        thread_local! {
+            static TOKEN: u8 = const { 0 };
+        }
+        TOKEN.with(|token| token as *const u8 as usize)
+    }
+
+    unsafe extern "C" fn record_thread(info: *mut c_void) {
+        // SAFETY: `info` is one of the tests' statics.
+        unsafe { &*(info as *const AtomicUsize) }.store(thread_token(), Ordering::SeqCst);
+    }
+
+    static TIMER_THREAD: AtomicUsize = AtomicUsize::new(0);
+
+    unsafe extern "C" fn timer_records_thread(_receiver: Id, _sel: Sel, _timer: Id) {
+        TIMER_THREAD.store(thread_token(), Ordering::SeqCst);
+    }
+
+    /// `+currentRunLoop` is the calling thread's own loop, the one
+    /// `CFRunLoopGetCurrent` names there, while `+mainRunLoop` is one object
+    /// from every thread.
+    #[test]
+    fn each_thread_has_its_own_run_loop() {
+        crate::bootstrap();
+        let ask = || {
+            // SAFETY: class methods and `-getCFRunLoop`, which take nothing.
+            unsafe {
+                let current = current_run_loop(std::ptr::null_mut(), std::ptr::null());
+                let again = current_run_loop(std::ptr::null_mut(), std::ptr::null());
+                let main = main_run_loop(std::ptr::null_mut(), std::ptr::null());
+                assert_eq!(current, again, "a second ask made a second object");
+                assert_eq!(
+                    get_cf_run_loop(current, std::ptr::null()) as usize,
+                    corefoundation::api::CFRunLoopGetCurrent() as usize
+                );
+                assert_eq!(
+                    get_cf_run_loop(main, std::ptr::null()) as usize,
+                    corefoundation::api::CFRunLoopGetMain() as usize
+                );
+                (current as usize, main as usize)
+            }
+        };
+        let (one, main_one) = std::thread::spawn(ask).join().unwrap();
+        let (two, main_two) = std::thread::spawn(ask).join().unwrap();
+        assert_ne!(one, two, "two threads were handed one run loop");
+        assert_ne!(one, main_one, "a secondary thread was handed the main loop");
+        assert_eq!(main_one, main_two);
+    }
+
+    /// A secondary thread turning its own `NSRunLoop` services its own sources
+    /// and timers, and never the main loop's: those are the main thread's
+    /// work, and running them beside it is a race the program never agreed to.
+    #[test]
+    fn a_secondary_thread_runs_its_own_loop_and_not_the_main_one() {
+        static MAIN_SOURCE: AtomicUsize = AtomicUsize::new(0);
+        static OWN_SOURCE: AtomicUsize = AtomicUsize::new(0);
+        crate::bootstrap();
+        let main_source = corefoundation::runloop::new_source(
+            Some(record_thread),
+            &MAIN_SOURCE as *const AtomicUsize as usize,
+        );
+        corefoundation::runloop::main()
+            .add_source(&main_source, corefoundation::runloop::DEFAULT_MODE);
+        main_source.signal();
+        let own_source = corefoundation::runloop::new_source(
+            Some(record_thread),
+            &OWN_SOURCE as *const AtomicUsize as usize,
+        );
+        corefoundation::runloop::current()
+            .add_source(&own_source, corefoundation::runloop::DEFAULT_MODE);
+        own_source.signal();
+
+        let target = target(c"RosemaryTestThreadTimerTarget", timer_records_thread);
+        // SAFETY: the prototypes are the methods'.
+        unsafe {
+            scheduled_timer(
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                0.005,
+                target,
+                objc::sel::get("tick:"),
+                std::ptr::null_mut(),
+                0,
+            );
+            let run_loop = current_run_loop(std::ptr::null_mut(), std::ptr::null());
+            for _ in 0..100 {
+                if TIMER_THREAD.load(Ordering::SeqCst) != 0 {
+                    break;
+                }
+                run_until_date(run_loop, std::ptr::null(), date(now() + 0.01));
+            }
+        }
+        corefoundation::runloop::main()
+            .remove_source(&main_source, corefoundation::runloop::DEFAULT_MODE);
+        main_source.invalidate();
+
+        let me = thread_token();
+        assert_eq!(
+            OWN_SOURCE.load(Ordering::SeqCst),
+            me,
+            "its own source did not fire"
+        );
+        assert_eq!(
+            TIMER_THREAD.load(Ordering::SeqCst),
+            me,
+            "its timer fired elsewhere"
+        );
+        assert_ne!(
+            MAIN_SOURCE.load(Ordering::SeqCst),
+            me,
+            "it serviced the main loop's source"
+        );
+    }
+
+    static MODE_TICKS: AtomicUsize = AtomicUsize::new(0);
+
+    unsafe extern "C" fn mode_tick(_receiver: Id, _sel: Sel, _timer: Id) {
+        MODE_TICKS.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// `-addTimer:forMode:` puts the timer in that mode: it fires while the
+    /// mode runs and not while only the default one does, and a timer added for
+    /// a second mode fires in either.
+    #[test]
+    fn a_timer_added_for_a_mode_fires_in_that_mode() {
+        let target = target(c"RosemaryTestModeTimerTarget", mode_tick);
+        MODE_TICKS.store(0, Ordering::SeqCst);
+        let tracking = crate::string::from_str("RosemaryTestTrackingMode");
+        // SAFETY: the prototypes are the methods'.
+        unsafe {
+            let timer = unscheduled_timer(
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                0.001,
+                target,
+                objc::sel::get("tick:"),
+                std::ptr::null_mut(),
+                1,
+            );
+            let run_loop = current_run_loop(std::ptr::null_mut(), std::ptr::null());
+            add_timer_for_mode(run_loop, std::ptr::null(), timer, tracking);
+
+            run_mode_before_date(
+                run_loop,
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                date(now() + 0.02),
+            );
+            assert_eq!(
+                MODE_TICKS.load(Ordering::SeqCst),
+                0,
+                "it fired in the default mode"
+            );
+            for _ in 0..100 {
+                if MODE_TICKS.load(Ordering::SeqCst) != 0 {
+                    break;
+                }
+                run_mode_before_date(run_loop, std::ptr::null(), tracking, date(now() + 0.01));
+            }
+            assert_ne!(
+                MODE_TICKS.load(Ordering::SeqCst),
+                0,
+                "it did not fire in its mode"
+            );
+
+            add_timer_for_mode(run_loop, std::ptr::null(), timer, std::ptr::null_mut());
+            let before = MODE_TICKS.load(Ordering::SeqCst);
+            for _ in 0..100 {
+                if MODE_TICKS.load(Ordering::SeqCst) != before {
+                    break;
+                }
+                run_mode_before_date(
+                    run_loop,
+                    std::ptr::null(),
+                    std::ptr::null_mut(),
+                    date(now() + 0.01),
+                );
+            }
+            assert_ne!(
+                MODE_TICKS.load(Ordering::SeqCst),
+                before,
+                "the second mode was not added"
+            );
+
+            invalidate(timer, objc::sel::get("invalidate"));
         }
     }
 }

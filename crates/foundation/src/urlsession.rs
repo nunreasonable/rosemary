@@ -1105,10 +1105,9 @@ unsafe extern "C" fn cancel_connection(receiver: Id, _sel: Sel) {
 
 /// `-scheduleInRunLoop:forMode:` / `-unscheduleFromRunLoop:forMode:`: no-ops.
 ///
-/// FIXME (ACCURACY): every run loop in this tree is the one `NSRunLoop`
-/// singleton (see `timer.rs`), so there is no second loop or mode to move a
-/// connection to or off of - it is already scheduled on the only one there
-/// is, which is what `-start` delivers through by default. See [`deliver`].
+/// FIXME (ACCURACY): a connection delivers through the main queue (or its
+/// delegate queue) whichever loop it was scheduled on, so moving it between
+/// loops or modes changes nothing. See [`deliver`].
 unsafe extern "C" fn schedule_in_run_loop(_receiver: Id, _sel: Sel, _run_loop: Id, _mode: Id) {}
 
 unsafe extern "C" fn unschedule_from_run_loop(_receiver: Id, _sel: Sel, _run_loop: Id, _mode: Id) {}
