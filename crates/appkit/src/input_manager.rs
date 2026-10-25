@@ -44,6 +44,8 @@ unsafe extern "C" fn marked_text_attribute(_receiver: Id, _sel: Sel) -> Id {
     std::ptr::null_mut()
 }
 
+unsafe extern "C" fn marked_text_abandoned(_receiver: Id, _sel: Sel, _client: Id) {}
+
 pub(crate) fn install() {
     let class = objc::class::lookup(c"NSInputManager").expect("declared before its methods");
     class_methods!(class, {
@@ -54,6 +56,8 @@ pub(crate) fn install() {
         "handleMouseEvent:" => handle_mouse_event, c"v24@0:8@16";
         "handleEvent:" => handle_event, c"B24@0:8@16";
         "markedTextAttribute" => marked_text_attribute, c"@16@0:8";
+        // Nothing is ever being composed here, so there is nothing to abandon.
+        "markedTextAbandoned:" => marked_text_abandoned, c"v24@0:8@16";
     });
 }
 

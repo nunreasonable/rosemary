@@ -492,6 +492,37 @@ unsafe extern "C" fn enter_exit_event(
 /// since the Carbon-backed graphics contexts it once took real values for;
 /// nothing here reads it either.
 #[allow(clippy::too_many_arguments)]
+/// `+[NSEvent keyEventWithType:location:modifierFlags:timestamp:windowNumber:
+/// context:characters:charactersIgnoringModifiers:isARepeat:keyCode:]`.
+// FIXME (ACCURACY): `-charactersIgnoringModifiers` answers `characters` for
+// every event here, so the second string is not kept.
+#[allow(clippy::too_many_arguments)]
+unsafe extern "C" fn key_event(
+    _class: Id,
+    _sel: Sel,
+    kind: u64,
+    location: NSPoint,
+    modifiers: u64,
+    _timestamp: CGFloat,
+    window_number: isize,
+    _context: Id,
+    characters: Id,
+    _unmodified: Id,
+    repeat: u8,
+    key_code: u16,
+) -> Id {
+    make(Fields {
+        kind,
+        modifiers,
+        location,
+        window: window_by_number(window_number),
+        characters,
+        key_code,
+        repeat: repeat != 0,
+        ..Fields::default()
+    })
+}
+
 unsafe extern "C" fn mouse_event(
     _class: Id,
     _sel: Sel,
@@ -604,6 +635,8 @@ pub(crate) fn install() {
             => enter_exit_event, c"@96@0:8Q16{CGPoint=dd}24Q40d48q56@64q72q80^v88";
         "otherEventWithType:location:modifierFlags:timestamp:windowNumber:context:subtype:data1:data2:"
             => other_event, c"@96@0:8Q16{CGPoint=dd}24Q40d48q56@64s72q80q88";
+        "keyEventWithType:location:modifierFlags:timestamp:windowNumber:context:characters:charactersIgnoringModifiers:isARepeat:keyCode:"
+            => key_event, c"@92@0:8Q16{CGPoint=dd}24Q40d48q56@64@72@80c88S90";
         "mouseEventWithType:location:modifierFlags:timestamp:windowNumber:context:eventNumber:clickCount:pressure:"
             => mouse_event, c"@96@0:8Q16{CGPoint=dd}24Q40d48q56@64q72q80f88";
     });
