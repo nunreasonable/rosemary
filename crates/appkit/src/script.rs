@@ -355,7 +355,9 @@ fn perform(action: &Action) {
                 y: *to_y,
                 dx,
                 dy,
-                buttons: 0,
+                // A move with a button held is a drag, as it is from a real
+                // mouse: SDL reports the held buttons on its motion events.
+                buttons: HELD.load(Ordering::Relaxed),
             });
         }
         Action::Click { button, clicks } => {
@@ -416,7 +418,15 @@ fn perform(action: &Action) {
     }
 }
 
+/// SDL's mask of the buttons the script holds down, `1 << (button - 1)` each.
+static HELD: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
 fn button_event(window: u32, button: u8, down: bool, clicks: i64, x: f32, y: f32) {
+    let bit = 1u32 << u32::from(button.max(1) - 1);
+    match down {
+        true => HELD.fetch_or(bit, Ordering::Relaxed),
+        false => HELD.fetch_and(!bit, Ordering::Relaxed),
+    };
     crate::event::deliver(Event::MouseButton {
         window,
         button: button.into(),
