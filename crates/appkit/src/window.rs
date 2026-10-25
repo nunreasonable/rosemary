@@ -2093,13 +2093,50 @@ unsafe extern "C" fn order_out(receiver: Id, _sel: Sel, _sender: Id) {
         sdl3::video::hide_window(sdl);
     }
     window_of(receiver).shown = 0;
-    let _ = KEY.compare_exchange(
-        receiver as usize,
-        0,
-        std::sync::atomic::Ordering::AcqRel,
-        std::sync::atomic::Ordering::Acquire,
-    );
+    let was_key = KEY
+        .compare_exchange(
+            receiver as usize,
+            0,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+        )
+        .is_ok();
     crate::event::announce_resign(receiver);
+    if was_key {
+        hand_key_on(receiver);
+    }
+}
+
+/// Make another window key after `leaving`, the key window, left the screen.
+///
+/// AppKit does not leave an active application without a key window: closing a
+/// dialog gives key back to the document under it. A program that ignores the
+/// click that activates a window would otherwise drop the first click after
+/// every dialog.
+///
+/// FIXME (ACCURACY): AppKit keeps the main window apart from the key one and
+/// hands key to it first; this takes the frontmost window that can be main,
+/// else the frontmost that can be key.
+fn hand_key_on(leaving: Id) {
+    let candidates: Vec<Id> = front_to_back()
+        .into_iter()
+        .filter(|&window| {
+            window != leaving
+                && presentation(window_of(window)) == Presentation::Toplevel
+                && crate::event::answers(window, "canBecomeKeyWindow")
+        })
+        .collect();
+    let next = candidates
+        .iter()
+        .copied()
+        .find(|&window| crate::event::answers(window, "canBecomeMainWindow"))
+        .or_else(|| candidates.first().copied());
+    let Some(next) = next else {
+        return;
+    };
+    trace!("{next:p} became key after {leaving:p} left the screen");
+    KEY.store(next as usize, std::sync::atomic::Ordering::Release);
+    crate::event::announce_key(next);
 }
 
 /// `-dealloc`. The content view is told it has no window before it is released,
@@ -4835,5 +4872,88 @@ mod tests {
         objc::arc::release(manager);
         objc::arc::release(delegate);
         objc::arc::release(window);
+    }
+
+    /// Closing the key window hands key to the window under it that can be
+    /// main, past a borderless one in front; ordering out a window that was
+    /// not key changes nothing.
+    #[test]
+    fn ordering_out_the_key_window_makes_the_one_under_it_key() {
+        if !sdl3::isolated::run_here() {
+            return;
+        }
+        crate::bootstrap();
+        let Some(probe) = sdl3::video::create_window(c"key handoff preflight", 32, 32, 0) else {
+            return;
+        };
+        sdl3::video::destroy_window(probe);
+        static BECAME_KEY: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        unsafe extern "C" fn did_become_key(_receiver: Id, _sel: Sel, notification: Id) {
+            assert!(!notification.is_null());
+            BECAME_KEY.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        let delegate_class =
+            objc::class::allocate_pair(objc::class::lookup(c"NSObject"), c"KeyHandoffDelegate", 0)
+                .unwrap();
+        delegate_class.add_method(
+            objc::sel::get("windowDidBecomeKey:"),
+            did_become_key as objc::class::Imp,
+            c"v24@0:8@16",
+        );
+        objc::class::register_pair(delegate_class);
+        let class = objc::class::lookup(c"NSWindow").unwrap();
+        let make = |mask: usize| {
+            let object = objc::object::create_instance(class, 0);
+            // SAFETY: a fresh window and the initializer's declared arguments.
+            unsafe {
+                init_with_content_rect(
+                    object,
+                    objc::sel::get("initWithContentRect:styleMask:backing:defer:"),
+                    NSRect {
+                        origin: NSPoint { x: 10.0, y: 10.0 },
+                        size: NSSize {
+                            width: 120.0,
+                            height: 90.0,
+                        },
+                    },
+                    mask,
+                    0,
+                    0,
+                )
+            }
+        };
+        let document = make(style::TITLED);
+        let borderless = make(0);
+        let dialog = make(style::TITLED);
+        let other = make(style::TITLED);
+        window_of(document).delegate = objc::object::create_instance(delegate_class, 0);
+        order_front(document, true);
+        order_front(other, true);
+        order_front(borderless, false);
+        order_front(dialog, true);
+        assert_eq!(key_window(), dialog);
+        let order_out_sel = objc::sel::get("orderOut:");
+        // SAFETY: windows this test made; `-orderOut:` is `void (id, SEL, id)`.
+        unsafe { order_out(other, order_out_sel, std::ptr::null_mut()) };
+        assert_eq!(
+            key_window(),
+            dialog,
+            "a window that was not key gave key away"
+        );
+        let before = BECAME_KEY.load(std::sync::atomic::Ordering::Relaxed);
+        // SAFETY: as above.
+        unsafe { order_out(dialog, order_out_sel, std::ptr::null_mut()) };
+        assert_eq!(key_window(), document);
+        assert_eq!(
+            BECAME_KEY.load(std::sync::atomic::Ordering::Relaxed),
+            before + 1,
+            "the new key window was not told"
+        );
+        // SAFETY: as above.
+        unsafe { order_out(document, order_out_sel, std::ptr::null_mut()) };
+        assert!(
+            key_window().is_null(),
+            "a window that cannot be key was made key"
+        );
     }
 }
