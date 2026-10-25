@@ -594,4 +594,44 @@ mod tests {
             object::release(s);
         }
     }
+
+    /// Producers signal and consumers wait, some with short deadlines that
+    /// expire and put their count back: every signal is taken exactly once.
+    #[test]
+    fn signals_and_waits_balance_with_timeouts_in_the_mix() {
+        const PAIRS: u64 = 4;
+        const EACH: u64 = 5_000;
+        let s = unsafe { semaphore_create(0) };
+        let taken = std::sync::Arc::new(AtomicU32::new(0));
+        let mut threads = Vec::new();
+        for which in 0..PAIRS {
+            threads.push(std::thread::spawn(move || {
+                for _ in 0..EACH {
+                    unsafe { semaphore_signal(s) };
+                }
+            }));
+            let taken = std::sync::Arc::clone(&taken);
+            threads.push(std::thread::spawn(move || {
+                let mut got = 0;
+                while got < EACH {
+                    let deadline = match which % 2 {
+                        0 => time::FOREVER,
+                        _ => unsafe { time::time(time::NOW, 20_000) },
+                    };
+                    if unsafe { semaphore_wait(s, deadline) } == 0 {
+                        got += 1;
+                        taken.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            }));
+        }
+        for t in threads {
+            t.join().expect("a producer or consumer");
+        }
+        assert_eq!(taken.load(Ordering::Relaxed) as u64, PAIRS * EACH);
+        unsafe {
+            assert_eq!(semaphore_wait(s, time::NOW), 1, "nothing left over");
+            object::release(s);
+        }
+    }
 }

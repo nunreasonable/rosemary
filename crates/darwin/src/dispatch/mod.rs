@@ -182,4 +182,59 @@ mod tests {
         unsafe { once_f(std::ptr::null_mut(), std::ptr::null_mut(), Some(count)) };
         assert_eq!(CALLS.load(Ordering::SeqCst), 1);
     }
+
+    struct Lazy {
+        predicate: std::cell::UnsafeCell<i64>,
+        value: std::cell::UnsafeCell<[u64; 8]>,
+        runs: AtomicUsize,
+    }
+
+    unsafe impl Sync for Lazy {}
+
+    unsafe extern "C" fn fill(context: *mut c_void) {
+        let lazy = unsafe { &*(context as *const Lazy) };
+        lazy.runs.fetch_add(1, Ordering::Relaxed);
+        // Slow enough that callers really do arrive while it runs.
+        for (i, word) in unsafe { &mut *lazy.value.get() }.iter_mut().enumerate() {
+            std::hint::spin_loop();
+            *word = i as u64 + 1;
+        }
+    }
+
+    /// Fresh predicates raced by threads released together, round after
+    /// round: one run, and every caller sees the body's plain writes, both
+    /// through the call and through the inline `~0` fast path Darwin's header
+    /// gives the guest.
+    #[test]
+    fn racing_callers_all_see_what_the_one_run_wrote() {
+        const THREADS: usize = 8;
+        for _ in 0..400 {
+            let lazy = Lazy {
+                predicate: std::cell::UnsafeCell::new(0),
+                value: std::cell::UnsafeCell::new([0; 8]),
+                runs: AtomicUsize::new(0),
+            };
+            let start = std::sync::Barrier::new(THREADS);
+            std::thread::scope(|s| {
+                for _ in 0..THREADS {
+                    s.spawn(|| {
+                        start.wait();
+                        let context = &lazy as *const Lazy as *mut c_void;
+                        unsafe { once_f(lazy.predicate.get().cast(), context, Some(fill)) };
+                        let expected: [u64; 8] = std::array::from_fn(|i| i as u64 + 1);
+                        assert_eq!(unsafe { *lazy.value.get() }, expected);
+                        let predicate = unsafe {
+                            &*(lazy.predicate.get() as *const std::sync::atomic::AtomicI64)
+                        };
+                        assert_eq!(
+                            predicate.load(Ordering::Acquire),
+                            !0,
+                            "the header's done value"
+                        );
+                    });
+                }
+            });
+            assert_eq!(lazy.runs.load(Ordering::Relaxed), 1);
+        }
+    }
 }
