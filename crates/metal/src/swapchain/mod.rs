@@ -6,7 +6,9 @@ mod tests;
 use present::*;
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex, TryLockError};
+use std::time::{Duration, Instant};
 
 use ash::vk;
 use vk::Handle;
@@ -15,10 +17,10 @@ use crate::gpu::{self, Gpu, GpuImage, ImageDescription};
 
 /// How many frames may be recorded before one has to have finished.
 ///
-/// Two, so that the host can record the next presentation while the device is
-/// still blitting the last. A third buys nothing here: presentation is one
-/// blit, and the guest's own frame is what the device is actually waiting on.
-const FRAMES_IN_FLIGHT: usize = 2;
+/// FIFO coalesces several independent Core Animation layer updates into
+/// one window presentation. The accumulator submissions must not reuse their
+/// command buffers while those small copies are still in the GPU queue.
+const FRAMES_IN_FLIGHT: usize = 8;
 
 /// The per-window state presentation goes through.
 struct Swapchain {
@@ -37,6 +39,11 @@ struct Swapchain {
     /// would see a difference on every frame and rebuild the swapchain on
     /// every frame.
     requested: vk::Extent2D,
+    /// The event pump never waits for WSI recreation. A window-local
+    /// worker consumes the newest requested extent under the presenting lock.
+    pending_rebuild: Option<vk::Extent2D>,
+    /// vkCreateSwapchainKHR retires oldSwapchain even if creation fails.
+    retired: bool,
     images: Vec<vk::Image>,
     /// One presentation semaphore per swapchain image, rather than one per
     /// frame in flight.
@@ -65,6 +72,303 @@ struct Swapchain {
     pool: vk::CommandPool,
     frames: Vec<Frame>,
     frame: usize,
+    present_mode: vk::PresentModeKHR,
+    /// FIFO layers accumulate in an offscreen image, not the Vulkan WSI
+    /// queue. The presentation worker drains that image once per display.
+    fifo_dirty: bool,
+    fifo_shape: Option<corners::Shape>,
+    fifo_dirty_since: Option<Instant>,
+    fifo_batch_delay: Duration,
+    last_wsi_error: Option<vk::Result>,
+    #[cfg(test)]
+    injected_build_vk_error: Option<vk::Result>,
+    #[cfg(test)]
+    injected_stage_vk_error: Option<vk::Result>,
+    #[cfg(test)]
+    injected_queue_present_error: Option<vk::Result>,
+    #[cfg(test)]
+    injected_unsignaled_present_fence: bool,
+    #[cfg(test)]
+    injected_queue_submit_error: Option<vk::Result>,
+    /// vkAcquireNextImageKHR succeeded, but its semaphore wait has not yet
+    /// been submitted. Failure requires retiring this swapchain, not simply
+    /// resetting a fence and reusing the signaled acquisition semaphore.
+    acquired_unsubmitted: Option<(vk::Semaphore, vk::Fence)>,
+    deferred_owned: bool,
+    #[cfg(test)]
+    injected_recovery_error: Option<vk::Result>,
+    #[cfg(test)]
+    injected_build_failure: bool,
+    #[cfg(test)]
+    injected_unavailable_extent: bool,
+    #[cfg(test)]
+    rebuild_attempts: usize,
+    #[cfg(test)]
+    last_create_old_swapchain: vk::SwapchainKHR,
+}
+
+/// Serialize presentations for one window while leaving swapchain state
+/// available to fence retirement during the blocking image acquisition.
+/// Dropping the permit releases the window lock before waking the Metal
+/// presenter. That ordering lets deferred staging acquire the lock immediately.
+struct PresentingGuard<'a> {
+    held: Option<std::sync::MutexGuard<'a, ()>>,
+    gpu: &'static Gpu,
+}
+
+impl Drop for PresentingGuard<'_> {
+    fn drop(&mut self) {
+        drop(self.held.take());
+        self.gpu.presenter.notify_progress();
+    }
+}
+
+struct WindowSwapchain {
+    gpu: &'static Gpu,
+    presenting: Mutex<()>,
+    state: Mutex<Swapchain>,
+    wake: Condvar,
+    alive: AtomicBool,
+    worker_started: AtomicBool,
+    worker: Mutex<Option<std::thread::JoinHandle<()>>>,
+    resize_worker_started: AtomicBool,
+    resize_worker: Mutex<Option<std::thread::JoinHandle<()>>>,
+    /// 0 = healthy, 1 = surface lost, 2 = device/unknown terminal failure.
+    fifo_failure: std::sync::atomic::AtomicU8,
+    #[cfg(test)]
+    injected_acquire_error: Mutex<Option<vk::Result>>,
+    #[cfg(test)]
+    injected_nonfifo_acquire_error: Mutex<Option<vk::Result>>,
+}
+
+struct PreparedPresent {
+    slot: usize,
+    command_buffer: vk::CommandBuffer,
+    acquired: vk::Semaphore,
+    done: vk::Fence,
+    composite: Option<vk::Image>,
+}
+
+#[derive(Clone, Copy)]
+struct AcquireRequest {
+    handle: vk::SwapchainKHR,
+    semaphore: vk::Semaphore,
+    fence: vk::Fence,
+}
+
+/// Only the image identity and extent cross an acquire. The swapchain
+/// retains ownership of the actual Vulkan allocation under `presenting`.
+#[derive(Clone, Copy)]
+struct PresentSource {
+    image: vk::Image,
+    width: u32,
+    height: u32,
+}
+
+impl From<&GpuImage> for PresentSource {
+    fn from(image: &GpuImage) -> Self {
+        Self {
+            image: image.image,
+            width: image.width,
+            height: image.height,
+        }
+    }
+}
+
+/// The compositor keeps its image and DMA fence alive across a WSI acquire.
+/// The Vulkan acquire itself must not hold the swapchain-state mutex.
+struct PreparedFifo {
+    frame: appkit::view::Frame,
+    source: PresentSource,
+    prepared: PreparedPresent,
+    request: AcquireRequest,
+}
+
+enum FifoAcquire {
+    Ready(Option<(u32, bool)>),
+    TimedOut,
+    Terminal(vk::Result),
+}
+
+/// Wake an idle FIFO worker without losing a wake issued immediately
+/// before it parks. Condvar still covers the bounded batch-delay wait.
+fn wake_fifo_worker(entry: &WindowSwapchain) {
+    if let Some(worker) = entry.worker.lock().expect("FIFO worker").as_ref() {
+        worker.thread().unpark();
+    }
+    entry.wake.notify_all();
+}
+
+fn wake_resize_worker(entry: &WindowSwapchain) {
+    if let Some(worker) = entry.resize_worker.lock().expect("resize worker").as_ref() {
+        worker.thread().unpark();
+    }
+}
+
+fn ensure_resize_worker(window: usize, entry: &Arc<WindowSwapchain>) {
+    if entry.resize_worker_started.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let owned = Arc::clone(entry);
+    let handle = std::thread::Builder::new()
+        .name("rosemary-wsi-resize".into())
+        .spawn(move || resize_worker(window, owned))
+        .expect("window-local WSI resize worker");
+    *entry.resize_worker.lock().expect("resize worker") = Some(handle);
+}
+
+fn resize_worker(window: usize, entry: Arc<WindowSwapchain>) {
+    loop {
+        if !entry.alive.load(Ordering::Acquire)
+            || entry.gpu.lost.load(Ordering::Acquire)
+            || entry.fifo_failure.load(Ordering::Acquire) != 0
+        {
+            return;
+        }
+        if entry
+            .state
+            .lock()
+            .expect("swapchain")
+            .pending_rebuild
+            .is_none()
+        {
+            std::thread::park();
+            continue;
+        }
+        let presenting = PresentingGuard {
+            held: Some(entry.presenting.lock().expect("window presentation")),
+            gpu: entry.gpu,
+        };
+        #[cfg(test)]
+        if TEST_BLOCK_RESIZE_WORKER.load(Ordering::Acquire) == window {
+            TEST_RESIZE_WORKER_PAUSED.store(window, Ordering::Release);
+            while TEST_BLOCK_RESIZE_WORKER.load(Ordering::Acquire) == window {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            TEST_RESIZE_WORKER_PAUSED.store(0, Ordering::Release);
+        }
+        if !entry.alive.load(Ordering::Acquire) || entry.gpu.lost.load(Ordering::Acquire) {
+            return;
+        }
+        let mut state = entry.state.lock().expect("swapchain");
+        let Some(extent) = state.pending_rebuild else {
+            continue;
+        };
+        // idle() and swapchain construction can block on GPU progress.
+        // Neither operation is ever performed by the AppKit event thread.
+        let rebuilt = if state.acquired_unsubmitted.is_some() {
+            // A failed submit left an acquired WSI semaphore outstanding.
+            // Consuming it and retiring the image can wait for GPU progress;
+            // that recovery belongs on this worker, never in AppKit.
+            state.recover_unsubmitted_acquire().and_then(|_| {
+                if state.requested != extent {
+                    state.rebuild(extent)
+                } else {
+                    Ok(())
+                }
+            })
+        } else {
+            state.rebuild(extent)
+        };
+        let typed_device_loss = state.last_wsi_error.take() == Some(vk::Result::ERROR_DEVICE_LOST);
+        match rebuilt {
+            Ok(()) => {
+                state.pending_rebuild = None;
+                let fifo = is_fifo_mode(state.present_mode) && state.fifo_dirty;
+                drop(state);
+                drop(presenting);
+                if fifo {
+                    ensure_fifo_presentation_worker(window, &entry);
+                    wake_fifo_worker(&entry);
+                }
+                appkit::backing::present_again(window as sdl3::Window);
+            }
+            Err(reason) if recoverable_fifo_rebuild_failure(&reason) => {
+                drop(state);
+                drop(presenting);
+                std::thread::sleep(Duration::from_millis(80));
+            }
+            Err(reason) => {
+                gpu::trace(format!("deferred WSI resize failed: {reason}"));
+                let device_lost = typed_device_loss || reason.contains("ERROR_DEVICE_LOST");
+                drop(state);
+                drop(presenting);
+                // No window lock may be held while notifying the device registry.
+                if device_lost {
+                    record_device_loss(entry.gpu);
+                } else {
+                    entry.fifo_failure.store(2, Ordering::Release);
+                    wake_fifo_worker(&entry);
+                }
+                return;
+            }
+        }
+    }
+}
+
+pub(crate) fn record_device_loss(gpu: &Gpu) {
+    if gpu.lost.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    gpu::trace("Vulkan logical device lost; stopping all associated FIFO windows");
+    let registry = SWAPCHAINS.lock().expect("window swapchains");
+    if let Some(entries) = registry.as_ref() {
+        for entry in entries
+            .values()
+            .filter(|entry| std::ptr::eq(entry.gpu, gpu))
+        {
+            entry.fifo_failure.store(2, Ordering::Release);
+            wake_fifo_worker(entry);
+            wake_resize_worker(entry);
+        }
+    }
+}
+
+fn handle_terminal_error(gpu: &'static Gpu, entry: &WindowSwapchain, error: vk::Result) {
+    if error == vk::Result::ERROR_DEVICE_LOST {
+        record_device_loss(gpu);
+    } else {
+        entry
+            .fifo_failure
+            .store(terminal_fifo_failure(error), Ordering::Release);
+    }
+}
+
+// Zero extent and out-of-date surfaces need a later retry, not a terminal
+// failure. A minimized window may remain in this state indefinitely.
+fn recoverable_fifo_rebuild_failure(reason: &str) -> bool {
+    reason.contains("the window has no area to present into")
+        || reason.contains("ERROR_OUT_OF_DATE_KHR")
+        || reason.contains("SUBOPTIMAL_KHR")
+        || reason.contains("ERROR_INITIALIZATION_FAILED")
+}
+
+// Converted SDL windows cannot use SDL_GetWindowSurface as fallback.
+// Terminal allocation/device failures stop the window, while transient
+// staging failures leave the Metal drawable queued for a later retry.
+fn terminal_fifo_staging_failure(reason: &str) -> bool {
+    reason.contains("ERROR_DEVICE_LOST")
+        || reason.contains("ERROR_OUT_OF_HOST_MEMORY")
+        || reason.contains("ERROR_OUT_OF_DEVICE_MEMORY")
+}
+
+/// CPU backing-store damage is needed only once the *first* frame of a new
+/// Metal layer has actually entered the Vulkan window accumulator.
+fn fifo_first_stage_needs_store(
+    joined: bool,
+    staged: &Result<Option<bool>, String>,
+    layer: usize,
+    window: usize,
+) -> bool {
+    joined && layer != window && matches!(staged, Ok(Some(true)))
+}
+
+fn terminal_fifo_failure(error: vk::Result) -> u8 {
+    if error == vk::Result::ERROR_SURFACE_LOST_KHR {
+        1
+    } else {
+        2
+    }
 }
 
 /// One frame's worth of recording and synchronization.
@@ -75,6 +379,10 @@ struct Frame {
     /// than per image, because which image an acquisition returns is not
     /// known until it has returned.
     acquired: vk::Semaphore,
+    /// Signals when WSI finishes signaling the acquisition semaphore.
+    /// Needed to safely retire an unconsumed semaphore if recovery fails.
+    acquire_done: vk::Fence,
+    acquire_pending: bool,
     /// Signalled with the submission, so that this frame's command buffer and
     /// its acquisition semaphore are not reused while the device still has
     /// them.
@@ -92,7 +400,159 @@ struct PresentFence {
     pending: bool,
 }
 
-static SWAPCHAINS: Mutex<Option<HashMap<usize, Swapchain>>> = Mutex::new(None);
+static SWAPCHAINS: Mutex<Option<HashMap<usize, Arc<WindowSwapchain>>>> = Mutex::new(None);
+
+/// A Vulkan initializer never owns the global map mutex while creating
+/// swapchain resources. Each window can initialize independently.
+static INITIALIZING: Mutex<Option<HashMap<usize, Arc<AtomicBool>>>> = Mutex::new(None);
+
+/// An initializer removes only its own token. SDL may recycle a window
+/// address while a cancelled initializer is still unwinding.
+struct InitializerRegistration {
+    window: usize,
+    token: Arc<AtomicBool>,
+}
+
+impl Drop for InitializerRegistration {
+    fn drop(&mut self) {
+        let mut pending = INITIALIZING
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if let Some(all) = pending.as_mut() {
+            if all
+                .get(&self.window)
+                .is_some_and(|current| Arc::ptr_eq(current, &self.token))
+            {
+                all.remove(&self.window);
+            }
+        }
+    }
+}
+
+struct InitRetry {
+    after: Instant,
+    delay: Duration,
+    unknown_failures: u32,
+}
+static INIT_RETRIES: Mutex<Option<HashMap<usize, InitRetry>>> = Mutex::new(None);
+
+fn retry_ready(window: usize) -> bool {
+    let retry = INIT_RETRIES.lock().expect("WSI initialization retry");
+    retry
+        .as_ref()
+        .and_then(|retries| retries.get(&window))
+        .is_none_or(|retry| Instant::now() >= retry.after)
+}
+
+// Minimized windows can be unavailable indefinitely. Cap backoff, not retries
+// for identified transient failures. Unclassified SDL failures have a budget.
+const MAX_UNCLASSIFIED_SURFACE_FAILURES: u32 = 8;
+
+fn schedule_retry(window: usize, unclassified_failure: bool) -> bool {
+    let mut retries = INIT_RETRIES.lock().expect("WSI initialization retry");
+    let retry = retries.get_or_insert_with(HashMap::new);
+    let unknown_failures = retry
+        .get(&window)
+        .map_or(0, |previous| previous.unknown_failures)
+        .saturating_add(u32::from(unclassified_failure));
+    if unclassified_failure && unknown_failures >= MAX_UNCLASSIFIED_SURFACE_FAILURES {
+        return false;
+    }
+    let delay = retry
+        .get(&window)
+        .map_or(Duration::from_millis(100), |previous| {
+            (previous.delay * 2).min(Duration::from_secs(2))
+        });
+    retry.insert(
+        window,
+        InitRetry {
+            after: Instant::now() + delay,
+            delay,
+            unknown_failures,
+        },
+    );
+    true
+}
+
+fn reset_retry(window: usize) {
+    if let Some(retries) = INIT_RETRIES
+        .lock()
+        .expect("WSI initialization retry")
+        .as_mut()
+    {
+        retries.remove(&window);
+    }
+}
+
+fn permanent_sdl_surface_failure(failure: &sdl3::video::vulkan::SurfaceFailure) -> bool {
+    let text = failure.reason.to_ascii_lowercase();
+    !failure.transient
+        && (text.contains("not supported")
+            || text.contains("unsupported")
+            || text.contains("not available")
+            || text.contains("incompatible")
+            || text.contains("failed to load")
+            || text.contains("missing")
+            || text.contains("abandoned"))
+}
+
+fn permanent_init_failure(reason: &str) -> bool {
+    reason.contains("belongs to OpenGL")
+        || reason.contains("cannot present to this window")
+        || reason.contains("VK_KHR_surface is gone")
+        || reason.contains("VK_KHR_swapchain is gone")
+}
+
+#[cfg(test)]
+static TEST_SLOW_INITIALIZER: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+static TEST_SLOW_INITIALIZER_STARTED: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+static TEST_BLOCK_RESIZE_WORKER: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+static TEST_RESIZE_WORKER_PAUSED: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+static TEST_WINDOW_RETIRED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+static TEST_ACTIVE_RETIREMENTS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+pub(crate) fn wait_for_test_retirements() {
+    let deadline = Instant::now() + Duration::from_secs(8);
+    while TEST_ACTIVE_RETIREMENTS.load(Ordering::Acquire) != 0 {
+        assert!(
+            Instant::now() < deadline,
+            "Vulkan retirement failed to finish"
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    sdl3::video::vulkan::service_surface_requests();
+}
+#[cfg(test)]
+static TEST_FIFO_IDLE_PARKED: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+static TEST_FAIL_FIRST_CREATE_WINDOW: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+static TEST_FAIL_DEVICE_CREATE_WINDOW: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+static TEST_SURFACE_GUARD_RELEASES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+fn release_created_surface(instance: u64, surface: u64) {
+    #[cfg(test)]
+    if surface == u64::MAX {
+        TEST_SURFACE_GUARD_RELEASES.fetch_add(1, Ordering::AcqRel);
+        return;
+    }
+    sdl3::video::vulkan::destroy_surface(instance, surface);
+}
 
 /// Whether a swapchain could not be made for this window, so that a run does
 /// not retry - and re-report - a surface the host will never give.
@@ -109,11 +569,25 @@ impl SourceOwner {
 impl Drop for SourceOwner {
     fn drop(&mut self) {
         if let Some(source) = self.0.take() {
-            // The copy was not submitted, so only the temporary reference is
-            // returned. The command submission still owns the drawable and
-            // may send it through the readback fallback after its fence.
+            // A pre-WSI failure may still fall back to CPU readback, so its
+            // original Metal drawable submission owns the drawable slot.
             objc::arc::release(source as objc::object::Id);
         }
+    }
+}
+
+// After a successful WSI acquisition, we cannot hand the drawable to SDL
+// readback if Vulkan recording/submission fails. Complete its drawable slot
+// on every early return unless a successful submission took ownership.
+struct AcquiredSource(Option<usize>);
+impl AcquiredSource {
+    fn take(&mut self) -> Option<usize> {
+        self.0.take()
+    }
+}
+impl Drop for AcquiredSource {
+    fn drop(&mut self) {
+        finish_source(self.0.take());
     }
 }
 
@@ -125,12 +599,74 @@ impl Drop for SourceOwner {
 /// longer exists.
 pub(crate) fn forget_window(window: sdl3::Window) {
     let key = window as usize;
-    if let Some(all) = SWAPCHAINS.lock().expect("swapchains").as_mut() {
-        all.remove(&key);
+    reset_retry(key);
+    if let Some(initializing) = INITIALIZING
+        .lock()
+        .expect("initializers")
+        .as_mut()
+        .and_then(|all| all.remove(&key))
+    {
+        initializing.store(true, Ordering::Release);
+    }
+    let entry = SWAPCHAINS
+        .lock()
+        .expect("swapchains")
+        .as_ref()
+        .and_then(|all| all.get(&key))
+        .cloned();
+    if let Some(entry) = &entry {
+        // A resize may be blocked in vkQueueWaitIdle with the window lock.
+        // Cancellation cannot wait for that lock on the AppKit thread.
+        entry.alive.store(false, Ordering::Release);
+        entry.wake.notify_all();
+        wake_fifo_worker(entry);
+        wake_resize_worker(entry);
+    }
+    let removed = SWAPCHAINS
+        .lock()
+        .expect("swapchains")
+        .as_mut()
+        .and_then(|all| all.remove(&key));
+    drop(entry);
+    if let Some(entry) = removed {
+        // SDL_DestroyWindow can run as soon as we return. A token prevents
+        // SDL from disposing of the native VkSurface until this swapchain
+        // and every window-local worker have actually retired.
+        let retired = Arc::new(AtomicBool::new(false));
+        sdl3::video::vulkan::hold_window_for_teardown(window, Arc::clone(&retired));
+        #[cfg(test)]
+        TEST_ACTIVE_RETIREMENTS.fetch_add(1, Ordering::AcqRel);
+        std::thread::Builder::new()
+            .name("rosemary-wsi-retire".into())
+            .spawn(move || {
+                let fifo = entry.worker.lock().expect("FIFO worker").take();
+                if let Some(fifo) = fifo {
+                    fifo.thread().unpark();
+                    let _ = fifo.join();
+                }
+                let resize = entry.resize_worker.lock().expect("resize worker").take();
+                if let Some(resize) = resize {
+                    resize.thread().unpark();
+                    let _ = resize.join();
+                }
+                // A concurrent presentation may retain another Arc. Wait
+                // without holding the AppKit or SDL video thread.
+                while Arc::strong_count(&entry) != 1 {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                drop(entry);
+                #[cfg(test)]
+                TEST_WINDOW_RETIRED.store(key, Ordering::Release);
+                retired.store(true, Ordering::Release);
+                #[cfg(test)]
+                TEST_ACTIVE_RETIREMENTS.fetch_sub(1, Ordering::AcqRel);
+            })
+            .expect("asynchronous Vulkan window retirement");
     }
     if let Some(refused) = REFUSED.lock().expect("refused windows").as_mut() {
         refused.remove(&key);
     }
+    sdl3::video::forget_cached_window_refresh_rate(window);
 }
 
 /// Blit `source` into `window`'s swapchain image at `frame` and present it.
@@ -142,6 +678,7 @@ pub(crate) fn forget_window(window: sdl3::Window) {
 ///
 /// `holes` are rectangles of other layers, which keep what those layers last
 /// presented there: the window's store is presented around its views' layers.
+#[cfg(test)]
 pub(crate) fn present(
     gpu: &'static Gpu,
     layer: usize,
@@ -149,6 +686,102 @@ pub(crate) fn present(
     source: &GpuImage,
     holes: &[(usize, Region)],
 ) -> Result<bool, String> {
+    let limit = Instant::now() + Duration::from_secs(3);
+    loop {
+        match present_impl(gpu, layer, frame, source, holes, None)? {
+            Some(shown) => return Ok(shown),
+            None if Instant::now() < limit => {
+                // These tests do not run an AppKit event pump.
+                sdl3::video::vulkan::service_surface_requests();
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            None => return Err("timed out initializing test swapchain".into()),
+        }
+    }
+}
+
+/// Fast preflight before uploading a backing store. The post-upload
+/// `present_nonblocking` check handles races with newly acquired WSI locks.
+pub(crate) fn window_rendering_disabled(window: sdl3::Window) -> bool {
+    let Ok(guard) = SWAPCHAINS.try_lock() else {
+        return false;
+    };
+    guard
+        .as_ref()
+        .and_then(|all| all.get(&(window as usize)))
+        .is_some_and(|entry| {
+            entry.gpu.lost.load(Ordering::Acquire)
+                || entry.fifo_failure.load(Ordering::Acquire) != 0
+        })
+}
+
+/// A permanent failure can still use CPU fallback only if SDL never
+/// converted the window to Vulkan.
+pub(crate) fn window_refused(window: sdl3::Window) -> Option<bool> {
+    let refused = REFUSED.lock().expect("refused windows");
+    refused
+        .as_ref()
+        .filter(|m| m.contains_key(&(window as usize)))
+        .map(|_| sdl3::video::vulkan::owns_window(window))
+}
+
+/// Do not upload the backing store on every pump while initialization is
+/// still running or backing off. The first frame still requests a surface.
+pub(crate) fn window_initialization_pending(window: sdl3::Window) -> bool {
+    let key = window as usize;
+    let entry_exists = match SWAPCHAINS.try_lock() {
+        Ok(registry) => registry.as_ref().is_some_and(|m| m.contains_key(&key)),
+        Err(_) => return true,
+    };
+    if entry_exists {
+        return false;
+    }
+    !retry_ready(key)
+        || INITIALIZING
+            .lock()
+            .expect("initializers")
+            .as_ref()
+            .is_some_and(|m| m.contains_key(&key))
+        || sdl3::video::vulkan::surface_request_pending(window)
+}
+
+/// A live swapchain can temporarily defer staging while its presentation
+/// lock or a GPU-copy fence is occupied. Unlike missing WSI metadata, these
+/// deferred drawables must be retried before their layer's ring fills.
+pub(crate) fn window_has_active_swapchain(window: sdl3::Window) -> bool {
+    let registry = match SWAPCHAINS.try_lock() {
+        Ok(registry) => registry,
+        // Do not turn transient contention with teardown into a long delay.
+        Err(_) => return true,
+    };
+    registry
+        .as_ref()
+        .and_then(|all| all.get(&(window as usize)))
+        .is_some_and(|entry| {
+            entry.alive.load(Ordering::Acquire)
+                && !entry.gpu.lost.load(Ordering::Acquire)
+                && entry.fifo_failure.load(Ordering::Acquire) == 0
+        })
+}
+
+pub(crate) fn window_presenting_busy(window: sdl3::Window) -> bool {
+    let guard = match SWAPCHAINS.try_lock() {
+        Ok(guard) => guard,
+        Err(_) => return true,
+    };
+    let entry = guard.as_ref().and_then(|all| all.get(&(window as usize)));
+    entry.is_some_and(|entry| entry.presenting.try_lock().is_err())
+}
+
+/// A backing-store presentation must never block AppKit's event pump on a
+/// FIFO worker's image acquisition. `None` means keep the store dirty.
+pub(crate) fn present_nonblocking(
+    gpu: &'static Gpu,
+    layer: usize,
+    frame: &appkit::view::Frame,
+    source: &GpuImage,
+    holes: &[(usize, Region)],
+) -> Result<Option<bool>, String> {
     present_impl(gpu, layer, frame, source, holes, None)
 }
 
@@ -161,7 +794,7 @@ pub(crate) fn present_owned(
     source: &GpuImage,
     holes: &[(usize, Region)],
     owner: usize,
-) -> Result<bool, String> {
+) -> Result<Option<bool>, String> {
     present_impl(gpu, layer, frame, source, holes, Some(owner))
 }
 
@@ -172,61 +805,327 @@ fn present_impl(
     source: &GpuImage,
     holes: &[(usize, Region)],
     owner: Option<usize>,
-) -> Result<bool, String> {
+) -> Result<Option<bool>, String> {
     let mut owner = SourceOwner(owner);
+    if gpu.lost.load(Ordering::Acquire) {
+        finish_source(owner.take());
+        return Ok(Some(true));
+    }
     if gpu.swapchain_api().is_none() || crate::vulkan::surface_api().is_none() {
-        return Ok(false);
+        return Ok(Some(false));
     }
     let window = frame.window as usize;
+    // Missing main-thread metadata is transient, not a permanently refused
+    // surface. Defer the drawable or backing store until AppKit publishes it.
+    if sdl3::video::presentation_window(frame.window).is_none() {
+        return Ok(None);
+    }
     if REFUSED
         .lock()
         .expect("refused windows")
         .as_ref()
         .is_some_and(|refused| refused.contains_key(&window))
     {
-        return Ok(false);
+        // A failed SDL Vulkan conversion may only fall back while SDL has
+        // not converted the window to Vulkan. Otherwise SDL_GetWindowSurface
+        // is invalid even when there is no longer a live VkSurface.
+        let converted = sdl3::video::vulkan::owns_window(frame.window);
+        if converted {
+            finish_source(owner.take());
+        }
+        return Ok(Some(converted));
     }
-    let mut guard = SWAPCHAINS.lock().expect("window swapchains");
-    let all = guard.get_or_insert_with(HashMap::new);
-    let extent = vk::Extent2D {
-        width: frame.window_width.max(1),
-        height: frame.window_height.max(1),
+    let window_swapchain = {
+        // This mutex covers only map operations. Never run Vulkan or SDL
+        // initialization while holding it. In particular AppKit may not wait
+        // for another window's VkSurface or swapchain creation.
+        let guard = match SWAPCHAINS.try_lock() {
+            Ok(guard) => guard,
+            Err(_) => return Ok(None),
+        };
+        guard.as_ref().and_then(|all| all.get(&window)).cloned()
     };
-
-    if let std::collections::hash_map::Entry::Vacant(slot) = all.entry(window) {
-        match Swapchain::create(gpu, frame.window, extent) {
-            Ok(swapchain) => {
-                gpu::milestone("window swapchain");
-                // Without the pass the surface ignores alpha, and the
-                // chrome's corners would show black where they are cut.
-                if swapchain.corners.is_none() {
-                    appkit::decor::presented_opaque(frame.window);
-                }
-                slot.insert(swapchain);
-            }
-            Err(reason) => {
-                gpu::trace(format!(
-                    "no swapchain for this window, presenting through a readback: {reason}"
-                ));
+    let Some(window_swapchain) = window_swapchain else {
+        if !retry_ready(window) {
+            return Ok(None);
+        }
+        let instance = crate::vulkan::instance_handle().ok_or("Vulkan instance unavailable")?;
+        // The OpenGL flag was captured on SDL's owner thread. Creating a
+        // Vulkan surface would irreversibly replace OpenGL on Wayland.
+        if sdl3::video::presentation_window(frame.window)
+            .is_some_and(|w| w.flags & sdl3::video::flags::OPENGL != 0)
+        {
+            REFUSED
+                .lock()
+                .expect("refused windows")
+                .get_or_insert_with(HashMap::new)
+                .insert(window, ());
+            return Ok(Some(false));
+        }
+        let (surface, init_token) = match sdl3::video::vulkan::acquire_prepared_surface(
+            frame.window,
+            instance,
+            crate::vulkan::library(),
+        ) {
+            sdl3::video::vulkan::PreparedSurface::Pending => return Ok(None),
+            sdl3::video::vulkan::PreparedSurface::Retired => return Ok(None),
+            sdl3::video::vulkan::PreparedSurface::Abandoned => {
+                // A terminated initializer cannot be retried. SDL converted
+                // windows cannot legally use its CPU surface fallback.
+                let converted = sdl3::video::vulkan::owns_window(frame.window);
                 REFUSED
                     .lock()
                     .expect("refused windows")
                     .get_or_insert_with(HashMap::new)
                     .insert(window, ());
-                return Ok(false);
+                if converted {
+                    finish_source(owner.take());
+                }
+                return Ok(Some(converted));
             }
+            sdl3::video::vulkan::PreparedSurface::Failed(failure) => {
+                let converted = sdl3::video::vulkan::owns_window(frame.window);
+                if !converted
+                    && !failure.transient
+                    && (permanent_sdl_surface_failure(&failure) || !schedule_retry(window, true))
+                {
+                    gpu::trace(format!(
+                        "SDL Vulkan window permanently refused; using CPU fallback: {}",
+                        failure.reason
+                    ));
+                    sdl3::video::vulkan::refuse_failed_surface(frame.window, instance);
+                    REFUSED
+                        .lock()
+                        .expect("refused windows")
+                        .get_or_insert_with(HashMap::new)
+                        .insert(window, ());
+                    return Ok(Some(false));
+                }
+                if converted || failure.transient {
+                    schedule_retry(window, false);
+                }
+                let _ = sdl3::video::vulkan::retry_surface(
+                    frame.window,
+                    instance,
+                    crate::vulkan::library(),
+                );
+                return Ok(None);
+            }
+            sdl3::video::vulkan::PreparedSurface::Ready(surface, token) => (surface, token),
+        };
+        // The real VkSurface is now owned by this initializer. Do not call
+        // SDL while building its Vulkan swapchain or holding the shared map.
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let accepted = {
+            let mut pending = INITIALIZING.lock().expect("initializers");
+            let all = pending.get_or_insert_with(HashMap::new);
+            if all.contains_key(&window) {
+                false
+            } else {
+                all.insert(window, Arc::clone(&cancelled));
+                true
+            }
+        };
+        if !accepted {
+            // A concurrent initializer already owns this window. A prepared
+            // handle obtained during the race still needs to be retired.
+            sdl3::video::vulkan::destroy_surface(instance, surface);
+            return Ok(None);
         }
+        let extent = vk::Extent2D {
+            width: frame.window_width.max(1),
+            height: frame.window_height.max(1),
+        };
+        let cancellation = Arc::clone(&cancelled);
+        let spawned = std::thread::Builder::new()
+            .name("metal:swapchain-init".into())
+            .spawn(move || {
+                let cancelled = cancellation;
+                let registration = InitializerRegistration {
+                    window,
+                    token: Arc::clone(&cancelled),
+                };
+                let _init_token = init_token;
+                #[cfg(test)]
+                if TEST_SLOW_INITIALIZER.load(Ordering::Acquire) == window {
+                    TEST_SLOW_INITIALIZER_STARTED.store(true, Ordering::Release);
+                    std::thread::sleep(Duration::from_millis(600));
+                }
+                if cancelled.load(Ordering::Acquire) {
+                    sdl3::video::vulkan::destroy_surface(instance, surface);
+                    return;
+                }
+                if gpu.lost.load(Ordering::Acquire) {
+                    // SDL already converted this window to Vulkan. Mark its
+                    // taken surface terminal, so the backing-store preflight
+                    // will no longer mistake it for an active initializer.
+                    sdl3::video::vulkan::abandon_surface(window as sdl3::Window, instance);
+                    sdl3::video::vulkan::destroy_surface(instance, surface);
+                    return;
+                }
+                let result =
+                    Swapchain::create(gpu, window as sdl3::Window, extent, surface, instance);
+                let pending = INITIALIZING.lock().expect("initializers");
+                // A destroyed window may have been recreated at the same
+                // pointer. Only the exact initializer may publish its result.
+                let current = pending
+                    .as_ref()
+                    .and_then(|all| all.get(&window))
+                    .is_some_and(|existing| Arc::ptr_eq(existing, &cancelled));
+                if !current || cancelled.load(Ordering::Acquire) {
+                    return;
+                }
+                let device_lost_on_init = result
+                    .as_ref()
+                    .err()
+                    .is_some_and(|reason| reason.contains("ERROR_DEVICE_LOST"));
+                let mut registry = SWAPCHAINS.lock().expect("window swapchains");
+                match result {
+                    Ok(mut swapchain) => {
+                        reset_retry(window);
+                        gpu::milestone("window swapchain");
+                        if swapchain.corners.is_none() {
+                            appkit::decor::presented_opaque(window as sdl3::Window);
+                        }
+                        let rate = sdl3::video::cached_window_refresh_rate(window as sdl3::Window)
+                            .unwrap_or(60.0)
+                            .max(30.0);
+                        swapchain.fifo_batch_delay =
+                            Duration::from_secs_f32((0.65 / rate).min(0.004));
+                        registry.get_or_insert_with(HashMap::new).insert(
+                            window,
+                            Arc::new(WindowSwapchain {
+                                gpu,
+                                presenting: Mutex::new(()),
+                                state: Mutex::new(swapchain),
+                                wake: Condvar::new(),
+                                alive: AtomicBool::new(true),
+                                worker_started: AtomicBool::new(false),
+                                worker: Mutex::new(None),
+                                resize_worker_started: AtomicBool::new(false),
+                                resize_worker: Mutex::new(None),
+                                fifo_failure: std::sync::atomic::AtomicU8::new(0),
+                                #[cfg(test)]
+                                injected_acquire_error: Mutex::new(None),
+                                #[cfg(test)]
+                                injected_nonfifo_acquire_error: Mutex::new(None),
+                            }),
+                        );
+                    }
+                    Err(reason) => {
+                        gpu::trace(format!("window swapchain initialization failed: {reason}"));
+                        if device_lost_on_init {
+                            // Propagate after releasing the global registry:
+                            // record_device_loss also needs that mutex.
+                        } else if permanent_init_failure(&reason) {
+                            REFUSED
+                                .lock()
+                                .expect("refused windows")
+                                .get_or_insert_with(HashMap::new)
+                                .insert(window, ());
+                        } else {
+                            schedule_retry(window, false);
+                            // SDL is still responsible for its window's
+                            // surface on the video thread, even after many
+                            // temporary initialization failures.
+                            let _ = sdl3::video::vulkan::retry_surface(
+                                window as sdl3::Window,
+                                instance,
+                                crate::vulkan::library(),
+                            );
+                        }
+                    }
+                }
+                drop(registry);
+                if device_lost_on_init {
+                    // The failed Swapchain::create already released its
+                    // VkSurface. Mark SDL's transferred request terminal
+                    // before dropping our initializer generation and
+                    // reporting the lost device. The pending mutex still
+                    // protects this exact generation against window reuse.
+                    sdl3::video::vulkan::abandon_surface(window as sdl3::Window, instance);
+                }
+                drop(pending);
+                // Clear before notifying the device-loss path, not merely
+                // when the initializer's closure eventually returns.
+                drop(registration);
+                if device_lost_on_init {
+                    record_device_loss(gpu);
+                }
+            });
+        if let Err(error) = spawned {
+            cancelled.store(true, Ordering::Release);
+            let mut pending = INITIALIZING.lock().expect("initializers");
+            if let Some(all) = pending.as_mut() {
+                if all
+                    .get(&window)
+                    .is_some_and(|job| Arc::ptr_eq(job, &cancelled))
+                {
+                    all.remove(&window);
+                }
+            }
+            drop(pending);
+            // The closure never executed, so no guard took this VkSurface.
+            sdl3::video::vulkan::destroy_surface(instance, surface);
+            sdl3::video::vulkan::abandon_surface(frame.window, instance);
+            return Err(format!("cannot start swapchain initializer: {error}"));
+        }
+        return Ok(None);
+    };
+    // Presentations must reserve frame slots in order, but waiting for an
+    // image must not hold the state lock: nextDrawable uses that time to
+    // retire completed drawables and release their ring slots.
+    let presenting = match window_swapchain.presenting.try_lock() {
+        Ok(guard) => guard,
+        Err(TryLockError::WouldBlock) => return Ok(None),
+        Err(TryLockError::Poisoned(error)) => error.into_inner(),
+    };
+    let presenting = PresentingGuard {
+        held: Some(presenting),
+        gpu: window_swapchain.gpu,
+    };
+    // The SDL window can be torn down after we cloned the entry, before
+    // acquiring its per-window lock. Do not touch its retired surface.
+    if !window_swapchain.alive.load(Ordering::Acquire) {
+        drop(presenting);
+        // The caller already transferred this drawable to Submitted. A
+        // plain ARC release cannot return its slot to the drawable ring.
+        finish_source(owner.take());
+        return Ok(Some(true));
     }
-    let swapchain = all.get_mut(&window).expect("just created");
+    match window_swapchain.fifo_failure.load(Ordering::Acquire) {
+        1 => {
+            // SDL_GetWindowSurface is incompatible with a window converted to
+            // Vulkan. A lost surface stays unavailable until window teardown;
+            // do not incorrectly switch that same window to SDL readback.
+            drop(presenting);
+            finish_source(owner.take());
+            return Ok(Some(true));
+        }
+        2 => {
+            drop(presenting);
+            finish_source(owner.take());
+            return Ok(Some(true));
+        }
+        _ => {}
+    }
+    let mut swapchain = window_swapchain.state.lock().expect("window swapchain");
+    let extent = vk::Extent2D {
+        width: frame.window_width.max(1),
+        height: frame.window_height.max(1),
+    };
+    // Defer all potentially unbounded VkQueueWaitIdle/vkWaitForFences calls
+    // to the window-local worker, including a previously retired swapchain.
+    // No new layer is registered before recreation completes.
+    if swapchain.pending_rebuild.is_some() || swapchain.retired || swapchain.requested != extent {
+        swapchain.pending_rebuild = Some(extent);
+        ensure_resize_worker(window, &window_swapchain);
+        wake_resize_worker(&window_swapchain);
+        return Ok(None);
+    }
     let joined = !swapchain.layers.contains(&layer);
     if joined {
         swapchain.layers.push(layer);
-    }
-    // The window resized, or the presentation engine said the last image no
-    // longer matches it. Either way every image in flight is finished with
-    // before the old swapchain goes.
-    if swapchain.requested != extent {
-        swapchain.rebuild(extent)?;
     }
     // Only a layer that has presented here has anything of its own to keep:
     // over any other hole the source is still what the window shows.
@@ -247,8 +1146,151 @@ fn present_impl(
             &holes,
         )),
     };
-    let presented = swapchain.present(frame, source, regions.as_deref(), owner.take());
-    drop(guard);
+    // Core Animation combines independently rendered layers into one
+    // window frame. FIFO cannot queue every layer separately: each queued
+    // image consumes an entire vblank. Keep the updates in a GPU accumulator
+    // and let the FIFO presentation worker display the latest composite.
+    if is_fifo_mode(swapchain.present_mode) {
+        // The main event pump refreshes this snapshot when the display or its
+        // mode changes. Never call main-thread-only SDL APIs from Metal.
+        let rate = sdl3::video::cached_window_refresh_rate(frame.window)
+            .unwrap_or(60.0)
+            .max(30.0);
+        swapchain.fifo_batch_delay = Duration::from_secs_f32((0.65 / rate).min(0.004));
+        #[cfg(not(test))]
+        ensure_fifo_presentation_worker(window, &window_swapchain);
+        swapchain.fifo_shape = Some(corners::Shape::of(
+            frame.window,
+            swapchain.extent.width,
+            swapchain.extent.height,
+        ));
+        // Keep the submitted drawable's additional retained reference until
+        // staging actually transfers it to a GPU fence. Error paths must not
+        // release the ring slot before the dispatcher decides to retry.
+        let staged = swapchain.stage_fifo(frame, source, regions.as_deref(), &mut owner, true);
+        let typed_device_loss =
+            swapchain.last_wsi_error.take() == Some(vk::Result::ERROR_DEVICE_LOST);
+        let refresh_store = fifo_first_stage_needs_store(joined, &staged, layer, window);
+        if matches!(staged, Ok(Some(true))) {
+            wake_fifo_worker(&window_swapchain);
+        } else if joined {
+            swapchain.layers.retain(|&known| known != layer);
+        }
+        drop(swapchain);
+        drop(presenting);
+        if refresh_store {
+            // A deferred or failed first frame has not changed the Vulkan
+            // accumulator; it must not dirty the AppKit CPU backing store.
+            appkit::backing::present_again(frame.window);
+        }
+        return match staged {
+            Ok(staged) => Ok(staged),
+            Err(reason) if sdl3::video::vulkan::owns_window(frame.window) => {
+                gpu::trace(format!("converted FIFO staging failed: {reason}"));
+                if typed_device_loss || terminal_fifo_staging_failure(&reason) {
+                    if typed_device_loss || reason.contains("ERROR_DEVICE_LOST") {
+                        record_device_loss(gpu);
+                    } else {
+                        window_swapchain.fifo_failure.store(2, Ordering::Release);
+                        wake_fifo_worker(&window_swapchain);
+                    }
+                    finish_source(owner.take());
+                    Ok(Some(true))
+                } else {
+                    // The presentation queue still owns its original ARC
+                    // reference and can retry when the frame slot recovers.
+                    Ok(None)
+                }
+            }
+            Err(reason) => Err(reason),
+        };
+    }
+    let prepared = swapchain.prepare_present(frame, regions.as_deref(), true);
+    if joined && !matches!(prepared, Ok(Some(_))) {
+        swapchain.layers.retain(|&known| known != layer);
+    }
+    drop(swapchain);
+    let Some((prepared, request)) = prepared? else {
+        return Ok(None);
+    };
+    #[cfg(test)]
+    let injected = window_swapchain
+        .injected_nonfifo_acquire_error
+        .lock()
+        .expect("non-FIFO injection")
+        .take();
+    #[cfg(not(test))]
+    let injected: Option<vk::Result> = None;
+    let acquired = match injected {
+        // Real vkAcquireNextImageKHR out-of-date is normalized to Ok(None).
+        // Fault injection must use the same recovery path.
+        Some(vk::Result::ERROR_OUT_OF_DATE_KHR) => Ok(None),
+        Some(error) => Err(error),
+        None => crate::stats::timed(crate::stats::Counter::PresentAcquireMicros, || {
+            acquire_image(gpu, request, true)
+        }),
+    };
+    if matches!(acquired, Err(vk::Result::TIMEOUT | vk::Result::NOT_READY)) {
+        // The acquire semaphore was never signaled. Do not block AppKit on a
+        // window whose presentation engine has no image ready.
+        if joined {
+            window_swapchain
+                .state
+                .lock()
+                .expect("window swapchain")
+                .layers
+                .retain(|&known| known != layer);
+        }
+        return Ok(None);
+    }
+    let mut swapchain = window_swapchain.state.lock().expect("window swapchain");
+    let owned_drawable = owner.0.is_some();
+    let frame_before = swapchain.frame;
+    let presented = swapchain.finish_present(
+        frame,
+        PresentSource::from(source),
+        regions.as_deref(),
+        owner.take(),
+        prepared,
+        acquired,
+        true,
+    );
+    // A compositor can invalidate WSI without changing requested geometry.
+    // Never let either acquired-image or queue-present recovery rebuild on
+    // AppKit's nonblocking backing-store path.
+    if swapchain.pending_rebuild.is_some() {
+        let retry_owned = std::mem::take(&mut swapchain.deferred_owned);
+        if joined && swapchain.frame == frame_before {
+            // No frame from this newly joined layer was staged.
+            swapchain.layers.retain(|&known| known != layer);
+        }
+        ensure_resize_worker(window, &window_swapchain);
+        wake_resize_worker(&window_swapchain);
+        drop(swapchain);
+        drop(presenting);
+        return Ok(if retry_owned {
+            None
+        } else if owned_drawable {
+            Some(true)
+        } else {
+            None
+        });
+    }
+    if swapchain.acquired_unsubmitted.is_some() {
+        // Consuming an unsubmitted WSI acquisition and retiring its image can
+        // block on the GPU. Leave that to the resize worker too.
+        swapchain.pending_rebuild = Some(swapchain.requested);
+        ensure_resize_worker(window, &window_swapchain);
+        wake_resize_worker(&window_swapchain);
+        drop(swapchain);
+        drop(presenting);
+        return Ok(if owned_drawable { Some(true) } else { None });
+    }
+    drop(swapchain);
+    drop(presenting);
+    if let Ok(Some(error)) = &presented {
+        handle_terminal_error(gpu, &window_swapchain, *error);
+    }
     // A layer's first frame starts the window's accumulator, which holds
     // nothing of the window's store yet: the store may have gone straight to
     // the screen before there was a layer to leave room for. Have it
@@ -256,7 +1298,466 @@ fn present_impl(
     if joined && layer != window {
         appkit::backing::present_again(frame.window);
     }
-    presented
+    // Once a Vulkan swapchain exists, SDL readback is not a legal fallback.
+    // A successful submission may still hold the Metal drawable even if a
+    // later WSI operation or swapchain rebuild failed. Never send that same
+    // drawable to the CPU path and complete its ring slot a second time.
+    match presented {
+        Ok(_) => Ok(Some(true)),
+        Err(reason) if sdl3::video::vulkan::owns_window(frame.window) => {
+            gpu::trace(format!("converted window presentation deferred: {reason}"));
+            Ok(if owned_drawable { Some(true) } else { None })
+        }
+        Err(reason) => Err(reason),
+    }
+}
+
+/// Some Gamescope WSI versions omit a present-fence signal when
+/// vkQueuePresentKHR fails. Only trust the fence after a successful result
+/// in that opt-in WSI path. Other drivers still enqueue ordinary OUT_OF_DATE
+/// and SURFACE_LOST operations; device loss and OOM cannot be assumed queued.
+/// Mirrors DXVK Presenter::presentImage's fence-result classification.
+fn present_fence_will_signal(result: &Result<bool, vk::Result>, gamescope_wsi: bool) -> bool {
+    if gamescope_wsi {
+        return result.is_ok();
+    }
+    !matches!(
+        result,
+        Err(vk::Result::ERROR_DEVICE_LOST
+            | vk::Result::ERROR_OUT_OF_HOST_MEMORY
+            | vk::Result::ERROR_OUT_OF_DEVICE_MEMORY)
+    )
+}
+
+/// Both vblank-queued modes need layer coalescing. MAILBOX/IMMEDIATE do not.
+fn is_fifo_mode(mode: vk::PresentModeKHR) -> bool {
+    matches!(
+        mode,
+        vk::PresentModeKHR::FIFO | vk::PresentModeKHR::FIFO_RELAXED
+    )
+}
+
+fn frame_slots(mode: vk::PresentModeKHR) -> usize {
+    if is_fifo_mode(mode) {
+        FRAMES_IN_FLIGHT
+    } else {
+        2
+    }
+}
+
+/// One sleeping presenter per window prevents a blocked/occluded window from
+/// stalling unrelated windows. It is started lazily, also after a rebuild
+/// changes a window's presentation mode to FIFO.
+fn ensure_fifo_presentation_worker(window: usize, entry: &Arc<WindowSwapchain>) {
+    if entry.worker_started.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let worker_entry = Arc::clone(entry);
+    let handle = std::thread::Builder::new()
+        .name("rosemary-fifo-present".into())
+        .spawn(move || fifo_presentation_worker(window, worker_entry))
+        .expect("FIFO presenter thread");
+    // Started under the window presentation mutex, so forget_window cannot
+    // run between launching the worker and recording its join handle.
+    *entry.worker.lock().expect("FIFO worker") = Some(handle);
+}
+
+fn fifo_presentation_worker(window: usize, entry: Arc<WindowSwapchain>) {
+    let mut prepare_failures = 0u32;
+    let mut acquire_timeouts = 0u32;
+    loop {
+        // Wait without polling when clean. The writer sets fifo_dirty under
+        // the same mutex before signaling us, so notifications are not lost.
+        let mut state = entry.state.lock().expect("window swapchain");
+        while !state.fifo_dirty
+            && entry.alive.load(Ordering::Acquire)
+            && !entry.gpu.lost.load(Ordering::Acquire)
+            && entry.fifo_failure.load(Ordering::Acquire) == 0
+        {
+            // The idle worker must not retain a window or device after
+            // terminal loss. Unlike Condvar notification, unpark's token is
+            // retained when a loss races the transition to sleep.
+            #[cfg(test)]
+            TEST_FIFO_IDLE_PARKED.store(window, Ordering::Release);
+            drop(state);
+            std::thread::park();
+            #[cfg(test)]
+            TEST_FIFO_IDLE_PARKED.store(0, Ordering::Release);
+            state = entry.state.lock().expect("window swapchain");
+        }
+        if !entry.alive.load(Ordering::Acquire)
+            || entry.gpu.lost.load(Ordering::Acquire)
+            || entry.fifo_failure.load(Ordering::Acquire) != 0
+        {
+            return;
+        }
+        if let Some(remaining) = state
+            .fifo_dirty_since
+            .and_then(|since| state.fifo_batch_delay.checked_sub(since.elapsed()))
+        {
+            let _wait = entry
+                .wake
+                .wait_timeout(state, remaining)
+                .expect("FIFO batch wait");
+            continue;
+        }
+        drop(state);
+
+        let _presenting = PresentingGuard {
+            held: Some(entry.presenting.lock().expect("window presentation")),
+            gpu: entry.gpu,
+        };
+        if !entry.alive.load(Ordering::Acquire) || entry.gpu.lost.load(Ordering::Acquire) {
+            return;
+        }
+        let mut state = entry.state.lock().expect("window swapchain");
+        // A resize may have reset the accumulator while we acquired the
+        // presentation lock. Do not try to submit a retired image.
+        if !is_fifo_mode(state.present_mode) || !state.fifo_dirty {
+            continue;
+        }
+        let prepared = state.prepare_fifo(window as sdl3::Window);
+        let typed_device_loss = state.last_wsi_error.take() == Some(vk::Result::ERROR_DEVICE_LOST);
+        let gpu = state.gpu;
+        drop(state);
+        let prepared = match prepared {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                if typed_device_loss || error.contains("ERROR_DEVICE_LOST") {
+                    drop(_presenting);
+                    record_device_loss(gpu);
+                    return;
+                }
+                if recoverable_fifo_rebuild_failure(&error) {
+                    prepare_failures = 0;
+                    drop(_presenting);
+                    std::thread::sleep(Duration::from_millis(80));
+                    continue;
+                }
+                prepare_failures += 1;
+                if prepare_failures >= 3 {
+                    gpu::trace(format!(
+                        "FIFO disabled after persistent preparation failures: {error}"
+                    ));
+                    entry.fifo_failure.store(2, Ordering::Release);
+                    return;
+                }
+                drop(_presenting);
+                std::thread::sleep(Duration::from_millis(10));
+                continue;
+            }
+        };
+        #[cfg(test)]
+        let injected = entry
+            .injected_acquire_error
+            .lock()
+            .expect("WSI injection")
+            .take();
+        #[cfg(not(test))]
+        let injected: Option<vk::Result> = None;
+        let acquired = match injected {
+            Some(error) => FifoAcquire::Terminal(error),
+            None => crate::stats::timed(crate::stats::Counter::PresentAcquireMicros, || {
+                acquire_fifo_image(gpu, prepared.request, acquire_timeouts == 0)
+            }),
+        };
+        if matches!(acquired, FifoAcquire::TimedOut) {
+            // Retain the dirty accumulator. Only this window waits; another
+            // window's presenter is completely independent. Wait with the
+            // presentation lock released: a minimized or occluded window can
+            // time out indefinitely, and every producer needs that lock.
+            acquire_timeouts = acquire_timeouts.saturating_add(1);
+            drop(_presenting);
+            std::thread::sleep(fifo_acquire_backoff(acquire_timeouts));
+            continue;
+        }
+        acquire_timeouts = 0;
+        let ready = match acquired {
+            FifoAcquire::Ready(frame) => frame,
+            FifoAcquire::TimedOut => unreachable!(),
+            FifoAcquire::Terminal(error) => {
+                gpu::trace(format!(
+                    "FIFO disabled after terminal WSI acquire error: {error:?}"
+                ));
+                drop(_presenting);
+                handle_terminal_error(gpu, &entry, error);
+                return;
+            }
+        };
+        let mut state = entry.state.lock().expect("window swapchain");
+        let old_swapchain = state.handle;
+        match state.complete_fifo(prepared, Ok(ready)) {
+            Ok(None) => {
+                prepare_failures = 0;
+                if state.handle != old_swapchain {
+                    // Recovery lost the accumulator. Request a new store
+                    // upload outside the WSI and AppKit store mutexes.
+                    drop(state);
+                    drop(_presenting);
+                    appkit::backing::present_again(window as sdl3::Window);
+                    continue;
+                }
+            }
+            Ok(Some(error)) => {
+                gpu::trace(format!(
+                    "FIFO disabled after terminal queue presentation error: {error:?}"
+                ));
+                drop(state);
+                drop(_presenting);
+                handle_terminal_error(gpu, &entry, error);
+                return;
+            }
+            Err(error) => {
+                let typed_device_loss =
+                    state.last_wsi_error.take() == Some(vk::Result::ERROR_DEVICE_LOST);
+                if typed_device_loss || error.contains("ERROR_DEVICE_LOST") {
+                    drop(state);
+                    drop(_presenting);
+                    record_device_loss(gpu);
+                    return;
+                }
+                if recoverable_fifo_rebuild_failure(&error) {
+                    prepare_failures = 0;
+                    drop(state);
+                    drop(_presenting);
+                    std::thread::sleep(Duration::from_millis(80));
+                    continue;
+                }
+                prepare_failures += 1;
+                if prepare_failures >= 3 {
+                    gpu::trace(format!(
+                        "FIFO disabled after persistent presentation failures: {error}"
+                    ));
+                    entry.fifo_failure.store(2, Ordering::Release);
+                    return;
+                }
+                gpu::trace(format!("FIFO composite presentation failed: {error}"));
+                drop(state);
+                drop(_presenting);
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+    }
+}
+
+impl Swapchain {
+    /// Copy a guest layer into the window accumulator without making the
+    /// compositor display an intermediate image. The regular Metal drawable
+    /// ownership/fence lifetime still applies to this submission.
+    fn stage_fifo(
+        &mut self,
+        frame: &appkit::view::Frame,
+        source: &GpuImage,
+        regions: Option<&[Region]>,
+        owner: &mut SourceOwner,
+        nonblocking: bool,
+    ) -> Result<Option<bool>, String> {
+        #[cfg(test)]
+        if let Some(error) = self.injected_stage_vk_error.take() {
+            self.last_wsi_error = Some(error);
+            return Err(format!("injected FIFO staging failure: {error:?}"));
+        }
+        let slot = self.frame % self.frames.len().max(1);
+        let this = &self.frames[slot];
+        let (command_buffer, done) = (this.command_buffer, this.done);
+        // vkQueueSubmit may fail after resetting the fence, without queueing
+        // any work to signal it. Only wait for slots actually submitted.
+        // AppKit must not wait for a GPU frame held by another operation.
+        if this.submitted {
+            if nonblocking {
+                // SAFETY: the fence belongs to a submitted frame on this GPU.
+                if !self.gpu.fence_signaled(done)? {
+                    return Ok(None);
+                }
+            } else {
+                self.gpu.wait(done)?;
+            }
+        }
+        self.frames[slot].submitted = false;
+        finish_source(self.frames[slot].source.take());
+        let composite = self.composite()?;
+
+        let device = &self.gpu.device;
+        let begin = vk::CommandBufferBeginInfo::default()
+            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+        // SAFETY: this command buffer's fence has completed, and all images
+        // remain in GENERAL for copies between guest layers.
+        unsafe {
+            device
+                .reset_command_buffer(command_buffer, vk::CommandBufferResetFlags::empty())
+                .map_err(|e| format!("vkResetCommandBuffer failed: {e:?}"))?;
+            device
+                .begin_command_buffer(command_buffer, &begin)
+                .map_err(|e| format!("vkBeginCommandBuffer failed: {e:?}"))?;
+            prepare_source(device, command_buffer, source.image);
+            // A previous window presentation may still be reading the
+            // accumulator (transfer or corners compute), even when its layer
+            // writes have finished. Order those reads before a new write.
+            let image_barrier = vk::ImageMemoryBarrier::default()
+                .old_layout(vk::ImageLayout::GENERAL)
+                .new_layout(vk::ImageLayout::GENERAL)
+                .src_access_mask(
+                    vk::AccessFlags::TRANSFER_READ
+                        | vk::AccessFlags::TRANSFER_WRITE
+                        | vk::AccessFlags::SHADER_READ,
+                )
+                .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(composite)
+                .subresource_range(vk::ImageSubresourceRange {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    base_mip_level: 0,
+                    level_count: 1,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                });
+            device.cmd_pipeline_barrier(
+                command_buffer,
+                vk::PipelineStageFlags::TRANSFER | vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[image_barrier],
+            );
+            match regions {
+                Some(regions) => {
+                    for region in regions {
+                        let part = appkit::view::Frame {
+                            x: region.x,
+                            y: region.y,
+                            width: region.width.max(0) as u32,
+                            height: region.height.max(0) as u32,
+                            ..*frame
+                        };
+                        if let Some(into) = clamp(&part, self.extent) {
+                            blit(
+                                device,
+                                command_buffer,
+                                source.image,
+                                source_of(into, frame, (source.width, source.height)),
+                                composite,
+                                vk::ImageLayout::GENERAL,
+                                into,
+                            );
+                        }
+                    }
+                }
+                None => {
+                    if let Some(into) = clamp(frame, self.extent) {
+                        blit(
+                            device,
+                            command_buffer,
+                            source.image,
+                            source_of(into, frame, (source.width, source.height)),
+                            composite,
+                            vk::ImageLayout::GENERAL,
+                            into,
+                        );
+                    }
+                }
+            }
+            device
+                .end_command_buffer(command_buffer)
+                .map_err(|e| format!("vkEndCommandBuffer failed: {e:?}"))?;
+        }
+        // The Vulkan queue orders this composite update after the guest's
+        // Metal command buffer and before a later WSI copy. No WSI semaphore
+        // is required: the composite is an ordinary device-owned image.
+        self.gpu
+            .submit_synchronized(command_buffer, done, &[], &[])?;
+        self.frames[slot].submitted = true;
+        self.frames[slot].source = owner.take();
+        self.frame = self.frame.wrapping_add(1);
+        if !self.fifo_dirty {
+            self.fifo_dirty_since = Some(Instant::now());
+        }
+        self.fifo_dirty = true;
+        Ok(Some(true))
+    }
+
+    /// Present the *whole* accumulator once, instead of putting one FIFO
+    /// entry into the scanout queue for every CAMetalLayer in the window.
+    fn prepare_fifo(&mut self, window: sdl3::Window) -> Result<PreparedFifo, String> {
+        if self.retired {
+            self.rebuild(self.requested)?;
+        }
+        let source = PresentSource::from(self.composite.as_ref().expect("FIFO accumulator"));
+        let frame = appkit::view::Frame {
+            window,
+            x: 0,
+            y: 0,
+            width: self.extent.width,
+            height: self.extent.height,
+            window_width: self.requested.width,
+            window_height: self.requested.height,
+        };
+        // The accumulator already includes all layers; this blits the
+        // composite once into the WSI image, with the corner mask applied.
+        let (prepared, request) = self
+            .prepare_present(&frame, Some(&[]), false)?
+            .ok_or("FIFO worker failed to reserve present frame")?;
+        Ok(PreparedFifo {
+            frame,
+            source,
+            prepared,
+            request,
+        })
+    }
+
+    fn complete_fifo(
+        &mut self,
+        ready: PreparedFifo,
+        acquired: Result<Option<(u32, bool)>, vk::Result>,
+    ) -> Result<Option<vk::Result>, String> {
+        let before = self.handle;
+        let result = self.finish_present(
+            &ready.frame,
+            ready.source,
+            Some(&[]),
+            None,
+            ready.prepared,
+            acquired,
+            false,
+        );
+        if self.acquired_unsubmitted.is_some() {
+            // A failed WSI copy must consume the acquisition semaphore and
+            // retire the acquired image before another FIFO acquisition.
+            if let Err(error) = &result {
+                gpu::trace(format!("FIFO submission dropped after acquire: {error}"));
+            }
+            if let Err(error) = self.recover_unsubmitted_acquire() {
+                // Never retry with unresolved WSI synchronization.
+                gpu::trace(format!("FIFO acquire recovery failed: {error}"));
+                return Ok(Some(vk::Result::ERROR_UNKNOWN));
+            }
+            return Ok(None);
+        }
+        let failed = result?;
+        // An out-of-date rebuild retained the previous FIFO snapshot.
+        // Clear dirty only when that snapshot reached the new swapchain.
+        if failed.is_none() && self.handle == before {
+            self.fifo_dirty = false;
+            self.fifo_dirty_since = None;
+        }
+        Ok(failed)
+    }
+
+    /// Deterministic WSI integration-test entry point. The production worker
+    /// has a bounded acquire and does not hold the swapchain-state lock.
+    #[cfg(test)]
+    fn flush_fifo(&mut self, window: sdl3::Window) -> Result<(), String> {
+        if !self.fifo_dirty {
+            return Ok(());
+        }
+        let ready = self.prepare_fifo(window)?;
+        let acquired = acquire_image(self.gpu, ready.request, false);
+        match self.complete_fifo(ready, acquired)? {
+            None => Ok(()),
+            Some(error) => Err(format!("terminal queue presentation error: {error:?}")),
+        }
+    }
 }
 
 /// Hand back every drawable whose copy into a swapchain image has finished.
@@ -268,10 +1769,38 @@ fn present_impl(
 /// that needs a drawable to happen. Must not be called with the drawable
 /// cache locked: finishing a source takes that lock.
 pub(crate) fn retire_copied() {
-    let mut guard = SWAPCHAINS.lock().expect("window swapchains");
-    for swapchain in guard.iter_mut().flat_map(|all| all.values_mut()) {
-        swapchain.retire_copied();
+    retire_copied_in(&every_swapchain());
+}
+
+fn every_swapchain() -> Vec<Arc<WindowSwapchain>> {
+    SWAPCHAINS
+        .lock()
+        .expect("window swapchains")
+        .as_ref()
+        .map(|all| all.values().cloned().collect::<Vec<_>>())
+        .unwrap_or_default()
+}
+
+/// Whether any of `swapchains` had a drawable to hand back.
+fn retire_copied_in(swapchains: &[Arc<WindowSwapchain>]) -> bool {
+    let mut any = false;
+    for swapchain in swapchains {
+        // Retiring copied drawables is opportunistic. A presentation may be
+        // waiting for a swapchain image under this window's lock; do not make
+        // drawable acquisition wait behind it merely to check a fence.
+        let retired = match swapchain.state.try_lock() {
+            Ok(mut state) => state.retire_copied(),
+            Err(TryLockError::WouldBlock) => false,
+            Err(TryLockError::Poisoned(error)) => error.into_inner().retire_copied(),
+        };
+        if retired {
+            // Source ownership has already returned to its drawable cache.
+            // Wake consumers only after releasing the swapchain state mutex.
+            swapchain.gpu.presenter.notify_progress();
+            any = true;
+        }
     }
+    any
 }
 
 /// [`retire_copied`], waiting up to `timeout` for a copy still running when
@@ -280,41 +1809,40 @@ pub(crate) fn retire_copied() {
 /// knows to look at its ring again before waiting on anything else. Must not
 /// be called with the drawable cache locked.
 pub(crate) fn wait_copied(timeout: std::time::Duration) -> bool {
-    let mut guard = SWAPCHAINS.lock().expect("window swapchains");
-    let mut retired = false;
-    let mut copying: Option<(&'static Gpu, Vec<vk::Fence>)> = None;
-    for swapchain in guard.iter_mut().flat_map(|all| all.values_mut()) {
-        retired |= swapchain.retire_copied();
-        let fences = swapchain.copying();
+    let entries = every_swapchain();
+    // Every window first: the ring being waited on may be another window's
+    // than the first one with a copy still running.
+    if retire_copied_in(&entries) {
+        return true;
+    }
+    // Hold a single window's state while using its fences: resize and teardown
+    // can destroy them, but cannot do so while this guard is held. Never hold
+    // the global swapchain-map lock across a Vulkan wait.
+    for entry in &entries {
+        let state = match entry.state.try_lock() {
+            Ok(state) => state,
+            Err(TryLockError::WouldBlock) => continue,
+            Err(TryLockError::Poisoned(error)) => error.into_inner(),
+        };
+        let fences = state.copying();
         if fences.is_empty() {
             continue;
         }
-        let (gpu, all) = copying.get_or_insert_with(|| (swapchain.gpu, Vec::new()));
-        // One wait covers one device's fences; another device's copies are
-        // waited for by a later call.
-        if std::ptr::eq(*gpu, swapchain.gpu) {
-            all.extend(fences);
-        }
+        // SAFETY: fences of this device's, each attached to a submission,
+        // and kept alive by the state guard.
+        let waited = unsafe {
+            state
+                .gpu
+                .device
+                .wait_for_fences(&fences, false, timeout.as_nanos() as u64)
+        };
+        drop(state);
+        retire_copied_in(&entries);
+        // A wait that failed outright did not wait, and the caller must not
+        // take it as having done so or it spins on a lost device.
+        return matches!(waited, Ok(()) | Err(vk::Result::TIMEOUT));
     }
-    if retired {
-        return true;
-    }
-    let Some((gpu, fences)) = copying else {
-        return false;
-    };
-    // The lock is held across the wait, as presenting holds it across its own
-    // fence waits: a rebuild or a forgotten window destroys these fences.
-    // SAFETY: fences of this device's, each attached to a submission.
-    let waited = unsafe {
-        gpu.device
-            .wait_for_fences(&fences, false, timeout.as_nanos() as u64)
-    };
-    for swapchain in guard.iter_mut().flat_map(|all| all.values_mut()) {
-        swapchain.retire_copied();
-    }
-    // A wait that failed outright did not wait, and the caller must not take
-    // it as having done so or it spins on a lost device.
-    matches!(waited, Ok(()) | Err(vk::Result::TIMEOUT))
+    false
 }
 
 fn finish_source(source: Option<usize>) {
@@ -386,7 +1914,29 @@ impl Swapchain {
         gpu: &'static Gpu,
         window: sdl3::Window,
         extent: vk::Extent2D,
+        surface: u64,
+        instance: u64,
     ) -> Result<Self, String> {
+        // Establish VkSurface ownership before *any* validation may fail.
+        // The window metadata can be invalidated by SDL resizing the window
+        // after its surface has been prepared on the video thread.
+        let surface = gpu::Guard::new(vk::SurfaceKHR::from_raw(surface), |surface| {
+            release_created_surface(instance, surface.as_raw());
+        });
+        #[cfg(test)]
+        if TEST_FAIL_FIRST_CREATE_WINDOW
+            .compare_exchange(window as usize, 0, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            return Err("the window has no area to present into".into());
+        }
+        #[cfg(test)]
+        if TEST_FAIL_DEVICE_CREATE_WINDOW
+            .compare_exchange(window as usize, 0, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            return Err("vkCreateSwapchainKHR failed with ERROR_DEVICE_LOST".into());
+        }
         // Never an OpenGL window. SDL will convert one in place, but it
         // converts the flags and the loaded libraries and not the backend's
         // own state: on Wayland the `EGLSurface` SDL created with the window
@@ -399,23 +1949,17 @@ impl Swapchain {
         // them, exactly so that this is possible - has no `EGLSurface` and
         // is converted safely, so only a guest that has actually asked for
         // an `NSOpenGLContext` ends up here.
-        if sdl3::video::window_flags(window) & sdl3::video::flags::OPENGL != 0 {
+        let snapshot = sdl3::video::presentation_window(window)
+            .ok_or("window video properties have not been published")?;
+        if snapshot.flags & sdl3::video::flags::OPENGL != 0 {
             return Err("the window belongs to OpenGL, which cannot share it".into());
         }
-        let instance = crate::vulkan::instance_handle().ok_or("the Vulkan instance is gone")?;
-        let surface =
-            sdl3::video::vulkan::create_surface(window, instance, crate::vulkan::library())
-                .ok_or_else(|| format!("SDL_Vulkan_CreateSurface failed: {}", sdl3::error()))?;
-        let surface = vk::SurfaceKHR::from_raw(surface);
-        // Until the `Swapchain` exists there is no `Drop` to undo any of this,
-        // so each piece is guarded and the guards are taken together once the
-        // last fallible step has succeeded.
-        let surface = gpu::Guard::new(surface, |surface| {
-            sdl3::video::vulkan::destroy_surface(instance, surface.as_raw());
-        });
+        // The transferred surface is already guarded above.
         if !gpu.can_present(*surface) {
             return Err("the Vulkan queue Metal submits to cannot present to this window".into());
         }
+        // Serialize Vulkan WSI-object setup, not unrelated shader compilation.
+        let wsi = gpu.wsi.lock().expect("Vulkan WSI");
         let pool_info = vk::CommandPoolCreateInfo::default()
             .queue_family_index(gpu.queue_family)
             .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
@@ -439,6 +1983,7 @@ impl Swapchain {
             // SAFETY: objects of this device's, never submitted.
             unsafe {
                 gpu.device.destroy_semaphore(frame.acquired, None);
+                gpu.device.destroy_fence(frame.acquire_done, None);
                 gpu.device.destroy_fence(frame.done, None);
             }
         });
@@ -459,17 +2004,31 @@ impl Swapchain {
             // SAFETY: a well-formed create info on this live device.
             let done = unsafe { gpu.device.create_fence(&fence_info, None) }
                 .map_err(|error| format!("vkCreateFence failed with {error:?}"))?;
+            let done = gpu::Guard::new(done, |fence| {
+                // A failed acquisition-fence creation must not leak this fence.
+                unsafe { gpu.device.destroy_fence(fence, None) };
+            });
+            // A separate acquire fence proves the WSI signal finished
+            // even if neither the graphics nor recovery queue submit works.
+            let acquire_done = unsafe {
+                gpu.device
+                    .create_fence(&vk::FenceCreateInfo::default(), None)
+            }
+            .map_err(|error| format!("vkCreateFence failed with {error:?}"))?;
             frames.push(Frame {
                 command_buffer,
                 acquired: acquired.take(),
-                done,
+                acquire_done,
+                acquire_pending: false,
+                done: done.take(),
                 submitted: false,
                 source: None,
             });
         }
+        drop(wsi);
         // Only a window made with room for rounded corners has a surface
         // that shows alpha; see `appkit::window`.
-        let transparent = sdl3::video::window_flags(window) & sdl3::video::flags::TRANSPARENT != 0;
+        let transparent = snapshot.flags & sdl3::video::flags::TRANSPARENT != 0;
         let corners = match transparent {
             true => corners::Corners::new(gpu)
                 .inspect_err(|reason| {
@@ -487,6 +2046,8 @@ impl Swapchain {
             format: vk::Format::UNDEFINED,
             extent,
             requested: extent,
+            pending_rebuild: None,
+            retired: false,
             images: Vec::new(),
             blitted: Vec::new(),
             presented: Vec::new(),
@@ -496,6 +2057,34 @@ impl Swapchain {
             pool: pool.take(),
             frames: frames.take(),
             frame: 0,
+            present_mode: vk::PresentModeKHR::FIFO,
+            fifo_dirty: false,
+            fifo_shape: None,
+            fifo_dirty_since: None,
+            fifo_batch_delay: Duration::from_millis(4),
+            last_wsi_error: None,
+            #[cfg(test)]
+            injected_build_vk_error: None,
+            #[cfg(test)]
+            injected_stage_vk_error: None,
+            #[cfg(test)]
+            injected_queue_present_error: None,
+            #[cfg(test)]
+            injected_unsignaled_present_fence: false,
+            #[cfg(test)]
+            injected_queue_submit_error: None,
+            acquired_unsubmitted: None,
+            deferred_owned: false,
+            #[cfg(test)]
+            injected_recovery_error: None,
+            #[cfg(test)]
+            injected_build_failure: false,
+            #[cfg(test)]
+            injected_unavailable_extent: false,
+            #[cfg(test)]
+            rebuild_attempts: 0,
+            #[cfg(test)]
+            last_create_old_swapchain: vk::SwapchainKHR::null(),
         };
         // From here the `Drop` above owns everything, including whatever
         // `build` leaves behind when it fails.
@@ -509,6 +2098,14 @@ impl Swapchain {
     /// failure part-way leaves the swapchain exactly as it was, rather than a
     /// `self.handle` naming a swapchain this call has already destroyed.
     fn build(&mut self, requested: vk::Extent2D) -> Result<(), String> {
+        self.last_wsi_error = None;
+        #[cfg(test)]
+        {
+            self.rebuild_attempts += 1;
+            if self.injected_unavailable_extent {
+                return Err("the window has no area to present into".into());
+            }
+        }
         let surface_api = crate::vulkan::surface_api().ok_or("VK_KHR_surface is gone")?;
         let api = self.gpu.swapchain_api().ok_or("VK_KHR_swapchain is gone")?;
         // SAFETY: a physical device and a surface of this instance's.
@@ -546,12 +2143,17 @@ impl Swapchain {
         if extent.width == 0 || extent.height == 0 {
             return Err("the window has no area to present into".into());
         }
-        // One more than the minimum, so that the host is not blocked in
-        // `vkAcquireNextImageKHR` for as long as the engine holds one.
-        let count = match capabilities.max_image_count {
-            0 => capabilities.min_image_count + 1,
-            most => (capabilities.min_image_count + 1).min(most),
-        };
+        // DXVK requests the surface minimum for IMMEDIATE and min+1 for
+        // queued modes. Do not expand FIFO's queue to hide per-layer vblanks.
+        let count = desired_image_count(
+            present_mode,
+            capabilities.min_image_count,
+            capabilities.max_image_count,
+        );
+        gpu::trace(format!(
+            "window swapchain: present modes {present_modes:?}, selected {present_mode:?}, images min={} max={} requested={count}",
+            capabilities.min_image_count, capabilities.max_image_count
+        ));
         let info = vk::SwapchainCreateInfoKHR::default()
             .surface(self.surface)
             .min_image_count(count)
@@ -567,19 +2169,61 @@ impl Swapchain {
             .composite_alpha(alpha)
             .present_mode(present_mode)
             .clipped(true)
-            .old_swapchain(self.handle);
-        // SAFETY: a well-formed create info; the old swapchain is retired by
-        // this call and destroyed once the replacement is whole.
-        let handle = unsafe { api.create_swapchain(&info, None) }
-            .map_err(|error| format!("vkCreateSwapchainKHR failed with {error:?}"))?;
+            .old_swapchain(if self.retired {
+                vk::SwapchainKHR::null()
+            } else {
+                self.handle
+            });
+        // A prior attempt retired this handle, even if a later allocation
+        // failed. The driver may reject an unrelated new swapchain while the
+        // retired old one still occupies the native window. Rebuild called
+        // idle() first, so it is safe to destroy this old handle now.
+        if self.retired && self.handle != vk::SwapchainKHR::null() {
+            unsafe { api.destroy_swapchain(self.handle, None) };
+            self.handle = vk::SwapchainKHR::null();
+        }
+        // Supplying a live oldSwapchain retires it even on creation failure.
+        if self.handle != vk::SwapchainKHR::null() {
+            self.retired = true;
+        }
+        #[cfg(test)]
+        {
+            self.last_create_old_swapchain = info.old_swapchain;
+        }
+        let wsi = self.gpu.wsi.lock().expect("Vulkan WSI");
+        #[cfg(test)]
+        if let Some(error) = self.injected_build_vk_error.take() {
+            self.last_wsi_error = Some(error);
+            return Err(format!(
+                "injected vkCreateSwapchainKHR failed with {error:?}"
+            ));
+        }
+        let handle = unsafe { api.create_swapchain(&info, None) }.map_err(|error| {
+            self.last_wsi_error = Some(error);
+            format!("vkCreateSwapchainKHR failed with {error:?}")
+        })?;
         let handle = gpu::Guard::new(handle, |handle| {
             // SAFETY: a swapchain of this device's which was never installed,
             // so nothing has acquired an image from it.
             unsafe { api.destroy_swapchain(handle, None) };
         });
+        #[cfg(test)]
+        if std::mem::take(&mut self.injected_build_failure) {
+            return Err("injected failure after oldSwapchain retirement".into());
+        }
         // SAFETY: the swapchain was just created by this device.
-        let images = unsafe { api.get_swapchain_images(*handle) }
-            .map_err(|error| format!("vkGetSwapchainImagesKHR failed with {error:?}"))?;
+        let images = unsafe { api.get_swapchain_images(*handle) }.map_err(|error| {
+            self.last_wsi_error = Some(error);
+            format!("vkGetSwapchainImagesKHR failed with {error:?}")
+        })?;
+        if crate::stats::enabled() {
+            eprintln!(
+                "rosemary: Metal: swapchain mode={present_mode:?} images min={} max={} requested={count} actual={}",
+                capabilities.min_image_count,
+                capabilities.max_image_count,
+                images.len()
+            );
+        }
         // One semaphore per image, made before anything is installed so that a
         // failure half way through leaves neither these nor the swapchain.
         let mut blitted = gpu::GuardedVec::new(|semaphore: &vk::Semaphore| {
@@ -594,7 +2238,10 @@ impl Swapchain {
                         .device
                         .create_semaphore(&vk::SemaphoreCreateInfo::default(), None)
                 }
-                .map_err(|error| format!("vkCreateSemaphore failed with {error:?}"))?,
+                .map_err(|error| {
+                    self.last_wsi_error = Some(error);
+                    format!("vkCreateSemaphore failed with {error:?}")
+                })?,
             );
         }
         let mut presented = gpu::GuardedVec::new(|present: &PresentFence| {
@@ -610,7 +2257,10 @@ impl Swapchain {
                         .device
                         .create_fence(&vk::FenceCreateInfo::default(), None)
                 }
-                .map_err(|error| format!("vkCreateFence failed with {error:?}"))?;
+                .map_err(|error| {
+                    self.last_wsi_error = Some(error);
+                    format!("vkCreateFence failed with {error:?}")
+                })?;
                 presented.push(PresentFence {
                     fence,
                     pending: false,
@@ -618,8 +2268,39 @@ impl Swapchain {
             }
         }
 
-        // Nothing below can fail, so the replacement is installed and the old
-        // state destroyed as one step.
+        drop(wsi);
+        // A static Metal layer cannot be redrawn by the host after a
+        // resize. Preserve the FIFO GPU accumulator across the replacement.
+        let keep_fifo = is_fifo_mode(self.present_mode)
+            && is_fifo_mode(present_mode)
+            && self.composite.is_some();
+        let replace_composite = if keep_fifo {
+            let old = self.composite.as_ref().expect("existing FIFO snapshot");
+            // The corners pass keeps the composite in its own format, never
+            // the swapchain's, so compare with what would be made.
+            let description =
+                Self::composite_description(chosen.format, extent, self.corners.is_some());
+            if old.width == extent.width
+                && old.height == extent.height
+                && old.format == description.format
+            {
+                None
+            } else {
+                let replacement = self.gpu.create_image(&description)?;
+                let copied = self.gpu.one_shot(|device, command_buffer| unsafe {
+                    keep_top_left(device, command_buffer, old, &replacement);
+                });
+                if let Err(reason) = copied {
+                    self.gpu.destroy_image(replacement);
+                    return Err(reason);
+                }
+                Some(replacement)
+            }
+        } else {
+            None
+        };
+
+        // All fallible allocations and copies completed.
         let blitted = blitted.take();
         let presented = presented.take();
         let old = std::mem::replace(&mut self.handle, handle.take());
@@ -640,11 +2321,25 @@ impl Swapchain {
             unsafe { self.gpu.device.destroy_fence(present.fence, None) };
         }
         self.requested = requested;
+        self.acquired_unsubmitted = None;
+        self.retired = false;
+        self.present_mode = present_mode;
+        self.fifo_dirty = keep_fifo;
+        self.fifo_shape = None;
+        self.fifo_dirty_since = keep_fifo.then(Instant::now);
         self.format = chosen.format;
         self.extent = extent;
         self.images = images;
-        if let Some(composite) = self.composite.take() {
-            self.gpu.destroy_image(composite);
+        if !keep_fifo {
+            if let Some(composite) = self.composite.take() {
+                self.gpu.destroy_image(composite);
+            }
+        } else if let Some(replacement) = replace_composite {
+            let old = self
+                .composite
+                .replace(replacement)
+                .expect("old FIFO snapshot");
+            self.gpu.destroy_image(old);
         }
         // A surface that cannot show premultiplied alpha is presented
         // opaque, which the pass would only get wrong.
@@ -667,7 +2362,7 @@ impl Swapchain {
             }
             // SAFETY: a fence of this device's, attached to this frame's
             // last submission.
-            if unsafe { self.gpu.device.get_fence_status(frame.done) }.unwrap_or(false) {
+            if self.gpu.fence_signaled(frame.done).unwrap_or(false) {
                 finish_source(frame.source.take());
                 retired = true;
             }
@@ -685,6 +2380,30 @@ impl Swapchain {
     }
 
     /// Wait for every frame in flight and rebuild at `extent`.
+    fn recover_unsubmitted_acquire(&mut self) -> Result<(), String> {
+        let Some((semaphore, fence)) = self.acquired_unsubmitted else {
+            return Ok(());
+        };
+        #[cfg(test)]
+        if let Some(error) = self.injected_recovery_error.take() {
+            return Err(format!("injected recovery submit failure: {error:?}"));
+        }
+        self.gpu.consume_acquired_semaphore(semaphore, fence)?;
+        // A successful recovery consumed the binary semaphore, but WSI
+        // still owns its acquired image until the swapchain is retired.
+        self.acquired_unsubmitted = None;
+        self.rebuild(self.requested)
+    }
+
+    fn rebuild_or_defer(&mut self, defer: bool) -> Result<(), String> {
+        if defer {
+            self.pending_rebuild = Some(self.requested);
+            Ok(())
+        } else {
+            self.rebuild(self.requested)
+        }
+    }
+
     fn rebuild(&mut self, extent: vk::Extent2D) -> Result<(), String> {
         self.idle();
         self.build(extent)
@@ -734,25 +2453,35 @@ impl Swapchain {
     /// this crate is.
     ///
     /// With the corners pass, the composite is one the pass can read.
+    fn composite_description(
+        format: vk::Format,
+        extent: vk::Extent2D,
+        corners_enabled: bool,
+    ) -> ImageDescription {
+        if corners_enabled {
+            corners::storage(extent.width, extent.height)
+        } else {
+            ImageDescription {
+                image_type: vk::ImageType::TYPE_2D,
+                view_type: vk::ImageViewType::TYPE_2D,
+                format,
+                width: extent.width,
+                height: extent.height,
+                depth: 1,
+                levels: 1,
+                layers: 1,
+                samples: 1,
+                usage: gpu::USAGE_RENDER_TARGET,
+                cube: false,
+                components: vk::ComponentMapping::default(),
+            }
+        }
+    }
+
     fn composite(&mut self) -> Result<vk::Image, String> {
         if self.composite.is_none() {
-            let description = match self.corners {
-                Some(_) => corners::storage(self.extent.width, self.extent.height),
-                None => ImageDescription {
-                    image_type: vk::ImageType::TYPE_2D,
-                    view_type: vk::ImageViewType::TYPE_2D,
-                    format: self.format,
-                    width: self.extent.width,
-                    height: self.extent.height,
-                    depth: 1,
-                    levels: 1,
-                    layers: 1,
-                    samples: 1,
-                    usage: gpu::USAGE_RENDER_TARGET,
-                    cube: false,
-                    components: vk::ComponentMapping::default(),
-                },
-            };
+            let description =
+                Self::composite_description(self.format, self.extent, self.corners.is_some());
             let image = self.gpu.create_image(&description)?;
             // A fresh image's contents are undefined, and the frame that
             // brings the composite into existence has only the one layer
@@ -784,16 +2513,14 @@ impl Swapchain {
         Ok(self.composite.as_ref().expect("just made").image)
     }
 
-    /// `regions`, where given, are the parts of `frame` to blit, each from
-    /// the part of `source` that lands there.
-    fn present(
+    /// Prepare one frame and reserve its WSI semaphore before releasing the
+    /// state lock for the blocking image acquisition.
+    fn prepare_present(
         &mut self,
         frame: &appkit::view::Frame,
-        source: &GpuImage,
         regions: Option<&[Region]>,
-        owner: Option<usize>,
-    ) -> Result<bool, String> {
-        let mut owner = SourceOwner(owner);
+        nonblocking: bool,
+    ) -> Result<Option<(PreparedPresent, AcquireRequest)>, String> {
         // One layer covering the window needs no accumulator: what it draws
         // is the whole of what the window shows, so it goes straight into the
         // image the presentation engine hands back.
@@ -811,41 +2538,135 @@ impl Swapchain {
             corners.prepare(self.extent.width, self.extent.height)?;
         }
 
-        let slot = self.frame % self.frames.len().max(1);
+        let in_flight = frame_slots(self.present_mode);
+        let slot = self.frame % in_flight;
         let this = &self.frames[slot];
-        let (command_buffer, acquired, done) = (this.command_buffer, this.acquired, this.done);
+        let (command_buffer, acquired, acquire_done, done) = (
+            this.command_buffer,
+            this.acquired,
+            this.acquire_done,
+            this.done,
+        );
         // SAFETY: a fence of this device's, signalled at creation or by the
         // submission this slot last made.
-        unsafe { self.gpu.device.wait_for_fences(&[done], true, u64::MAX) }
-            .map_err(|error| format!("vkWaitForFences failed with {error:?}"))?;
+        if this.submitted {
+            let timeout = if nonblocking { 0 } else { u64::MAX };
+            if !self.gpu.wait_fence_timeout(done, timeout)? {
+                return Ok(None);
+            }
+        }
         self.frames[slot].submitted = false;
         finish_source(self.frames[slot].source.take());
+        if self.frames[slot].acquire_pending {
+            // WSI may signal an acquisition fence after a successful
+            // vkAcquireNextImageKHR returns. Never stall AppKit while it
+            // waits; retry this frame slot at a subsequent pump instead.
+            let timeout = if nonblocking { 0 } else { u64::MAX };
+            if !self.gpu.wait_fence_timeout(acquire_done, timeout)? {
+                return Ok(None);
+            }
+            self.frames[slot].acquire_pending = false;
+            self.gpu.fence_result(
+                unsafe { self.gpu.device.reset_fences(&[acquire_done]) },
+                "vkResetFences",
+            )?;
+        }
+        Ok(Some((
+            PreparedPresent {
+                slot,
+                command_buffer,
+                acquired,
+                done,
+                composite,
+            },
+            AcquireRequest {
+                handle: self.handle,
+                semaphore: acquired,
+                fence: acquire_done,
+            },
+        )))
+    }
 
-        let Some(index) = crate::stats::timed(crate::stats::Counter::PresentAcquireMicros, || {
-            self.acquire(acquired)
-        })?
-        else {
+    fn defer_acquired_image(&mut self, owner: &mut AcquiredSource) {
+        self.pending_rebuild = Some(self.requested);
+        if let Some(duplicate) = owner.take() {
+            // The per-device presenter retains the queued drawable itself.
+            // Release only present_owned's additional retained reference;
+            // do not complete the drawable ring before staging a frame.
+            objc::arc::release(duplicate as objc::object::Id);
+            self.deferred_owned = true;
+        }
+    }
+
+    /// Finish a prepared frame after the presentation engine returns an image.
+    fn finish_present(
+        &mut self,
+        frame: &appkit::view::Frame,
+        source: PresentSource,
+        regions: Option<&[Region]>,
+        owner: Option<usize>,
+        prepared: PreparedPresent,
+        acquired: Result<Option<(u32, bool)>, vk::Result>,
+        defer_rebuild: bool,
+    ) -> Result<Option<vk::Result>, String> {
+        let mut owner = AcquiredSource(owner);
+        self.deferred_owned = false;
+        // An unsuccessful acquire did not submit this frame. Report its
+        // raw Vulkan status to the caller so it can propagate DEVICE_LOST
+        // across the logical device and mark SURFACE_LOST window-local.
+        let acquired = match acquired {
+            Ok(acquired) => acquired,
+            Err(error) => {
+                finish_source(owner.take());
+                return Ok(Some(error));
+            }
+        };
+        let Some((index, _suboptimal)) = acquired else {
             // The swapchain was rebuilt underneath the acquisition. The frame
             // the guest drew is gone, which is what a resize costs; the next
             // one lands in the new swapchain.
+            self.rebuild_or_defer(defer_rebuild)?;
             finish_source(owner.take());
-            return Ok(true);
+            return Ok(None);
         };
+        let PreparedPresent {
+            slot,
+            command_buffer,
+            acquired,
+            done,
+            composite,
+        } = prepared;
+        self.frames[slot].acquire_pending = true;
+        // Until a successful queue submission consumes the acquired
+        // semaphore, all subsequent errors must retire the WSI swapchain.
+        // This semaphore must be consumed by a queue wait even if the
+        // subsequent image-copy queue submission fails.
+        self.acquired_unsubmitted = Some((prepared.acquired, prepared.done));
         let target = self.images[index as usize];
         // Safe to signal: this image has just come back from the
         // presentation engine, so the presentation which last waited on this
         // semaphore is finished.
         let blitted = self.blitted[index as usize];
+        #[cfg(test)]
+        if defer_rebuild && std::mem::take(&mut self.injected_unsignaled_present_fence) {
+            // Simulate an unsignaled prior-present fence on drivers which
+            // do not expose VK_EXT_swapchain_maintenance1. The successful
+            // acquired image must remain owned until worker recovery.
+            self.defer_acquired_image(&mut owner);
+            return Ok(None);
+        }
         let present_fence = if let Some(present) = self.presented.get_mut(index as usize) {
             if present.pending {
-                // SAFETY: this fence was attached to the last presentation
-                // of the image which acquisition just returned.
-                unsafe {
-                    self.gpu
-                        .device
-                        .wait_for_fences(&[present.fence], true, u64::MAX)
+                // Acquisition may precede the prior presentation's completion.
+                // Keep its acquired image/semaphore pending for worker-side
+                // retirement instead of waiting indefinitely in AppKit.
+                if defer_rebuild && !self.gpu.wait_fence_timeout(present.fence, 0)? {
+                    self.defer_acquired_image(&mut owner);
+                    return Ok(None);
                 }
-                .map_err(|error| format!("vkWaitForFences failed with {error:?}"))?;
+                if !defer_rebuild {
+                    self.gpu.wait(present.fence)?;
+                }
                 present.pending = false;
             }
             // SAFETY: the fence is either fresh or was waited above, and is
@@ -884,6 +2705,43 @@ impl Swapchain {
                     z: 1,
                 },
             ];
+            // The swapchain image is display-sized even if its NSWindow is
+            // not. Clear it before copying the *clipped* accumulator or layer:
+            // an overlay blended on the GPU can otherwise escape the frame.
+            // Transfer clear is guaranteed to cover stale pixels from prior
+            // presents; the compositor's excluded region is opaque black.
+            let logical = logical_image_clip(frame.window, self.extent);
+            let restricted = logical != Some(whole);
+            transition_to_transfer_dst(device, command_buffer, target);
+            if restricted {
+                let black = vk::ClearColorValue {
+                    float32: [0.0, 0.0, 0.0, 1.0],
+                };
+                device.cmd_clear_color_image(
+                    command_buffer,
+                    target,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    &black,
+                    &[vk::ImageSubresourceRange {
+                        aspect_mask: vk::ImageAspectFlags::COLOR,
+                        base_mip_level: 0,
+                        level_count: 1,
+                        base_array_layer: 0,
+                        layer_count: 1,
+                    }],
+                );
+                // Transfer write -> transfer write/read within this command
+                // buffer is ordered, but the barrier expresses the dependency.
+                barrier(
+                    device,
+                    command_buffer,
+                    target,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    vk::AccessFlags::TRANSFER_WRITE,
+                    vk::AccessFlags::TRANSFER_WRITE,
+                );
+            }
             match composite {
                 // The layer's own rectangle of the accumulator, then the
                 // whole accumulator into the image being presented.
@@ -920,7 +2778,7 @@ impl Swapchain {
                                     device,
                                     command_buffer,
                                     source.image,
-                                    extent_of(source),
+                                    source_of(into, frame, (source.width, source.height)),
                                     composite,
                                     vk::ImageLayout::GENERAL,
                                     into,
@@ -930,11 +2788,13 @@ impl Swapchain {
                     }
                     let shown = match &self.corners {
                         Some(corners) => {
-                            let shape = corners::Shape::of(
-                                frame.window,
-                                self.extent.width,
-                                self.extent.height,
-                            );
+                            let shape = self.fifo_shape.unwrap_or_else(|| {
+                                corners::Shape::of(
+                                    frame.window,
+                                    self.extent.width,
+                                    self.extent.height,
+                                )
+                            });
                             let image = self.composite.as_ref().expect("made above");
                             corners.record(command_buffer, slot, image, shape)
                         }
@@ -953,28 +2813,35 @@ impl Swapchain {
                             composite
                         }
                     };
-                    transition_to_transfer_dst(device, command_buffer, target);
-                    blit(
-                        device,
-                        command_buffer,
-                        shown,
-                        whole,
-                        target,
-                        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                        whole,
-                    );
+                    if let Some(clipped) = logical {
+                        blit(
+                            device,
+                            command_buffer,
+                            shown,
+                            clipped,
+                            target,
+                            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                            clipped,
+                        );
+                    }
                 }
                 None => {
-                    transition_to_transfer_dst(device, command_buffer, target);
-                    blit(
-                        device,
-                        command_buffer,
-                        source.image,
-                        extent_of(source),
-                        target,
-                        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                        whole,
-                    );
+                    if let Some((from, into)) = direct_blit_to(
+                        frame,
+                        self.extent,
+                        appkit::window::presentation_clip(frame.window),
+                        (source.width, source.height),
+                    ) {
+                        blit(
+                            device,
+                            command_buffer,
+                            source.image,
+                            from,
+                            target,
+                            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                            into,
+                        );
+                    }
                 }
             }
             transition_to_present(device, command_buffer, target);
@@ -984,7 +2851,14 @@ impl Swapchain {
         }
         crate::stats::finish_timer(crate::stats::Counter::PresentRecordMicros, record_timer);
 
+        #[cfg(test)]
+        let injected_submit = self.injected_queue_submit_error.take();
+        #[cfg(not(test))]
+        let injected_submit: Option<vk::Result> = None;
         crate::stats::timed(crate::stats::Counter::PresentSubmitMicros, || {
+            if let Some(error) = injected_submit {
+                return Err(format!("injected vkQueueSubmit failure: {error:?}"));
+            }
             self.gpu.submit_synchronized(
                 command_buffer,
                 done,
@@ -992,6 +2866,8 @@ impl Swapchain {
                 &[blitted],
             )
         })?;
+        // The acquire semaphore is consumed only after vkQueueSubmit succeeds.
+        self.acquired_unsubmitted = None;
         self.frames[slot].submitted = true;
         self.frames[slot].source = owner.take();
         self.frame = self.frame.wrapping_add(1);
@@ -999,15 +2875,17 @@ impl Swapchain {
         let result = crate::stats::timed(crate::stats::Counter::QueuePresentMicros, || {
             self.gpu.present(self.handle, index, blitted, present_fence)
         });
-        // OUT_OF_DATE and the other ordinary WSI errors still enqueue the
-        // semaphore wait. Only allocation failure is specified to leave all
-        // synchronization objects untouched.
-        if present_fence.is_some()
-            && !matches!(
-                result,
-                Err(vk::Result::ERROR_OUT_OF_HOST_MEMORY | vk::Result::ERROR_OUT_OF_DEVICE_MEMORY)
-            )
-        {
+        // The fault-injection test lets real Vulkan finish its queue operation,
+        // then replaces its result to exercise the post-acquire error path.
+        #[cfg(test)]
+        let result = self.injected_queue_present_error.take().map_or(result, Err);
+        // Exclude device loss and allocation failures from present-fence
+        // waits. The Gamescope WSI opt-in can also omit a signal on ordinary
+        // failed presents; keep that driver quirk out of normal WSI paths.
+        static GAMESCOPE_WSI: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+            std::env::var("ENABLE_GAMESCOPE_WSI").as_deref() == Ok("1")
+        });
+        if present_fence.is_some() && present_fence_will_signal(&result, *GAMESCOPE_WSI) {
             self.presented[index as usize].pending = true;
         }
         match result {
@@ -1015,40 +2893,137 @@ impl Swapchain {
                 if suboptimal {
                     // The image still reached the window; the next frame is
                     // the one that gets a swapchain matching it.
-                    self.rebuild(self.requested)?;
+                    self.rebuild_or_defer(defer_rebuild)?;
                 }
-                Ok(true)
+                Ok(None)
             }
             Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
-                self.rebuild(self.requested)?;
-                Ok(true)
+                self.rebuild_or_defer(defer_rebuild)?;
+                Ok(None)
             }
             Err(error) => {
-                // The blit submission succeeded and owns the drawable until
-                // its frame fence. A WSI failure must not make the caller
-                // schedule a second consumer or release the slot early.
+                // The blit submission owns its source until the frame fence,
+                // but the FIFO worker must see the terminal error and stop.
                 gpu::trace(format!("vkQueuePresentKHR failed with {error:?}"));
-                Ok(true)
+                Ok(Some(error))
             }
         }
     }
+}
 
-    /// The next image to write into, or `None` where the swapchain had to be
-    /// rebuilt and this frame is lost with it.
-    fn acquire(&mut self, signal: vk::Semaphore) -> Result<Option<u32>, String> {
-        let api = self.gpu.swapchain_api().ok_or("VK_KHR_swapchain is gone")?;
-        // SAFETY: a swapchain and a semaphore of this device's; no fence, so
-        // the semaphore is the only signal.
-        let acquired =
-            unsafe { api.acquire_next_image(self.handle, u64::MAX, signal, vk::Fence::null()) };
-        match acquired {
-            Ok((index, _suboptimal)) => Ok(Some(index)),
-            Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
-                self.rebuild(self.requested)?;
-                Ok(None)
-            }
-            Err(error) => Err(format!("vkAcquireNextImageKHR failed with {error:?}")),
-        }
+/// Bound the wait for a compositor image. A minimized X11 window may stop
+/// returning images entirely; UINT64_MAX would block window teardown while
+/// the worker held the presentation mutex. Timeout leaves the acquisition
+/// semaphore untouched, and the dirty accumulator remains pending.
+/// Waits up to a frame for an image when `wait`, and otherwise only polls:
+/// the caller holds the window's presentation lock throughout.
+fn acquire_fifo_image(gpu: &'static Gpu, request: AcquireRequest, wait: bool) -> FifoAcquire {
+    const TIMEOUT_NS: u64 = 20_000_000;
+    let Some(api) = gpu.swapchain_api() else {
+        return FifoAcquire::Terminal(vk::Result::ERROR_DEVICE_LOST);
+    };
+    let timeout = if wait { TIMEOUT_NS } else { 0 };
+    // SAFETY: the live window swapchain and its unused acquisition semaphore
+    // remain owned by the worker while it holds the presentation mutex.
+    classify_fifo_acquire(unsafe {
+        api.acquire_next_image(request.handle, timeout, request.semaphore, request.fence)
+    })
+}
+
+/// Copy what `old` held into `new` unscaled, from the top-left corner as the
+/// window's store keeps it across a resize, and clear the rest: stretched,
+/// the stale frame would be presented distorted until every layer redraws.
+///
+/// # Safety
+///
+/// Recording into `command_buffer`, with both images of `device`'s and in
+/// `GENERAL`.
+unsafe fn keep_top_left(
+    device: &ash::Device,
+    command_buffer: vk::CommandBuffer,
+    old: &GpuImage,
+    new: &GpuImage,
+) {
+    let range = vk::ImageSubresourceRange {
+        aspect_mask: vk::ImageAspectFlags::COLOR,
+        base_mip_level: 0,
+        level_count: 1,
+        base_array_layer: 0,
+        layer_count: 1,
+    };
+    let kept = [
+        vk::Offset3D { x: 0, y: 0, z: 0 },
+        vk::Offset3D {
+            x: old.width.min(new.width).max(1) as i32,
+            y: old.height.min(new.height).max(1) as i32,
+            z: 1,
+        },
+    ];
+    unsafe {
+        device.cmd_clear_color_image(
+            command_buffer,
+            new.image,
+            vk::ImageLayout::GENERAL,
+            &vk::ClearColorValue { float32: [0.0; 4] },
+            &[range],
+        );
+        barrier(
+            device,
+            command_buffer,
+            new.image,
+            vk::ImageLayout::GENERAL,
+            vk::ImageLayout::GENERAL,
+            vk::AccessFlags::TRANSFER_WRITE,
+            vk::AccessFlags::TRANSFER_WRITE,
+        );
+        blit(
+            device,
+            command_buffer,
+            old.image,
+            kept,
+            new.image,
+            vk::ImageLayout::GENERAL,
+            kept,
+        );
+    }
+}
+
+/// How long the FIFO worker sleeps, unlocked, after its `timeouts`th
+/// acquisition in a row that found no image.
+fn fifo_acquire_backoff(timeouts: u32) -> Duration {
+    Duration::from_millis(1 << timeouts.saturating_sub(1).min(5))
+}
+
+fn classify_fifo_acquire(outcome: Result<(u32, bool), vk::Result>) -> FifoAcquire {
+    match outcome {
+        Ok((index, suboptimal)) => FifoAcquire::Ready(Some((index, suboptimal))),
+        Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => FifoAcquire::Ready(None),
+        Err(vk::Result::TIMEOUT | vk::Result::NOT_READY) => FifoAcquire::TimedOut,
+        Err(error) => FifoAcquire::Terminal(error),
+    }
+}
+
+fn acquire_image(
+    gpu: &'static Gpu,
+    request: AcquireRequest,
+    nonblocking: bool,
+) -> Result<Option<(u32, bool)>, vk::Result> {
+    let api = gpu
+        .swapchain_api()
+        .ok_or(vk::Result::ERROR_EXTENSION_NOT_PRESENT)?;
+    // SAFETY: a live swapchain and semaphore of this device's; no fence, so
+    // the semaphore is the only signal.
+    match unsafe {
+        api.acquire_next_image(
+            request.handle,
+            if nonblocking { 0 } else { u64::MAX },
+            request.semaphore,
+            request.fence,
+        )
+    } {
+        Ok((index, suboptimal)) => Ok(Some((index, suboptimal))),
+        Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => Ok(None),
+        Err(error) => Err(error),
     }
 }
 
@@ -1061,19 +3036,33 @@ impl Swapchain {
 impl Drop for Swapchain {
     fn drop(&mut self) {
         self.idle();
+        // If both queue submissions failed, the WSI acquire may still be
+        // scheduling its semaphore signal. The separate acquire fence proves
+        // completion of that signal; queue idle alone does not.
+        if let Some((semaphore, _)) = self.acquired_unsubmitted {
+            if let Some(frame) = self.frames.iter().find(|f| f.acquired == semaphore) {
+                if let Err(reason) = self.gpu.wait(frame.acquire_done) {
+                    // A device-lost wait counts as completed for resource
+                    // lifetime under Vulkan's lost-device rules.
+                    gpu::trace(format!("unconsumed WSI acquire teardown: {reason}"));
+                }
+            }
+        }
         let device = &self.gpu.device;
         // The swapchain first: its images are what the semaphores below were
         // signalled for, and a surface outlives the swapchain made on it.
-        if let Some(api) = self.gpu.swapchain_api() {
-            // SAFETY: the wait above retired every submission and presentation
-            // which refers to this swapchain.
-            unsafe { api.destroy_swapchain(self.handle, None) };
+        if self.handle != vk::SwapchainKHR::null() {
+            if let Some(api) = self.gpu.swapchain_api() {
+                // SAFETY: teardown has finished references to this swapchain.
+                unsafe { api.destroy_swapchain(self.handle, None) };
+            }
         }
         for frame in &self.frames {
             // SAFETY: objects of this device's, with nothing in flight after
             // the wait above.
             unsafe {
                 device.destroy_semaphore(frame.acquired, None);
+                device.destroy_fence(frame.acquire_done, None);
                 device.destroy_fence(frame.done, None);
             }
         }

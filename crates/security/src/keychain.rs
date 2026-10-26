@@ -44,6 +44,10 @@ pub const KEYS: &[(&str, &str)] = &[
     ("_kSecMatchSearchList", "m_SearchList"),
     ("_kSecClassCertificate", "cert"),
     ("_kSecReturnRef", "r_Ref"),
+    ("_kSecAttrComment", "icmt"),
+    ("_kSecAttrDescription", "desc"),
+    ("_kSecKeyAlgorithmRSAEncryptionRaw", "algid:encrypt:RSA:raw"),
+    ("_kSecTransformInputAttributeName", "INPUT"),
 ];
 
 /// What identifies an item: its class, its service and its account.

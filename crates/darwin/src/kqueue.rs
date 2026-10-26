@@ -63,7 +63,10 @@ struct Timer {
 }
 
 fn monotonic_ns() -> u64 {
-    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
     // SAFETY: writes the one `timespec` it is given.
     unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
     ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
@@ -95,7 +98,10 @@ fn timer_for(change: &Kevent) -> Timer {
             }
             _ => value,
         };
-        return Timer { deadline, period: None };
+        return Timer {
+            deadline,
+            period: None,
+        };
     }
     let period = units(value).max(1);
     Timer {
@@ -257,7 +263,17 @@ trait ReadinessBackend: Sized {
 /// implementation on hosts with neither epoll nor a Darwin kqueue.
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 struct PollBackend {
+    /// Private rather than the guest's descriptor: a duplicate keeps the queue
+    /// alive after the guest closes the number it was created under.
     wake: c_int,
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+impl Drop for PollBackend {
+    fn drop(&mut self) {
+        forget_waker(self.wake);
+        unsafe { libc::close(self.wake) };
+    }
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -265,10 +281,18 @@ impl ReadinessBackend for PollBackend {
     fn new() -> Result<(Self, c_int), c_int> {
         let wake = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
         if wake < 0 {
-            Err(crate::errno::get())
-        } else {
-            Ok((Self { wake }, wake))
+            return Err(crate::errno::get());
         }
+        let backend = Self { wake };
+        // FIXME (ACCURACY): the guest's descriptor only names the queue. It
+        // never polls readable, where Darwin's does while events are pending.
+        let queue = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+        if queue < 0 {
+            let errno = crate::errno::get();
+            drop(backend);
+            return Err(errno);
+        }
+        Ok((backend, queue))
     }
 
     fn wake(&self) {
@@ -295,13 +319,13 @@ impl ReadinessBackend for PollBackend {
 
     fn wait(
         &self,
-        queue: c_int,
+        _: c_int,
         registrations: &HashMap<(usize, i16), Registration>,
         ports: &[c_int],
         _: usize,
         timeout: c_int,
     ) -> Result<Vec<Ready>, c_int> {
-        let mut watched = poll_set(queue, registrations);
+        let mut watched = poll_set(self.wake, registrations);
         let registered = watched.len();
         watched.extend(ports.iter().map(|fd| libc::pollfd {
             fd: *fd,
@@ -320,7 +344,7 @@ impl ReadinessBackend for PollBackend {
             .map(|entry| Ready {
                 fd: entry.fd,
                 revents: entry.revents,
-                source: match entry.fd == queue {
+                source: match entry.fd == self.wake {
                     true => Source::Wake,
                     false => Source::Level,
                 },
@@ -397,7 +421,11 @@ impl EpollBackend {
 impl ReadinessBackend for EpollBackend {
     fn needs_registrations(&self) -> bool {
         // Only for the descriptors epoll refused, which `wait` polls itself.
-        !self.poll_only.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
+        !self
+            .poll_only
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_empty()
     }
 
     fn new() -> Result<(Self, c_int), c_int> {
@@ -961,13 +989,40 @@ pub extern "C" fn kqueue() -> c_int {
     let Ok((backend, fd)) = SelectedBackend::new() else {
         return -1;
     };
-    // Whatever this number held before is gone with the descriptor it named;
-    // see the module note on `close`.
+    // A queue still under this number lost its descriptor to a close that
+    // bypassed Darwin's `close`, so it is gone.
     queues()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .insert(fd, Arc::new(Mutex::new(Queue::new(backend))));
     fd
+}
+
+/// A kqueue descriptor was duplicated: `to` now names the queue `from` does,
+/// and no longer whatever it named before.
+pub fn duplicate(from: c_int, to: c_int) {
+    if from == to {
+        return;
+    }
+    let replaced = {
+        let mut map = queues().lock().unwrap_or_else(|e| e.into_inner());
+        match map.get(&from).cloned() {
+            Some(queue) => map.insert(to, queue),
+            None => map.remove(&to),
+        }
+    };
+    // Outside the table lock: the last reference tears the backend down.
+    drop(replaced);
+}
+
+/// `fd` is closing, so the queue it named loses that descriptor.
+pub fn forget(fd: c_int) {
+    let removed = queues()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&fd);
+    // Outside the table lock, as in `duplicate`.
+    drop(removed);
 }
 
 /// Wake a `kevent` blocked on `queue`.
@@ -1042,11 +1097,65 @@ pub(crate) fn descriptor_closing(fd: c_int) {
     }
 }
 
+/// Remove watches of the old file only when `dup2` replaces it successfully.
+pub(crate) fn replace_descriptor(from: c_int, to: c_int) -> c_int {
+    // Check the source before disturbing edge-triggered registrations.
+    if from == to || unsafe { libc::fcntl(from, libc::F_GETFD) } < 0 {
+        return unsafe { libc::dup2(from, to) };
+    }
+    let mut all: Vec<_> = queues()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .values()
+        .cloned()
+        .collect();
+    // Duplicated queue descriptors share a lock. Take each once, in a fixed order.
+    all.sort_unstable_by_key(Arc::as_ptr);
+    all.dedup_by(|a, b| Arc::ptr_eq(a, b));
+    let mut held: Vec<_> = all
+        .iter()
+        .map(|state| state.lock().unwrap_or_else(|e| e.into_inner()))
+        .collect();
+    for state in &held {
+        let before = interest_for(&state.registrations, to);
+        let _ = state.backend.update(to, before, Interest::default());
+    }
+    // Detach before replacement: epoll keys include the old open file.
+    let result = unsafe { libc::dup2(from, to) };
+    let errno = crate::errno::get();
+    for state in &mut held {
+        if result < 0 {
+            let after = interest_for(&state.registrations, to);
+            let _ = state.backend.update(to, Interest::default(), after);
+        } else {
+            state.registrations.retain(|(ident, filter), _| {
+                *ident != to as usize || !matches!(*filter, EVFILT_READ | EVFILT_WRITE)
+            });
+        }
+    }
+    drop(held);
+    drop(all);
+    crate::errno::set(errno);
+    result
+}
+
 /// Before the descriptor closes, so its number is not written once it names
 /// something else.
 fn forget_waker(fd: c_int) {
     for slot in &WAKER_FDS {
         let _ = slot.compare_exchange(fd, -1, Ordering::AcqRel, Ordering::Acquire);
+    }
+}
+
+/// Stop waking `state` for signals once it watches none, so the table does
+/// not fill with queues that only ever watched one briefly.
+fn release_signal_waker<B: ReadinessBackend>(state: &Queue<B>) {
+    if !state
+        .registrations
+        .values()
+        .any(|registration| registration.filter == EVFILT_SIGNAL)
+    {
+        forget_waker(state.backend.wake_descriptor());
     }
 }
 
@@ -1082,9 +1191,9 @@ fn watch_exit(pid: i32) -> Result<(), c_int> {
                 revents: 0,
             };
             // SAFETY: one `pollfd` on this stack; the pidfd is this thread's.
-            while unsafe { libc::poll(&mut entry, 1, -1) } < 0
-                && crate::errno::get() == libc::EINTR
-            {}
+            while unsafe { libc::poll(&mut entry, 1, -1) } < 0 && crate::errno::get() == libc::EINTR
+            {
+            }
             // SAFETY: closing the pidfd this thread owns.
             unsafe { libc::close(pidfd) };
             let all: Vec<_> = queues()
@@ -1095,7 +1204,10 @@ fn watch_exit(pid: i32) -> Result<(), c_int> {
                 .collect();
             for queue in all {
                 let mut state = queue.lock().unwrap_or_else(|e| e.into_inner());
-                if state.registrations.contains_key(&(pid as usize, EVFILT_PROC)) {
+                if state
+                    .registrations
+                    .contains_key(&(pid as usize, EVFILT_PROC))
+                {
                     state.exited.push_back(pid as usize);
                     state.backend.wake();
                 }
@@ -1126,7 +1238,12 @@ fn drain_fd(queue: c_int) {
 fn apply<B: ReadinessBackend>(state: &mut Queue<B>, change: &Kevent) -> Result<(), c_int> {
     if !matches!(
         change.filter,
-        EVFILT_READ | EVFILT_WRITE | EVFILT_USER | EVFILT_SIGNAL | EVFILT_MACHPORT | EVFILT_PROC
+        EVFILT_READ
+            | EVFILT_WRITE
+            | EVFILT_USER
+            | EVFILT_SIGNAL
+            | EVFILT_MACHPORT
+            | EVFILT_PROC
             | EVFILT_TIMER
     ) {
         return Err(crate::errno::from_host(libc::EINVAL));
@@ -1149,6 +1266,7 @@ fn apply<B: ReadinessBackend>(state: &mut Queue<B>, change: &Kevent) -> Result<(
         state.triggered_set = triggered_set;
         if change.filter == EVFILT_SIGNAL {
             let _ = crate::signal::observe(change.ident as i32, false);
+            release_signal_waker(state);
         }
         if change.filter == EVFILT_TIMER {
             state.timers.remove(&change.ident);
@@ -1199,7 +1317,8 @@ fn apply<B: ReadinessBackend>(state: &mut Queue<B>, change: &Kevent) -> Result<(
             // Only the exit is reported; a registration for anything else
             // is accepted and never fires, as for a process that does not
             // fork or exec.
-            let pid = i32::try_from(change.ident).map_err(|_| crate::errno::from_host(libc::ESRCH))?;
+            let pid =
+                i32::try_from(change.ident).map_err(|_| crate::errno::from_host(libc::ESRCH))?;
             if registrations.get(&key).is_none() && change.fflags & NOTE_EXIT != 0 {
                 watch_exit(pid)?;
             }
@@ -1380,12 +1499,9 @@ fn timeout_ms(timeout: *const libc::timespec) -> Result<c_int, c_int> {
 /// The descriptors to wait on: the wakeup channel, and every enabled readiness
 /// registration folded together by descriptor.
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn poll_set(
-    queue: c_int,
-    registrations: &HashMap<(usize, i16), Registration>,
-) -> Vec<libc::pollfd> {
+fn poll_set(wake: c_int, registrations: &HashMap<(usize, i16), Registration>) -> Vec<libc::pollfd> {
     let mut interest: HashMap<c_int, i16> = HashMap::new();
-    interest.insert(queue, libc::POLLIN);
+    interest.insert(wake, libc::POLLIN);
     for registration in registrations.values() {
         if !registration.enabled
             || matches!(
@@ -1717,6 +1833,7 @@ pub unsafe extern "C" fn kevent(
         if flags & EV_ONESHOT != 0 {
             state.registrations.remove(&key);
             let _ = crate::signal::observe(ident as i32, false);
+            release_signal_waker(&state);
         } else if flags & EV_DISPATCH != 0 {
             registration.enabled = false;
         }
@@ -1885,7 +2002,10 @@ fn trace_kevent(queue: c_int, changes: &[Kevent], out: &[Kevent]) {
     if !*ON.get_or_init(|| std::env::var_os("ROSEMARY_TRACE_KEVENT").is_some()) {
         return;
     }
-    if !out.iter().any(|e| matches!(e.filter, EVFILT_READ | EVFILT_WRITE)) {
+    if !out
+        .iter()
+        .any(|e| matches!(e.filter, EVFILT_READ | EVFILT_WRITE))
+    {
         return;
     }
     if SEEN.fetch_add(1, Ordering::Relaxed) > 60 {
@@ -2081,11 +2201,14 @@ pub unsafe extern "C" fn kevent64(
                 )
             };
             wide.fflags = status as u32;
-            wide.ext = [buffer, match status {
-                // SAFETY: a received header begins with its bits and size.
-                0 => (unsafe { *((buffer + 4) as *const u32) }) as u64,
-                _ => 0,
-            }];
+            wide.ext = [
+                buffer,
+                match status {
+                    // SAFETY: a received header begins with its bits and size.
+                    0 => (unsafe { *((buffer + 4) as *const u32) }) as u64,
+                    _ => 0,
+                },
+            ];
         }
         // SAFETY: the caller states there is room for `nevents`.
         unsafe { events.add(i).write(wide) };
@@ -2149,27 +2272,59 @@ mod tests {
         // SAFETY: descriptors of this test's, one change, room for four.
         unsafe {
             let first = add(read_end);
-            kevent(queue, &raw const first, 1, got.as_mut_ptr(), 4, &raw const NO_WAIT);
+            kevent(
+                queue,
+                &raw const first,
+                1,
+                got.as_mut_ptr(),
+                4,
+                &raw const NO_WAIT,
+            );
             assert_eq!(libc::write(write_end, c"x".as_ptr().cast(), 1), 1);
             crate::net::descriptor::close(read_end);
             assert_eq!(
-                kevent(queue, std::ptr::null(), 0, got.as_mut_ptr(), 4, &raw const NO_WAIT),
+                kevent(
+                    queue,
+                    std::ptr::null(),
+                    0,
+                    got.as_mut_ptr(),
+                    4,
+                    &raw const NO_WAIT
+                ),
                 0,
                 "the old file is not reported once its descriptor closed"
             );
             let (fresh, other_write) = pipe();
-            assert_eq!(libc::dup2(fresh, read_end), read_end, "the number is reused");
+            assert_eq!(
+                libc::dup2(fresh, read_end),
+                read_end,
+                "the number is reused"
+            );
             libc::close(fresh);
             let again = read_end;
             let second = add(again);
             assert_eq!(
-                kevent(queue, &raw const second, 1, got.as_mut_ptr(), 4, &raw const NO_WAIT),
+                kevent(
+                    queue,
+                    &raw const second,
+                    1,
+                    got.as_mut_ptr(),
+                    4,
+                    &raw const NO_WAIT
+                ),
                 0,
                 "the new pipe is empty, whatever the old one holds"
             );
             assert_eq!(libc::write(other_write, c"y".as_ptr().cast(), 1), 1);
             assert_eq!(
-                kevent(queue, std::ptr::null(), 0, got.as_mut_ptr(), 4, &raw const NO_WAIT),
+                kevent(
+                    queue,
+                    std::ptr::null(),
+                    0,
+                    got.as_mut_ptr(),
+                    4,
+                    &raw const NO_WAIT
+                ),
                 1
             );
             for fd in [again, other_write, write_end, copy, queue] {
@@ -2222,7 +2377,7 @@ mod tests {
             );
             libc::close(read_end);
             libc::close(write_end);
-            libc::close(queue);
+            crate::net::descriptor::close(queue);
         }
         assert_eq!(got[0].ident, read_end as usize);
         assert_eq!(got[0].filter, EVFILT_READ);
@@ -2276,7 +2431,7 @@ mod tests {
             );
             libc::close(read_end);
             libc::close(write_end);
-            libc::close(queue);
+            crate::net::descriptor::close(queue);
         }
     }
 
@@ -2310,7 +2465,7 @@ mod tests {
         assert_eq!(n, 1);
         assert_eq!(got[0].ident, file.as_raw_fd() as usize);
         // SAFETY: this test's queue descriptor.
-        unsafe { libc::close(queue) };
+        unsafe { crate::net::descriptor::close(queue) };
     }
 
     /// A closed writer is readiness with `EV_EOF`, reported once even when the
@@ -2344,7 +2499,7 @@ mod tests {
             assert_eq!(reads.len(), 1);
             assert_eq!(reads[0].flags & EV_EOF, EV_EOF);
             libc::close(read_end);
-            libc::close(queue);
+            crate::net::descriptor::close(queue);
         }
     }
 
@@ -2419,7 +2574,7 @@ mod tests {
             "the caller's request is not handed back as a property of the event"
         );
         // SAFETY: this test's own descriptor.
-        unsafe { libc::close(queue) };
+        unsafe { crate::net::descriptor::close(queue) };
     }
 
     /// Applies `change` and collects what is ready, without waiting.
@@ -2467,7 +2622,7 @@ mod tests {
         assert_eq!(event.udata, 9);
         assert_eq!(collect(queue, None).0, 0, "reported once");
         // SAFETY: this test's own descriptor.
-        unsafe { libc::close(queue) };
+        unsafe { crate::net::descriptor::close(queue) };
     }
 
     /// `SIG_IGN` does not hide a signal from the queue, and removing the last
@@ -2497,7 +2652,7 @@ mod tests {
         unsafe { libc::raise(host) };
         assert_eq!(collect(queue, None).0, 0);
         // SAFETY: this test's own descriptor.
-        unsafe { libc::close(queue) };
+        unsafe { crate::net::descriptor::close(queue) };
     }
 
     /// `SIGCHLD`, which is what `opend` watches: a child exiting is reported.
@@ -2533,7 +2688,7 @@ mod tests {
         assert_eq!(n, 1);
         assert!(got[0].data >= 1);
         // SAFETY: this test's own descriptor.
-        unsafe { libc::close(queue) };
+        unsafe { crate::net::descriptor::close(queue) };
     }
 
     /// A filter this module cannot answer is refused, and `EV_RECEIPT` is how
@@ -2582,7 +2737,7 @@ mod tests {
             -1
         );
         // SAFETY: this test's own descriptor.
-        unsafe { libc::close(queue) };
+        unsafe { crate::net::descriptor::close(queue) };
     }
 
     /// A descriptor that is not a queue is `EBADF` rather than a queue with
@@ -2711,7 +2866,7 @@ mod tests {
         space::destroy(set);
         space::destroy(port);
         // SAFETY: this test's own descriptor.
-        unsafe { libc::close(queue) };
+        unsafe { crate::net::descriptor::close(queue) };
     }
 
     #[test]
@@ -2742,7 +2897,7 @@ mod tests {
         space::destroy(set);
         space::destroy(port);
         // SAFETY: this test's own descriptor.
-        unsafe { libc::close(queue) };
+        unsafe { crate::net::descriptor::close(queue) };
     }
 
     #[test]
@@ -2751,7 +2906,7 @@ mod tests {
         assert_eq!(watch_machport(queue, 0xdead_0003), -1);
         assert_eq!(crate::errno::get(), libc::EINVAL);
         // SAFETY: this test's own descriptor.
-        unsafe { libc::close(queue) };
+        unsafe { crate::net::descriptor::close(queue) };
     }
 
     /// Crashpad's handshake watches its pipe this way and blocks until
@@ -2775,7 +2930,7 @@ mod tests {
                 "the reader going away is a change"
             );
             libc::close(write_end);
-            libc::close(queue);
+            crate::net::descriptor::close(queue);
         }
     }
 
@@ -2803,7 +2958,7 @@ mod tests {
             assert_eq!((n, event.data), (1, 2));
             libc::close(read_end);
             libc::close(write_end);
-            libc::close(queue);
+            crate::net::descriptor::close(queue);
         }
     }
 
@@ -2820,7 +2975,7 @@ mod tests {
             assert_eq!(collect(queue, None).0, 1);
             libc::close(read_end);
             libc::close(write_end);
-            libc::close(queue);
+            crate::net::descriptor::close(queue);
         }
     }
 
@@ -2850,7 +3005,7 @@ mod tests {
             assert_eq!((n, event.data), (1, 2));
             libc::close(read_end);
             libc::close(write_end);
-            libc::close(queue);
+            crate::net::descriptor::close(queue);
         }
     }
 
@@ -2872,7 +3027,7 @@ mod tests {
         space::destroy(set);
         space::destroy(port);
         // SAFETY: this test's own descriptor.
-        unsafe { libc::close(queue) };
+        unsafe { crate::net::descriptor::close(queue) };
     }
 
     #[test]
@@ -2886,6 +3041,227 @@ mod tests {
         space::destroy(set);
         space::destroy(port);
         // SAFETY: this test's own descriptor.
-        unsafe { libc::close(queue) };
+        unsafe { crate::net::descriptor::close(queue) };
+    }
+
+    /// A descriptor closed through Darwin's `close`, which is what keeps the
+    /// queue table in step.
+    struct Descriptor(c_int);
+
+    impl Drop for Descriptor {
+        fn drop(&mut self) {
+            // SAFETY: this test's own descriptor.
+            unsafe { crate::net::descriptor::close(self.0) };
+        }
+    }
+
+    fn user_event(ident: usize, flags: u16, fflags: u32, udata: usize) -> Kevent {
+        Kevent {
+            ident,
+            filter: EVFILT_USER,
+            flags,
+            fflags,
+            udata,
+            ..Kevent::default()
+        }
+    }
+
+    /// Apply `change` without collecting anything.
+    fn change(queue: c_int, change: &Kevent) -> c_int {
+        // SAFETY: one change and no room for events.
+        unsafe {
+            kevent(
+                queue,
+                change,
+                1,
+                std::ptr::null_mut(),
+                0,
+                &raw const NO_WAIT,
+            )
+        }
+    }
+
+    fn wakes_on_signals(queue: &Arc<Mutex<Queue<SelectedBackend>>>) -> bool {
+        let wake = queue.lock().unwrap().backend.wake_descriptor();
+        WAKER_FDS
+            .iter()
+            .any(|slot| slot.load(Ordering::Acquire) == wake)
+    }
+
+    /// mio's waker registers `EVFILT_USER` on an `F_DUPFD_CLOEXEC` copy of
+    /// its selector and expects the selector to see the trigger.
+    #[test]
+    fn a_duplicated_queue_shares_its_registrations() {
+        let queue = Descriptor(kqueue());
+        // SAFETY: integer descriptors and an integer argument.
+        let (copied, cloned) = unsafe {
+            (
+                Descriptor(crate::net::descriptor::dup(queue.0)),
+                Descriptor(crate::fcntl::entry::fcntl(
+                    queue.0,
+                    crate::fcntl::cmd::F_DUPFD_CLOEXEC,
+                    0,
+                )),
+            )
+        };
+        assert!(copied.0 >= 0 && cloned.0 >= 0);
+
+        assert_eq!(
+            change(copied.0, &user_event(0, EV_ADD | EV_CLEAR, 0, 0x42)),
+            0
+        );
+        assert_eq!(change(cloned.0, &user_event(0, 0, NOTE_TRIGGER, 0)), 0);
+        let (n, event) = collect(queue.0, None);
+        assert_eq!(n, 1);
+        assert_eq!(event.udata, 0x42);
+    }
+
+    #[test]
+    fn failed_dup2_preserves_the_targets_read_watch() {
+        let queue = Descriptor(kqueue());
+        let (read, write) = pipe();
+        let (read, write) = (Descriptor(read), Descriptor(write));
+        let add = Kevent {
+            ident: read.0 as usize,
+            filter: EVFILT_READ,
+            flags: EV_ADD | EV_CLEAR,
+            ..Kevent::default()
+        };
+        assert_eq!(change(queue.0, &add), 0);
+        assert_eq!(unsafe { crate::net::descriptor::dup2(-1, read.0) }, -1);
+        assert_eq!(crate::errno::get(), libc::EBADF);
+        assert_eq!(unsafe { libc::write(write.0, c"x".as_ptr().cast(), 1) }, 1);
+        let (n, event) = collect(queue.0, None);
+        assert_eq!(n, 1);
+        assert_eq!(event.ident, read.0 as usize);
+    }
+
+    #[test]
+    fn successful_dup2_removes_the_old_read_watch_with_an_open_copy() {
+        let queue = Descriptor(kqueue());
+        let alias = Descriptor(unsafe { crate::net::descriptor::dup(queue.0) });
+        let (old_read, old_write) = pipe();
+        let (old_read, old_write) = (Descriptor(old_read), Descriptor(old_write));
+        let copy = Descriptor(unsafe { crate::net::descriptor::dup(old_read.0) });
+        let (new_read, new_write) = pipe();
+        let (new_read, new_write) = (Descriptor(new_read), Descriptor(new_write));
+        let add = Kevent {
+            ident: old_read.0 as usize,
+            filter: EVFILT_READ,
+            flags: EV_ADD,
+            ..Kevent::default()
+        };
+        assert_eq!(change(queue.0, &add), 0);
+        assert_eq!(
+            unsafe { libc::write(old_write.0, c"x".as_ptr().cast(), 1) },
+            1
+        );
+        assert_eq!(
+            unsafe { crate::net::descriptor::dup2(new_read.0, old_read.0) },
+            old_read.0
+        );
+        assert_eq!(collect(alias.0, None).0, 0);
+        assert_eq!(change(alias.0, &add), 0);
+        assert_eq!(collect(queue.0, None).0, 0);
+        assert_eq!(
+            unsafe { libc::write(new_write.0, c"y".as_ptr().cast(), 1) },
+            1
+        );
+        let (n, event) = collect(queue.0, None);
+        assert_eq!(n, 1);
+        assert_eq!(event.ident, old_read.0 as usize);
+        drop(copy);
+    }
+
+    #[test]
+    fn dup2_onto_a_queue_replaces_it_with_the_source_queue() {
+        let source = Descriptor(kqueue());
+        let target = Descriptor(kqueue());
+        assert_eq!(
+            change(source.0, &user_event(1, EV_ADD | EV_CLEAR, 0, 0x1111)),
+            0
+        );
+        assert_eq!(
+            change(target.0, &user_event(2, EV_ADD | EV_CLEAR, 0, 0x2222)),
+            0
+        );
+
+        // SAFETY: two integer descriptors.
+        assert_eq!(
+            unsafe { crate::net::descriptor::dup2(source.0, target.0) },
+            target.0
+        );
+        // The target's own registration went with the queue it named.
+        assert_eq!(change(target.0, &user_event(2, 0, NOTE_TRIGGER, 0)), -1);
+        assert_eq!(crate::errno::get(), libc::ENOENT);
+
+        assert_eq!(change(target.0, &user_event(1, 0, NOTE_TRIGGER, 0)), 0);
+        let (n, event) = collect(source.0, None);
+        assert_eq!(n, 1);
+        assert_eq!(event.udata, 0x1111);
+    }
+
+    #[test]
+    fn dup2_of_another_file_onto_a_queue_leaves_no_queue_behind() {
+        let (read, write) = pipe();
+        let (read, write) = (Descriptor(read), Descriptor(write));
+        let queue = Descriptor(kqueue());
+        // SAFETY: two integer descriptors.
+        assert_eq!(
+            unsafe { crate::net::descriptor::dup2(read.0, queue.0) },
+            queue.0
+        );
+        let (n, _) = collect(queue.0, None);
+        assert_eq!(n, -1);
+        assert_eq!(crate::errno::get(), libc::EBADF);
+        drop(write);
+    }
+
+    #[test]
+    fn a_queue_outlives_its_first_descriptor_while_a_duplicate_is_open() {
+        let queue = Descriptor(kqueue());
+        let held = queue_of(queue.0).expect("queue registered");
+        let signal = Kevent {
+            ident: crate::signal::signum::SIGWINCH as usize,
+            filter: EVFILT_SIGNAL,
+            flags: EV_ADD,
+            ..Kevent::default()
+        };
+        assert_eq!(change(queue.0, &signal), 0);
+        assert_eq!(
+            change(queue.0, &user_event(0, EV_ADD | EV_CLEAR, 0, 0x42)),
+            0
+        );
+        // SAFETY: an integer descriptor.
+        let copied = Descriptor(unsafe { crate::net::descriptor::dup(queue.0) });
+        drop(queue);
+
+        assert!(wakes_on_signals(&held));
+        assert_eq!(change(copied.0, &user_event(0, 0, NOTE_TRIGGER, 0)), 0);
+        let (n, event) = collect(copied.0, None);
+        assert_eq!(n, 1);
+        assert_eq!(event.udata, 0x42);
+
+        drop(copied);
+        // The table let go, so dropping `held` tears the queue down.
+        assert_eq!(Arc::strong_count(&held), 1);
+    }
+
+    #[test]
+    fn deleting_the_last_signal_registration_stops_signal_wakeups() {
+        let queue = Descriptor(kqueue());
+        let held = queue_of(queue.0).expect("queue registered");
+        let mut signal = Kevent {
+            ident: crate::signal::signum::SIGWINCH as usize,
+            filter: EVFILT_SIGNAL,
+            flags: EV_ADD,
+            ..Kevent::default()
+        };
+        assert!(!wakes_on_signals(&held));
+        assert_eq!(change(queue.0, &signal), 0);
+        assert!(wakes_on_signals(&held));
+        signal.flags = EV_DELETE;
+        assert_eq!(change(queue.0, &signal), 0);
+        assert!(!wakes_on_signals(&held));
     }
 }

@@ -26,6 +26,7 @@ pub mod accounts;
 #[cfg(not(target_os = "macos"))]
 pub mod acl;
 pub mod appmailbox;
+mod asl;
 mod atomics;
 pub mod attrlist;
 pub mod audit;
@@ -396,6 +397,8 @@ static NONPORTABLE_MODULES: &[exports::Module] = &[
     backtrace::MODULE,
     #[cfg(target_arch = "x86_64")]
     printf_l::MODULE,
+    #[cfg(target_arch = "x86_64")]
+    asl::MODULE,
     acl::MODULE,
     fmtcheck::MODULE,
     langinfo::MODULE,
@@ -454,6 +457,7 @@ pub const LIBRARY_NAMES: &[&str] = &[
     "/usr/lib/libpoll.dylib",
     "/usr/lib/libproc.dylib",
     "/usr/lib/libdbm.dylib",
+    "/usr/lib/libcopyfile.dylib",
     "/usr/lib/librpcsvc.dylib",
     "/usr/lib/libgcc_s.1.dylib",
     // OpenPAM, which `crate::pam` is on hosts without a Darwin one.

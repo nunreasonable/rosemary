@@ -903,7 +903,11 @@ pub fn vsnprintf(symbol: &str, ctx: &mut RegisterContext, mem: &mut dyn GuestMem
 
 /// `vsnprintf_l(buf, size, locale, fmt, ap)`: `vsnprintf` with a locale, which
 /// formats the same here - every locale's decimal point is the C one's.
-pub fn vsnprintf_l(symbol: &str, ctx: &mut RegisterContext, mem: &mut dyn GuestMemory) -> Result<()> {
+pub fn vsnprintf_l(
+    symbol: &str,
+    ctx: &mut RegisterContext,
+    mem: &mut dyn GuestMemory,
+) -> Result<()> {
     let out = format_from_list(symbol, ctx, mem, ctx.rcx, ctx.r8)?;
     store_bounded(symbol, ctx, mem, ctx.rdi, ctx.rsi, out)
 }
@@ -934,6 +938,18 @@ pub fn syslog(symbol: &str, ctx: &mut RegisterContext, mem: &mut dyn GuestMemory
     let text = std::ffi::CString::new(out).unwrap_or_default();
     // SAFETY: a constant format consuming the one NUL-terminated string.
     unsafe { libc::syslog(ctx.rdi as i32, c"%s".as_ptr(), text.as_ptr()) };
+    Ok(())
+}
+
+/// `int asl_log(aslclient, aslmsg, int level, const char *format, ...)`, sent to the
+/// host's logger as `syslog` would be: ASL's levels are syslog's priorities.
+pub fn asl_log(symbol: &str, ctx: &mut RegisterContext, mem: &mut dyn GuestMemory) -> Result<()> {
+    let out = format_from(symbol, ctx, &*mem, ctx.rcx, 4)?;
+    let text = std::ffi::CString::new(out).unwrap_or_default();
+    let priority = (ctx.rdx as i32).clamp(libc::LOG_EMERG, libc::LOG_DEBUG);
+    // SAFETY: a constant format consuming the one NUL-terminated string.
+    unsafe { libc::syslog(priority, c"%s".as_ptr(), text.as_ptr()) };
+    set_int_return(ctx, 0);
     Ok(())
 }
 

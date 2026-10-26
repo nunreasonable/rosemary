@@ -10,6 +10,7 @@ use crate::vm::Vm;
 
 use super::encoding::{self, Signature};
 use super::host;
+use crate::shims::bind;
 
 /// A runtime entry point the guest may call, and what crosses at it.
 pub(super) struct Runtime {
@@ -596,11 +597,6 @@ fn set_arg_reg(ctx: &mut RegisterContext, i: usize, v: u64) {
     ][i] = v;
 }
 
-/// Whether `name` (underscore already stripped) is one of this module's.
-pub fn shim_for(name: &str) -> Option<crate::jmpbuf::Shim> {
-    resolve(name).map(|_| serve as crate::jmpbuf::Shim)
-}
-
 /// Symbols this runtime answers for, resolved to the host's own implementations.
 pub fn provider() -> SyntheticDylib {
     let mut lib = SyntheticDylib::new("<rosemary objc runtime>");
@@ -707,19 +703,6 @@ pub(super) fn host_symbol(name: &str) -> Option<u64> {
     super::host::symbol(name)
 }
 
-/// Service one call into the Objective-C runtime.
-fn serve(symbol: &str, ctx: &mut RegisterContext, mem: &mut dyn GuestMemory) -> Result<()> {
-    match resolve(symbol) {
-        Some(entry) => entry.call(symbol, ctx, mem),
-        None => {
-            current_vm(symbol)?;
-            Err(AbiError::NoSignature {
-                symbol: symbol.to_string(),
-            })
-        }
-    }
-}
-
 /// Which of this module's tables `name` is in, found once by [`resolve`] so that a
 /// caller servicing the same import again does not search them by name again.
 #[derive(Clone, Copy)]
@@ -728,9 +711,12 @@ pub struct Entry(Kind);
 #[derive(Clone, Copy)]
 enum Kind {
     Exception(crate::jmpbuf::Shim),
-    Send(Send),
+    /// The spelling from [`MESSAGES`], and what it means.
+    Send(&'static str, Send),
+    /// An index into [`RUNTIME`], which also holds the name.
     Runtime(usize),
-    Refused(&'static str),
+    /// The spelling from [`REFUSED`], and why.
+    Refused(&'static str, &'static str),
 }
 
 /// The entry for `name` (underscore already stripped), if it is one of this
@@ -741,12 +727,12 @@ pub fn resolve(name: &str) -> Option<Entry> {
     // the shim cannot serve gets, and the shim decides which that is.
     let kind = if let Some(f) = exception_shim(name) {
         Kind::Exception(f)
-    } else if let Some((_, message)) = MESSAGES.iter().find(|(n, _)| *n == name) {
-        Kind::Send(*message)
+    } else if let Some((name, message)) = MESSAGES.iter().find(|(n, _)| *n == name) {
+        Kind::Send(name, *message)
     } else if let Ok(i) = RUNTIME.binary_search_by_key(&name, |r| r.name) {
         Kind::Runtime(i)
-    } else if let Some((_, reason)) = REFUSED.iter().find(|(n, _)| *n == name) {
-        Kind::Refused(reason)
+    } else if let Some((name, reason)) = REFUSED.iter().find(|(n, _)| *n == name) {
+        Kind::Refused(name, reason)
     } else {
         return None;
     };
@@ -754,18 +740,16 @@ pub fn resolve(name: &str) -> Option<Entry> {
 }
 
 impl Entry {
-    /// Service one call to `symbol`, the name this entry was resolved from.
-    pub fn call(
-        self,
-        symbol: &str,
-        ctx: &mut RegisterContext,
-        mem: &mut dyn GuestMemory,
-    ) -> Result<()> {
+    /// Service one call to the name this entry was resolved from.
+    pub fn call(self, ctx: &mut RegisterContext, mem: &mut dyn GuestMemory) -> Result<()> {
         match self.0 {
-            Kind::Exception(f) => f(symbol, ctx, mem),
-            Kind::Send(message) => send(symbol, message, current_vm(symbol)?, ctx, mem),
-            Kind::Runtime(i) => call_runtime(symbol, i, current_vm(symbol)?, ctx, mem),
-            Kind::Refused(reason) => Err(AbiError::Refused {
+            Kind::Exception(f) => f(ctx, mem),
+            Kind::Send(symbol, message) => send(symbol, message, current_vm(symbol)?, ctx, mem),
+            Kind::Runtime(i) => {
+                let symbol = RUNTIME[i].name;
+                call_runtime(symbol, i, current_vm(symbol)?, ctx, mem)
+            }
+            Kind::Refused(symbol, reason) => Err(AbiError::Refused {
                 symbol: symbol.to_string(),
                 reason,
             }),
@@ -786,8 +770,8 @@ fn exception_shim(symbol: &str) -> Option<crate::jmpbuf::Shim> {
         return None;
     }
     Some(match symbol {
-        "objc_begin_catch" => begin_catch,
-        "objc_exception_throw" => exception_throw,
+        "objc_begin_catch" => bind!("objc_begin_catch" => begin_catch),
+        "objc_exception_throw" => bind!("objc_exception_throw" => exception_throw),
         _ => return None,
     })
 }
@@ -1797,7 +1781,7 @@ mod tests {
             .chain(MESSAGES.iter().map(|(n, _)| *n))
             .chain(REFUSED.iter().map(|(n, _)| *n))
         {
-            assert!(shim_for(name).is_some(), "{name} is claimed and not served");
+            assert!(resolve(name).is_some(), "{name} is claimed and not served");
             assert!(
                 crate::shims::is_shimmed(&format!("_{name}")),
                 "{name} would be promoted to an inlined host call"

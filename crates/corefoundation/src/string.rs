@@ -31,6 +31,8 @@ pub struct CFString {
     length: i64,
 }
 
+pub type CFStringRef = *const c_void;
+
 /// `kCFStringEncoding*`, the few a guest actually passes.
 pub mod encoding {
     pub const MAC_ROMAN: u32 = 0;

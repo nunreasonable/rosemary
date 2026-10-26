@@ -204,6 +204,42 @@ unsafe extern "C" fn resize_with_old_superview_size(receiver: Id, _sel: Sel, old
     }
 }
 
+/// How a view its autoresizing mask places follows its superview: what its
+/// origin and its size gain per point the superview grows, along x then y.
+/// The solver reads this as AppKit reads a mask into constraints, so a
+/// constraint on such a view can size its superview. `None` when the
+/// superview does not resize its subviews.
+pub(crate) fn autoresizing_rates(view: Id) -> Option<[(CGFloat, CGFloat); 2]> {
+    let v = view_of(view);
+    if !is_view(v.superview) || view_of(v.superview).does_not_autoresize_subviews != 0 {
+        return None;
+    }
+    let old = view_of(v.superview).frame.size;
+    let mask = v.autoresizing_mask;
+    let rate = |leading, sizable, trailing, origin: CGFloat, size: CGFloat, old: CGFloat| {
+        let (o, s) = distribute(leading, sizable, trailing, origin, size, old, old + 1.0);
+        (o - origin, s - size)
+    };
+    Some([
+        rate(
+            mask & autoresizing::MIN_X_MARGIN != 0,
+            mask & autoresizing::WIDTH_SIZABLE != 0,
+            mask & autoresizing::MAX_X_MARGIN != 0,
+            v.frame.origin.x,
+            v.frame.size.width,
+            old.width,
+        ),
+        rate(
+            mask & autoresizing::MIN_Y_MARGIN != 0,
+            mask & autoresizing::HEIGHT_SIZABLE != 0,
+            mask & autoresizing::MAX_Y_MARGIN != 0,
+            v.frame.origin.y,
+            v.frame.size.height,
+            old.height,
+        ),
+    ])
+}
+
 /// Spread a superview's change along one axis over the three lengths that make
 /// it up: the leading margin, the subview itself, and the trailing margin.
 ///
@@ -716,13 +752,13 @@ fn y_from_superview(frame: NSRect, flipped: bool, outer_flipped: bool, y: f64) -
 fn to_superview(view: Id, point: NSPoint) -> NSPoint {
     let v = view_of(view);
     let bounds = bounds_of(view);
-    let point = NSPoint {
+    let local = NSPoint {
         x: (point.x - bounds.origin.x) * axis_scale(v.frame.size.width, bounds.size.width),
         y: (point.y - bounds.origin.y) * axis_scale(v.frame.size.height, bounds.size.height),
     };
     NSPoint {
-        x: point.x + v.frame.origin.x,
-        y: y_to_superview(v.frame, is_flipped(view), is_flipped(v.superview), point.y),
+        x: local.x + v.frame.origin.x,
+        y: y_to_superview(v.frame, is_flipped(view), is_flipped(v.superview), local.y),
     }
 }
 
@@ -806,9 +842,18 @@ pub fn rect_in_window(view: Id) -> NSRect {
     rect_between(bounds, |point| point_to_window(view, point))
 }
 
+/// Where a view's subviews' frames are measured from: its bounds origin, which
+/// a clip view moves to scroll.
+pub(crate) fn bounds_origin_of(view: Id) -> NSPoint {
+    match is_view(view) {
+        true => bounds_of(view).origin,
+        false => NSPoint::default(),
+    }
+}
+
 /// Whether a rectangle of a view's holds a point, for [`crate::cursor`].
 pub fn holds(view: Id, rect: NSRect, point: NSPoint) -> bool {
-    is_view(view) && contains(rect, point)
+    is_view(view) && crate::geometry::mouse_in_rect(point, rect, is_flipped(view))
 }
 
 /// Where a view's layer lands in its window, in pixels from the top left.
@@ -840,41 +885,44 @@ pub unsafe fn presentation_frame(view: Id) -> Option<Frame> {
         return None;
     }
     let rect = rect_in_window(view);
-    let (x, y, size) = (rect.origin.x, rect.origin.y, rect.size);
-    let (_, window_height) = sdl3::video::window_size(sdl)?;
-    let (pixel_width, pixel_height) = sdl3::video::window_size_in_pixels(sdl)?;
-    let density = sdl3::video::window_pixel_density(sdl) as f64;
-    let density = if density > 0.0 { density } else { 1.0 };
-    // AppKit counts up from the bottom of the window's content rect; a
-    // swapchain image counts down from the top of it.
-    let top = f64::from(window_height) - (y + size.height);
+    let mapped = crate::window::rect_to_surface(window, rect)?;
+    // The SDL video thread publishes these dimensions. No native SDL
+    // query is permitted from a renderer resolving a Metal view frame.
+    let snapshot = sdl3::video::presentation_window(sdl)?;
+    let host_points = snapshot.logical_size;
+    let host_pixels = snapshot.pixel_size;
+    let mut rounded = crate::window::pixel_rect_from_surface(mapped, host_points, host_pixels);
+    // A view's source extent uses exactly the same separately rounded pixel
+    // edges as the destination clip; the *unclipped* rectangle is needed for
+    // Metal's destination-to-source mapping when views overhang the window.
+    if rounded.w == 0 || rounded.h == 0 {
+        let surface = crate::window::surface_frame(window)?;
+        let inset = crate::window::content_inset(window).min(surface.size.height);
+        rounded = crate::window::pixel_rect_from_surface(
+            NSRect {
+                origin: NSPoint {
+                    x: surface.origin.x,
+                    y: surface.origin.y + inset,
+                },
+                size: NSSize {
+                    width: surface.size.width,
+                    height: (surface.size.height - inset).max(0.0),
+                },
+            },
+            host_points,
+            host_pixels,
+        );
+    }
     let frame = Frame {
         window: sdl,
-        x: (x * density).round() as i32,
-        y: (top * density).round() as i32,
-        width: (size.width * density).round().max(0.0) as u32,
-        height: (size.height * density).round().max(0.0) as u32,
-        window_width: pixel_width.max(0) as u32,
-        window_height: pixel_height.max(0) as u32,
+        x: rounded.x,
+        y: rounded.y,
+        width: rounded.w as u32,
+        height: rounded.h as u32,
+        window_width: host_pixels.0.max(0) as u32,
+        window_height: host_pixels.1.max(0) as u32,
     };
-    // A view with no frame of its own - one a guest made with
-    // `-initWithFrame:` of a zero rect and then never sized - covers its
-    // window's content rather than nothing, which is what AppKit's own
-    // autoresizing would have made of it.
-    match frame.width == 0 || frame.height == 0 {
-        true => {
-            let inset = (crate::window::content_inset(window) * density).round() as u32;
-            let inset = inset.min(frame.window_height);
-            Some(Frame {
-                x: 0,
-                y: inset as i32,
-                width: frame.window_width,
-                height: frame.window_height - inset,
-                ..frame
-            })
-        }
-        false => Some(frame),
-    }
+    Some(frame)
 }
 
 /// The view's rectangle in SDL's logical window coordinates.
@@ -898,17 +946,13 @@ pub unsafe fn input_frame(view: Id) -> Option<(sdl3::Window, sdl3::Rect)> {
         return None;
     }
     let rect = rect_in_window(view);
-    let (x, y, size) = (rect.origin.x, rect.origin.y, rect.size);
-    let (_, window_height) = sdl3::video::window_size(sdl)?;
-    let top = f64::from(window_height) - (y + size.height);
+    let mapped = crate::window::rect_to_surface(window, rect)?;
+    let points = sdl3::video::window_size(sdl)?;
+    // SDL text-input areas use window points rather than physical pixels,
+    // but their half-open edges must follow the same rounding convention.
     Some((
         sdl,
-        sdl3::Rect {
-            x: x.round() as i32,
-            y: top.round() as i32,
-            w: size.width.round().max(0.0) as i32,
-            h: size.height.round().max(0.0) as i32,
-        },
+        crate::window::pixel_rect_from_surface(mapped, points, points),
     ))
 }
 
@@ -979,7 +1023,8 @@ unsafe fn hit(view: Id, point: NSPoint, depth: usize) -> Id {
 /// on `view`. This distinction matters when that override calls `super`.
 unsafe fn hit_base(view: Id, point: NSPoint, depth: usize) -> Id {
     let frame = view_of(view).frame;
-    if !contains(frame, point) {
+    let superview = view_of(view).superview;
+    if !crate::geometry::mouse_in_rect(point, frame, is_flipped(superview)) {
         return std::ptr::null_mut();
     }
     let local = from_superview(view, point);
@@ -1007,16 +1052,6 @@ unsafe extern "C" fn hit_test_method(receiver: Id, _sel: Sel, point: NSPoint) ->
     // SAFETY: the receiver is a live view and the point is in its superview's
     // coordinates, as expected by this module's tree walk.
     unsafe { hit_base(receiver, point, 0) }
-}
-
-/// Whether a rectangle holds a point, on AppKit's half-open rule: the minimum
-/// edges are inside and the maximum ones are not, so two views that share an
-/// edge do not both claim the click.
-fn contains(rect: NSRect, point: NSPoint) -> bool {
-    point.x >= rect.origin.x
-        && point.y >= rect.origin.y
-        && point.x < rect.origin.x + rect.size.width
-        && point.y < rect.origin.y + rect.size.height
 }
 
 /// Send `-updateTrackingAreas` down a view tree.
@@ -1154,6 +1189,21 @@ fn scale(receiver: Id) -> f64 {
     }
 }
 
+/// `-init`, which is `-initWithFrame:` with an empty frame: sent, so a
+/// subclass's designated initializer runs, as it does under AppKit.
+unsafe extern "C" fn init(receiver: Id, _sel: Sel) -> Id {
+    // SAFETY: `-initWithFrame:` is `id (id, SEL, NSRect)`.
+    unsafe {
+        let f: unsafe extern "C" fn(Id, Sel, NSRect) -> Id =
+            std::mem::transmute(objc::msg::entry());
+        f(
+            receiver,
+            objc::sel::get("initWithFrame:"),
+            NSRect::default(),
+        )
+    }
+}
+
 pub(crate) unsafe extern "C" fn init_with_frame(receiver: Id, _sel: Sel, frame: NSRect) -> Id {
     view_of(receiver).frame = frame;
     receiver
@@ -1198,6 +1248,7 @@ unsafe extern "C" fn set_bounds(receiver: Id, _sel: Sel, bounds: NSRect) {
     view.bounds = bounds;
     view.custom_bounds = 1;
     if before == bounds { return; }
+    crate::backing::needs_display(receiver);
     if !view.layer.is_null() {
         crate::layer::set_bounds_of(view.layer, bounds);
     }
@@ -1215,22 +1266,69 @@ unsafe extern "C" fn set_bounds_size(receiver: Id, sel: Sel, size: NSSize) {
     unsafe { set_bounds(receiver, sel, bounds) };
 }
 
-unsafe extern "C" fn set_bounds_origin(receiver: Id, sel: Sel, origin: NSPoint) {
+pub(crate) unsafe extern "C" fn set_bounds_origin(receiver: Id, sel: Sel, origin: NSPoint) {
     let mut bounds = bounds_of(receiver);
     bounds.origin = origin;
     // SAFETY: forwarded with the same receiver and a complete bounds rectangle.
     unsafe { set_bounds(receiver, sel, bounds) };
 }
 
-/// `-visibleRect`: the part of the view not clipped away by an ancestor.
-///
-/// The bounds, because nothing in this tree clips: there is no scroll view and
-/// no clip view with a smaller frame, so every view is wholly visible. A guest
-/// sizing a viewport from this gets the same answer it would from `-bounds`,
-/// which is what it would get from AppKit for a view that fills its window.
-unsafe extern "C" fn visible_rect(receiver: Id, sel: Sel) -> NSRect {
-    // SAFETY: `-bounds` is `NSRect (id, SEL)`.
-    unsafe { bounds(receiver, sel) }
+/// `-translateOriginToPoint:`.
+unsafe extern "C" fn translate_origin(receiver: Id, sel: Sel, by: NSPoint) {
+    let origin = bounds_of(receiver).origin;
+    // SAFETY: as `-setBoundsOrigin:`.
+    unsafe {
+        set_bounds_origin(
+            receiver,
+            sel,
+            NSPoint {
+                x: origin.x - by.x,
+                y: origin.y - by.y,
+            },
+        )
+    };
+}
+
+/// `-visibleRect`: the part of the view's bounds no ancestor clips away, in
+/// the view's own coordinates. Every view clips its subviews to its frame.
+unsafe extern "C" fn visible_rect(receiver: Id, _sel: Sel) -> NSRect {
+    visible_rect_of(receiver)
+}
+
+pub(crate) fn visible_rect_of(view: Id) -> NSRect {
+    if !is_view(view) {
+        return NSRect::default();
+    }
+    let mut visible = rect_in_window(view);
+    let mut node = view_of(view).superview;
+    for _ in 0..64 {
+        if !is_view(node) {
+            break;
+        }
+        visible = intersection(visible, rect_in_window(node));
+        node = view_of(node).superview;
+    }
+    if visible.size.width <= 0.0 || visible.size.height <= 0.0 {
+        return NSRect {
+            origin: bounds_of(view).origin,
+            size: NSSize::default(),
+        };
+    }
+    rect_between(visible, |point| point_from_window(view, point))
+}
+
+fn intersection(a: NSRect, b: NSRect) -> NSRect {
+    let left = a.origin.x.max(b.origin.x);
+    let bottom = a.origin.y.max(b.origin.y);
+    let right = (a.origin.x + a.size.width).min(b.origin.x + b.size.width);
+    let top = (a.origin.y + a.size.height).min(b.origin.y + b.size.height);
+    NSRect {
+        origin: NSPoint { x: left, y: bottom },
+        size: NSSize {
+            width: (right - left).max(0.0),
+            height: (top - bottom).max(0.0),
+        },
+    }
 }
 
 /// `-convertRectToBacking:`, which is the whole reason a Retina program asks a
@@ -1274,13 +1372,7 @@ unsafe extern "C" fn convert_size_to_backing(receiver: Id, _sel: Sel, size: NSSi
 /// `-mouse:inRect:`, which is `NSMouseInRect` with the view's own flippedness:
 /// the edge a point on it counts as inside is the top one either way up.
 unsafe extern "C" fn mouse_in_rect(receiver: Id, _sel: Sel, point: NSPoint, rect: NSRect) -> u8 {
-    let (min_y, max_y) = (rect.origin.y, rect.origin.y + rect.size.height);
-    let x = point.x >= rect.origin.x && point.x < rect.origin.x + rect.size.width;
-    let y = match is_flipped(receiver) {
-        true => point.y >= min_y && point.y < max_y,
-        false => point.y > min_y && point.y <= max_y,
-    };
-    (x && y) as u8
+    crate::geometry::mouse_in_rect(point, rect, is_flipped(receiver)) as u8
 }
 
 /// A point from `from`'s coordinates to `to`'s, through their window; `nil`
@@ -1504,6 +1596,104 @@ unsafe extern "C" fn subviews(receiver: Id, _sel: Sel) -> Id {
     view.subviews
 }
 
+/// Send `selector`, taking one object, to `view` and every view under it.
+fn tell_tree(view: Id, selector: &str, argument: Id) {
+    if !is_view(view) {
+        return;
+    }
+    let sel = objc::sel::get(selector);
+    // SAFETY: `void (id, SEL, id)`, which the hierarchy hooks are.
+    unsafe {
+        let f: unsafe extern "C" fn(Id, Sel, Id) = std::mem::transmute(objc::msg::entry());
+        f(view, sel, argument);
+    }
+    for child in subviews_of(view) {
+        tell_tree(child, selector, argument);
+    }
+}
+
+/// [`tell_tree`] for a hook that takes nothing.
+fn tell_tree_bare(view: Id, selector: &str) {
+    if !is_view(view) {
+        return;
+    }
+    let sel = objc::sel::get(selector);
+    // SAFETY: `void (id, SEL)`.
+    unsafe {
+        let f: unsafe extern "C" fn(Id, Sel) = std::mem::transmute(objc::msg::entry());
+        f(view, sel);
+    }
+    for child in subviews_of(view) {
+        tell_tree_bare(child, selector);
+    }
+}
+
+fn tell(view: Id, selector: &str, argument: Id) {
+    // SAFETY: `void (id, SEL, id)`.
+    unsafe {
+        let f: unsafe extern "C" fn(Id, Sel, Id) = std::mem::transmute(objc::msg::entry());
+        f(view, objc::sel::get(selector), argument);
+    }
+}
+
+fn tell_bare(view: Id, selector: &str) {
+    // SAFETY: `void (id, SEL)`.
+    unsafe {
+        let f: unsafe extern "C" fn(Id, Sel) = std::mem::transmute(objc::msg::entry());
+        f(view, objc::sel::get(selector));
+    }
+}
+
+/// `view` and its subtree are leaving `old` for `new`: the will-move hooks.
+pub(crate) fn will_move_to_window(view: Id, old: Id, new: Id) {
+    if old != new {
+        tell_tree(view, "viewWillMoveToWindow:", new);
+    }
+}
+
+/// ...and the did-move ones, once the move is made.
+pub(crate) fn did_move_to_window(view: Id, old: Id, new: Id) {
+    if old != new {
+        crate::layout::note_tree_changed();
+        tell_tree_bare(view, "viewDidMoveToWindow");
+    }
+}
+
+/// `-enclosingScrollView`: the nearest scroll view above this one.
+unsafe extern "C" fn enclosing_scroll_view(receiver: Id, _sel: Sel) -> Id {
+    let Some(scroll) = objc::class::lookup(c"NSScrollView") else {
+        return std::ptr::null_mut();
+    };
+    // SAFETY: a view of this crate's.
+    let mut at = unsafe { superview_of(receiver) };
+    while is_view(at) {
+        // SAFETY: a live view.
+        if unsafe { corefoundation::base::is_kind_of(at.cast(), scroll) } {
+            return at;
+        }
+        // SAFETY: as above.
+        at = unsafe { superview_of(at) };
+    }
+    std::ptr::null_mut()
+}
+
+/// `-isDescendantOf:`, counting the view itself.
+unsafe extern "C" fn is_descendant_of(receiver: Id, _sel: Sel, other: Id) -> u8 {
+    let mut at = receiver;
+    while is_view(at) {
+        if at == other {
+            return 1;
+        }
+        // SAFETY: a view of this crate's.
+        at = unsafe { superview_of(at) };
+    }
+    0
+}
+
+unsafe extern "C" fn hook_with_object(_receiver: Id, _sel: Sel, _argument: Id) {}
+
+unsafe extern "C" fn hook(_receiver: Id, _sel: Sel) {}
+
 unsafe extern "C" fn add_subview(receiver: Id, sel: Sel, subview: Id) {
     if !is_view(subview) {
         return;
@@ -1512,9 +1702,12 @@ unsafe extern "C" fn add_subview(receiver: Id, sel: Sel, subview: Id) {
     // old parent keeps a reference and, when it goes, frees what it no longer owns.
     // Held across the move because the old list may own the only reference.
     objc::arc::retain(subview);
+    // SAFETY: both are views of this crate's.
+    let (old_window, new_window) = unsafe { (window_of(subview), window_of(receiver)) };
+    will_move_to_window(subview, old_window, new_window);
+    tell(subview, "viewWillMoveToSuperview:", receiver);
     if !view_of(subview).superview.is_null() {
-        // SAFETY: `-removeFromSuperview` is `void (id, SEL)`.
-        unsafe { remove_from_superview(subview, objc::sel::get("removeFromSuperview")) };
+        detach_from_superview(subview);
     }
     view_of(subview).superview = receiver;
     // A window's content view that becomes a subview is in its new parent's
@@ -1527,6 +1720,9 @@ unsafe extern "C" fn add_subview(receiver: Id, sel: Sel, subview: Id) {
             .values
             .push(array.policy.retain(subview as *const c_void));
     }
+    tell_bare(subview, "viewDidMoveToSuperview");
+    tell(receiver, "didAddSubview:", subview);
+    did_move_to_window(subview, old_window, new_window);
     objc::arc::release(subview);
     // SAFETY: a view this crate made, now in a window.
     unsafe { update_tracking_areas(subview) };
@@ -1605,7 +1801,28 @@ pub(crate) fn convert_rect(rect: NSRect, from: Id, to: Id) -> NSRect {
     rect_between(rect, |point| convert_point(point, from, to))
 }
 
+/// `-removeFromSuperview`, with the hooks a view is told of around it.
 unsafe extern "C" fn remove_from_superview(receiver: Id, _sel: Sel) {
+    let parent = view_of(receiver).superview;
+    if !is_view(parent) {
+        view_of(receiver).superview = std::ptr::null_mut();
+        return;
+    }
+    // Held: the superview's list may own the only reference.
+    objc::arc::retain(receiver);
+    // SAFETY: a view of this crate's.
+    let old_window = unsafe { window_of(receiver) };
+    tell(parent, "willRemoveSubview:", receiver);
+    will_move_to_window(receiver, old_window, std::ptr::null_mut());
+    tell(receiver, "viewWillMoveToSuperview:", std::ptr::null_mut());
+    detach_from_superview(receiver);
+    tell_bare(receiver, "viewDidMoveToSuperview");
+    did_move_to_window(receiver, old_window, std::ptr::null_mut());
+    objc::arc::release(receiver);
+}
+
+/// Take `receiver` out of its superview's list, telling no one.
+fn detach_from_superview(receiver: Id) {
     let view = view_of(receiver);
     let parent = view.superview;
     view.superview = std::ptr::null_mut();
@@ -1929,6 +2146,7 @@ pub(crate) fn install() {
         "appearance" => appearance, c"@16@0:8";
         "setAppearance:" => set_appearance, c"v24@0:8@16";
         "effectiveAppearance" => effective_appearance, c"@16@0:8";
+        "init" => init, c"@16@0:8";
         "initWithFrame:" => init_with_frame, c"@48@0:8{CGRect={CGPoint=dd}{CGSize=dd}}16";
         "frame" => frame, c"{CGRect={CGPoint=dd}{CGSize=dd}}16@0:8";
         "setFrame:" => set_frame, c"v48@0:8{CGRect={CGPoint=dd}{CGSize=dd}}16";
@@ -1939,6 +2157,7 @@ pub(crate) fn install() {
         "setBounds:" => set_bounds, c"v48@0:8{CGRect={CGPoint=dd}{CGSize=dd}}16";
         "setBoundsSize:" => set_bounds_size, c"v32@0:8{CGSize=dd}16";
         "setBoundsOrigin:" => set_bounds_origin, c"v32@0:8{CGPoint=dd}16";
+        "translateOriginToPoint:" => translate_origin, c"v32@0:8{CGPoint=dd}16";
         "convertRectToBacking:" => convert_rect_to_backing,
             c"{CGRect={CGPoint=dd}{CGSize=dd}}48@0:8{CGRect={CGPoint=dd}{CGSize=dd}}16";
         "convertRectFromBacking:" => convert_rect_from_backing,
@@ -1973,6 +2192,14 @@ pub(crate) fn install() {
         "setTranslatesAutoresizingMaskIntoConstraints:" => set_translates_autoresizing_mask,
             c"v20@0:8c16";
         "translatesAutoresizingMaskIntoConstraints" => translates_autoresizing_mask, c"c16@0:8";
+        "enclosingScrollView" => enclosing_scroll_view, c"@16@0:8";
+        "isDescendantOf:" => is_descendant_of, c"c24@0:8@16";
+        "viewWillMoveToWindow:" => hook_with_object, c"v24@0:8@16";
+        "viewDidMoveToWindow" => hook, c"v16@0:8";
+        "viewWillMoveToSuperview:" => hook_with_object, c"v24@0:8@16";
+        "viewDidMoveToSuperview" => hook, c"v16@0:8";
+        "didAddSubview:" => hook_with_object, c"v24@0:8@16";
+        "willRemoveSubview:" => hook_with_object, c"v24@0:8@16";
         "removeFromSuperview" => remove_from_superview, c"v16@0:8";
         "dealloc" => dealloc, c"v16@0:8";
         "setWantsBestResolutionOpenGLSurface:" => set_wants_best_resolution, c"v20@0:8c16";
@@ -2222,6 +2449,62 @@ mod tests {
         let object = objc::object::create_instance(class, 0);
         // SAFETY: the object has `View` storage.
         unsafe { init_with_frame(object, objc::sel::get("initWithFrame:"), frame) }
+    }
+
+    #[test]
+    fn the_top_window_edge_hits_the_topmost_view_in_either_orientation() {
+        for parent_flipped in [false, true] {
+            for child_flipped in [false, true] {
+                let make = |flipped, frame| match flipped {
+                    true => flipped_view(frame),
+                    false => view(frame),
+                };
+                let content = make(parent_flipped, rect(0.0, 0.0, 200.0, 100.0));
+                let upper_y = if parent_flipped { 0.0 } else { 80.0 };
+                let lower_y = if parent_flipped { 20.0 } else { 60.0 };
+                let upper = make(child_flipped, rect(0.0, upper_y, 200.0, 20.0));
+                let lower = make(child_flipped, rect(0.0, lower_y, 200.0, 20.0));
+                // SAFETY: live views; hit-test points are in window coordinates.
+                unsafe {
+                    add_subview(content, objc::sel::get("addSubview:"), upper);
+                    add_subview(content, objc::sel::get("addSubview:"), lower);
+                    let top = crate::geometry::point_in_window(0.0, 0.0, 100.0);
+                    assert_eq!(hit_test(content, top), upper);
+                    let shared_edge = crate::geometry::point_in_window(0.0, 20.0, 100.0);
+                    assert_eq!(hit_test(content, shared_edge), lower);
+                    for (x, y) in [(200.0, 0.0), (0.0, 100.0), (0.0, -0.1)] {
+                        let outside = crate::geometry::point_in_window(x, y, 100.0);
+                        assert!(hit_test(content, outside).is_null());
+                    }
+                }
+                objc::arc::release(upper);
+                objc::arc::release(lower);
+                objc::arc::release(content);
+            }
+        }
+    }
+
+    #[test]
+    fn tracking_rectangles_include_the_visual_top_edge_in_either_orientation() {
+        for flipped in [false, true] {
+            let frame = rect(0.0, 0.0, 200.0, 100.0);
+            let content = match flipped {
+                true => flipped_view(frame),
+                false => view(frame),
+            };
+            for (x, y, expected) in [
+                (0.0, 0.0, true),
+                (100.0, 0.0, true),
+                (200.0, 0.0, false),
+                (0.0, 100.0, false),
+                (0.0, -0.1, false),
+            ] {
+                let window_point = crate::geometry::point_in_window(x, y, 100.0);
+                let local = point_from_window(content, window_point);
+                assert_eq!(holds(content, frame, local), expected);
+            }
+            objc::arc::release(content);
+        }
     }
 
     /// Qt's views are flipped, and a subview at `y = 0` of one is along its
@@ -2502,6 +2785,12 @@ mod tests {
     #[test]
     fn a_subviews_frame_reaches_the_window_in_pixels() {
         crate::bootstrap();
+        // SDL belongs to the video thread. Concurrent window tests can claim
+        // it first; on another thread the presentation cache cannot be built.
+        // Run this graphical integration test in a single-threaded harness.
+        if !sdl3::may_pump() {
+            return;
+        }
         let window =
             objc::object::create_instance(objc::class::lookup(c"NSWindow").expect("NSWindow"), 0);
         // SAFETY: `-initWithContentRect:styleMask:backing:defer:` is
@@ -2548,6 +2837,52 @@ mod tests {
         // SAFETY: a view of this crate's.
         let frame = unsafe { presentation_frame(whole) }.expect("the view is in a window");
         assert!(frame.covers_window());
+    }
+
+    /// A zero-sized view is fitted to its window's drawable with exactly the
+    /// canonical rounded edges, including the content inset. No alternative
+    /// origin/width rounding is permitted in the fallback.
+    #[test]
+    fn zero_sized_presentation_fallback_preserves_fractional_surface_edges() {
+        crate::bootstrap();
+        let class = objc::class::lookup(c"NSWindow").unwrap();
+        let window = objc::object::create_instance(class, 0);
+        let made = unsafe {
+            crate::window::init_with_content_rect_for_tests(window, rect(0.0, 0.0, 320.0, 240.0))
+        };
+        if !made {
+            return;
+        }
+        // Only the SDL video thread can build the presentation cache.
+        if !sdl3::video::is_video_thread() {
+            return;
+        }
+        let child = view(rect(0.0, 0.0, 0.0, 0.0));
+        unsafe { set_window(child, window) };
+        let sdl = unsafe { crate::window::sdl_window(window) };
+        let rounded = unsafe { presentation_frame(child) }.unwrap();
+        let surface = crate::window::surface_frame(window).unwrap();
+        let inset = crate::window::content_inset(window).min(surface.size.height);
+        let expected = crate::window::pixel_rect_from_surface(
+            NSRect {
+                origin: NSPoint {
+                    x: surface.origin.x,
+                    y: surface.origin.y + inset,
+                },
+                size: NSSize {
+                    width: surface.size.width,
+                    height: (surface.size.height - inset).max(0.0),
+                },
+            },
+            sdl3::video::window_size(sdl).unwrap(),
+            sdl3::video::window_size_in_pixels(sdl).unwrap(),
+        );
+        assert_eq!(
+            (rounded.x, rounded.y, rounded.width, rounded.height),
+            (expected.x, expected.y, expected.w as u32, expected.h as u32)
+        );
+        objc::arc::release(child);
+        objc::arc::release(window);
     }
 
     /// A view with no window has nowhere to be presented, which is what

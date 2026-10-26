@@ -1323,11 +1323,26 @@ impl Vm {
         guest_va: u64,
         signature: crate::thunk::ThunkSignature,
     ) -> Result<u64, VmError> {
-        if let Some(existing) = self.host_thunk_for(guest_va) {
+        // A generic thunk is not ABI-compatible, and a guest address may be
+        // used with more than one callback prototype. Typed thunks are not in
+        // the published view, but a read lock does not stall other readers.
+        let cached = self
+            .thunks
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .typed_host_for(guest_va, &signature);
+        if let Some(existing) = cached {
             return Ok(existing);
         }
-        let thunk = crate::thunk::build_typed(guest_va, signature)?;
-        let host = self.insert_thunk(thunk);
+        // Compiled outside the lock; a thread that lost the race to insert
+        // drops its copy, which nothing has seen yet.
+        let thunk = crate::thunk::build_typed(guest_va, signature.clone())?;
+        let mut table = self.thunks.write().unwrap_or_else(|e| e.into_inner());
+        let (host, kept) = table.insert_typed(signature, thunk);
+        if kept {
+            self.publish_thunk_view(&table);
+        }
+        drop(table);
         // As in `thunk_for`: handing the pointer out is the demand signal.
         let _ = self.cache.get_or_lift(&self.program, guest_va);
         Ok(host)
@@ -1337,6 +1352,8 @@ impl Vm {
         if let Some(existing) = self.host_thunk_for(guest_va) {
             return Ok(existing);
         }
+        // As for typed thunks: built outside the lock, and the first one
+        // inserted is the one every caller gets.
         let thunk = crate::thunk::build(guest_va)?;
         let host = self.insert_thunk(thunk);
 
@@ -1345,7 +1362,7 @@ impl Vm {
         Ok(host)
     }
 
-    /// How many guest function pointers have been handed to host code.
+    /// How many host thunks exist, including typed variants of one guest address.
     pub fn thunks(&self) -> usize {
         self.thunks.read().unwrap_or_else(|e| e.into_inner()).len()
     }
@@ -1395,7 +1412,14 @@ impl Vm {
     /// Add a thunk and republish the snapshot, both under the one lock.
     fn insert_thunk(&self, thunk: crate::thunk::Thunk) -> u64 {
         let mut table = self.thunks.write().unwrap_or_else(|e| e.into_inner());
-        let host = table.insert(thunk);
+        let (host, kept) = table.insert(thunk);
+        if kept {
+            self.publish_thunk_view(&table);
+        }
+        host
+    }
+
+    fn publish_thunk_view(&self, table: &ThunkTable) {
         let view = Box::leak(Box::new(table.view()));
         let count = view.count;
         self.thunk_view.store(view, Ordering::Release);
@@ -1405,7 +1429,6 @@ impl Vm {
         // An address that meant nothing a moment ago is now a thunk. See
         // [`crate::dispatch::invalidate`].
         crate::dispatch::invalidate();
-        host
     }
 
     /// Record an error raised inside a host->guest callback, on the thread it happened
@@ -1665,28 +1688,71 @@ impl crate::objc::Realizer for Vm {
     }
 }
 
-impl crate::abi::Callbacks for Vm {
-    fn substitute(&self, symbol: &str, va: u64) -> Result<u64, AbiError> {
+/// What a guest-held function pointer is on its way out to host code.
+enum Outbound {
+    /// Already callable by the host, and passed as it is.
+    Host(u64),
+    /// Guest code, which needs a thunk of the callee's chosen kind.
+    Guest(u64),
+}
+
+impl Vm {
+    /// Classify a pointer for [`crate::abi::Callbacks::substitute`] and its typed twin,
+    /// so both apply the same rules.
+    fn outbound(&self, va: u64) -> Outbound {
         if va == 0 {
-            return Ok(0);
+            return Outbound::Host(0);
+        }
+        // A thunk the guest read back out of host-visible state. Its guest
+        // target is what gets a thunk again: the one it came from may have a
+        // different ABI from the one this callee calls through.
+        if let Some(guest) = self.guest_behind_thunk(va) {
+            return Outbound::Guest(guest);
         }
         // One of this runtime's own import stubs, which the guest is holding
         // because a slot it loaded was substituted for one.
         if let Some(host) = crate::trampoline::host_behind(va) {
-            return Ok(host);
+            return Outbound::Host(host);
         }
         // Not guest code: a host pointer the guest is handing back, which the
         // host may compare against one it gave out.
         if !self.program.is_guest_address(va) {
-            return Ok(va);
+            return Outbound::Host(va);
         }
-        self.thunk_for(va).map_err(|e: VmError| AbiError::Refused {
-            symbol: symbol.to_string(),
-            reason: match e {
-                VmError::Thunk { .. } => "a host->guest thunk could not be built",
-                _ => "the guest function pointer could not be made callable",
-            },
-        })
+        Outbound::Guest(va)
+    }
+}
+
+fn thunk_refusal(symbol: &str, e: VmError) -> AbiError {
+    AbiError::Refused {
+        symbol: symbol.to_string(),
+        reason: match e {
+            VmError::Thunk { .. } => "a host->guest thunk could not be built",
+            _ => "the guest function pointer could not be made callable",
+        },
+    }
+}
+
+impl crate::abi::Callbacks for Vm {
+    fn substitute(&self, symbol: &str, va: u64) -> Result<u64, AbiError> {
+        match self.outbound(va) {
+            Outbound::Host(host) => Ok(host),
+            Outbound::Guest(guest) => self.thunk_for(guest).map_err(|e| thunk_refusal(symbol, e)),
+        }
+    }
+
+    fn substitute_typed(
+        &self,
+        symbol: &str,
+        va: u64,
+        signature: crate::thunk::ThunkSignature,
+    ) -> Result<u64, AbiError> {
+        match self.outbound(va) {
+            Outbound::Host(host) => Ok(host),
+            Outbound::Guest(guest) => self
+                .typed_thunk_for(guest, signature)
+                .map_err(|e| thunk_refusal(symbol, e)),
+        }
     }
 
     /// A thunk handed back by host code becomes the guest pointer it stands for.

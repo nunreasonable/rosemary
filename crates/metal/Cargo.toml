@@ -18,3 +18,6 @@ rspirv.workspace = true
 appkit.workspace = true
 sdl3.workspace = true
 static_init.workspace = true
+
+[dev-dependencies]
+sdl3 = { workspace = true, features = ["test-support"] }

@@ -219,13 +219,11 @@ mod darwin {
         };
         // SAFETY: the declaration above is the framework's own, and `address` is
         // the caller's `struct sockaddr` - a host layout on the one host this
-        // reaches. The allocator is passed along; every caller in practice
-        // passes the default, which is null in Apple's CoreFoundation as well as
-        // in this one.
+        // reaches. The allocator is this runtime's, so the host gets its own.
         unsafe {
             let f: unsafe extern "C" fn(CFTypeRef, *const c_void) -> CFTypeRef =
                 std::mem::transmute(f);
-            f(allocator, address)
+            f(crate::api::host_allocator(allocator), address)
         }
     }
 
@@ -241,7 +239,7 @@ mod darwin {
         unsafe {
             let f: unsafe extern "C" fn(CFTypeRef, *const c_void) -> CFTypeRef =
                 std::mem::transmute(f);
-            f(allocator, name)
+            f(crate::api::host_allocator(allocator), name)
         }
     }
 

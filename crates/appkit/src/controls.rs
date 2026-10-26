@@ -1123,6 +1123,20 @@ unsafe extern "C" fn control_tag(receiver: Id, _sel: Sel) -> isize {
     read(buttons(), receiver, slot::TAG) as isize
 }
 
+/// `-[NSButtonCell drawBezelWithFrame:inView:]` draws only the border. The
+/// supplied view is the button whose state controls the bezel appearance.
+unsafe extern "C" fn button_cell_draw_bezel_with_frame(
+    _receiver: Id,
+    _sel: Sel,
+    frame: NSRect,
+    control_view: Id,
+) {
+    if control_view.is_null() {
+        return;
+    }
+    draw_button(control_view, frame, false);
+}
+
 /// The bezel of a bordered button and its title, which is how a text button
 /// built in Interface Builder looks. An image button that is not bordered
 /// draws neither.
@@ -1130,21 +1144,53 @@ unsafe extern "C" fn control_tag(receiver: Id, _sel: Sel) -> isize {
 /// FIXME (ACCURACY): one rounded, lightly shaded bezel stands in for every
 /// `NSBezelStyle`; Apple's artwork differs per style.
 fn draw_bezel_and_title(receiver: Id) {
+    draw_button(receiver, view::bounds_of(receiver), true);
+}
+
+fn draw_button(receiver: Id, frame: NSRect, draw_title: bool) {
+    let Some((pixels, width, height)) = button_surface(receiver, frame, draw_title) else {
+        return;
+    };
+    crate::backing::draw_image(
+        &pixels,
+        width,
+        height,
+        frame.size,
+        frame,
+        NSRect {
+            origin: NSPoint::default(),
+            size: frame.size,
+        },
+        // Source-over.
+        2,
+        1.0,
+        true,
+    );
+}
+
+fn button_surface(
+    receiver: Id,
+    frame: NSRect,
+    draw_title: bool,
+) -> Option<(Vec<u8>, usize, usize)> {
     let bordered = read(buttons(), receiver, slot::NOT_BORDERED) == 0;
-    let title = button_text(receiver);
+    let title = if draw_title {
+        button_text(receiver)
+    } else {
+        String::new()
+    };
     if !bordered && title.is_empty() {
-        return;
+        return None;
     }
-    let bounds = view::bounds_of(receiver);
     let density = crate::backing::focus_density();
-    let width = (bounds.size.width * density).ceil() as usize;
-    let height = (bounds.size.height * density).ceil() as usize;
+    let width = (frame.size.width * density).ceil() as usize;
+    let height = (frame.size.height * density).ceil() as usize;
     if width == 0 || height == 0 {
-        return;
+        return None;
     }
     let mut pixels = vec![0u8; width * height * 4];
     let mut canvas = chrome::Canvas::new(&mut pixels, width, height, width * 4, density as f32);
-    let (w, h) = (bounds.size.width as f32, bounds.size.height as f32);
+    let (w, h) = (frame.size.width as f32, frame.size.height as f32);
     let pressed = read(buttons(), receiver, slot::HIGHLIGHTED) != 0;
     let enabled = read(buttons(), receiver, slot::DISABLED) == 0;
     if bordered {
@@ -1183,21 +1229,7 @@ fn draw_bezel_and_title(receiver: Id) {
             chrome::Color::rgba(0, 0, 0, alpha),
         );
     }
-    crate::backing::draw_image(
-        &pixels,
-        width,
-        height,
-        bounds.size,
-        bounds,
-        NSRect {
-            origin: NSPoint::default(),
-            size: bounds.size,
-        },
-        // Source-over.
-        2,
-        1.0,
-        true,
-    );
+    Some((pixels, width, height))
 }
 
 /// A check box or radio button: its box, its mark and its title beside it.
@@ -1592,6 +1624,7 @@ fn send_button_action(receiver: Id) {
     if read(buttons(), receiver, slot::DISABLED) != 0 {
         return;
     }
+    crate::bindings::control_changed(receiver);
     let action = read(buttons(), receiver, slot::ACTION) as Sel;
     let app = crate::application::shared();
     if action.is_null() || app.is_null() {
@@ -1927,6 +1960,101 @@ fn new_view(class: Id) -> Option<Id> {
     (!object.is_null()).then(|| objc::arc::autorelease(object))
 }
 
+fn send_word(receiver: Id, selector: &str, value: usize) {
+    // SAFETY: every selector this is used with is `void (id, SEL, NSUInteger)`
+    // or takes a BOOL, which the ABI passes in the same register.
+    unsafe {
+        let f: unsafe extern "C" fn(Id, Sel, usize) = std::mem::transmute(objc::msg::entry());
+        f(receiver, objc::sel::get(selector), value);
+    }
+}
+
+/// A button of `kind` titled `title`, sized to fit, for the `+...WithTitle:`
+/// constructors.
+fn titled_button(class: Id, title: Id, target: Id, action: Sel, kind: usize) -> Id {
+    let Some(button) = new_view(class) else {
+        return std::ptr::null_mut();
+    };
+    send_word(button, "setButtonType:", kind);
+    if kind == button_type::MOMENTARY_PUSH_IN {
+        // `NSBezelStyleRounded`.
+        send_word(button, "setBezelStyle:", 1);
+    }
+    send_object(button, "setTitle:", title);
+    send_object(button, "setTarget:", target);
+    // SAFETY: `-setAction:` is `void (id, SEL, SEL)`, and `-sizeToFit`
+    // `void (id, SEL)`.
+    unsafe {
+        let f: unsafe extern "C" fn(Id, Sel, Sel) = std::mem::transmute(objc::msg::entry());
+        f(button, objc::sel::get("setAction:"), action);
+        let f: unsafe extern "C" fn(Id, Sel) = std::mem::transmute(objc::msg::entry());
+        f(button, objc::sel::get("sizeToFit"));
+    }
+    button
+}
+
+/// `+buttonWithTitle:target:action:`: a rounded push button.
+unsafe extern "C" fn button_with_title(
+    class: Id,
+    _sel: Sel,
+    title: Id,
+    target: Id,
+    action: Sel,
+) -> Id {
+    titled_button(class, title, target, action, button_type::MOMENTARY_PUSH_IN)
+}
+
+unsafe extern "C" fn checkbox_with_title(
+    class: Id,
+    _sel: Sel,
+    title: Id,
+    target: Id,
+    action: Sel,
+) -> Id {
+    titled_button(class, title, target, action, button_type::SWITCH)
+}
+
+/// `-setAttributedAlternateTitle:`. Kept, and shown as its characters: a
+/// button here draws its alternate title as plain text.
+unsafe extern "C" fn button_set_attributed_alternate_title(receiver: Id, sel: Sel, value: Id) {
+    // SAFETY: the property's own setter and getter selectors.
+    unsafe { crate::props::set_copied(receiver, sel, value) };
+    let string = match value.is_null() {
+        true => std::ptr::null_mut(),
+        // SAFETY: `-string` is `id (id, SEL)` on an attributed string.
+        false => unsafe {
+            let f: unsafe extern "C" fn(Id, Sel) -> Id = std::mem::transmute(objc::msg::entry());
+            f(value, objc::sel::get("string"))
+        },
+    };
+    // SAFETY: the receiver is a button and the argument an NSString or nil.
+    unsafe { button_set_alternate_title(receiver, objc::sel::get("setAlternateTitle:"), string) };
+}
+
+/// `+stackViewWithViews:`: a horizontal stack arranging `views` in order.
+unsafe extern "C" fn stack_with_views(class: Id, _sel: Sel, views: Id) -> Id {
+    let Some(stack) = new_view(class) else {
+        return std::ptr::null_mut();
+    };
+    // SAFETY: an array, or nil.
+    if let Some(array) = unsafe { corefoundation::collections::array(views as _) } {
+        for view in array.values.clone() {
+            arrange_view(stack, view as Id, 1);
+        }
+    }
+    stack
+}
+
+/// `-isDisplayedWhenStopped`, stored inverted: AppKit's default is YES.
+/// FIXME (ACCURACY): kept only; an indicator here draws nothing either way.
+unsafe extern "C" fn indicator_set_displayed_when_stopped(receiver: Id, _sel: Sel, value: u8) {
+    crate::props::set_integer_of(receiver, "hiddenWhenStopped", usize::from(value == 0));
+}
+
+unsafe extern "C" fn indicator_is_displayed_when_stopped(receiver: Id, _sel: Sel) -> u8 {
+    u8::from(crate::props::integer(receiver, "hiddenWhenStopped") == 0)
+}
+
 /// `+buttonWithImage:target:action:`, sized to the image as AppKit sizes it to
 /// fit.
 unsafe extern "C" fn button_with_image(
@@ -2216,6 +2344,9 @@ pub(crate) fn install() {
         "removeArrangedSubview:" => stack_remove_arranged_subview, c"v24@0:8@16";
         "arrangedSubviews" => stack_arranged_subviews, c"@16@0:8";
     });
+    class_methods!(class, {
+        "stackViewWithViews:" => stack_with_views, c"@24@0:8@16";
+    });
 
     let class = objc::class::lookup(c"NSBox").expect("declared before its methods");
     methods!(class, {
@@ -2252,6 +2383,11 @@ pub(crate) fn install() {
         "stopAnimation:" => indicator_stop_animation, c"v24@0:8@16";
         "setDoubleValue:" => indicator_set_double_value, c"v24@0:8d16";
         "doubleValue" => indicator_double_value, c"d16@0:8";
+        "setDisplayedWhenStopped:" => indicator_set_displayed_when_stopped, c"v20@0:8c16";
+        "isDisplayedWhenStopped" => indicator_is_displayed_when_stopped, c"c16@0:8";
+        // FIXME (ACCURACY): kept, and not drawn: an indicator draws nothing.
+        "controlSize" => crate::props::get_integer, c"Q16@0:8";
+        "setControlSize:" => crate::props::set_integer, c"v24@0:8Q16";
     });
 
     // Every control has a target and an action; a subclass a program writes
@@ -2271,11 +2407,21 @@ pub(crate) fn install() {
         "setContinuous:" => control_ignored_flag, c"v20@0:8c16";
         "isContinuous" => control_no, c"c16@0:8";
         "sendActionOn:" => control_send_action_on, c"q24@0:8Q16";
+        // FIXME (ACCURACY): kept, and not drawn: controls here draw at the
+        // regular size.
+        "controlSize" => crate::props::get_integer, c"Q16@0:8";
+        "setControlSize:" => crate::props::set_integer, c"v24@0:8Q16";
+        // FIXME (ACCURACY): kept, not applied: a field shows its string value
+        // as set, unformatted.
+        "formatter" => crate::props::get_object, c"@16@0:8";
+        "setFormatter:" => crate::props::set_retained, c"v24@0:8@16";
     });
 
     let class = objc::class::lookup(c"NSButton").expect("declared before its methods");
     class_methods!(class, {
         "buttonWithImage:target:action:" => button_with_image, c"@40@0:8@16@24:32";
+        "buttonWithTitle:target:action:" => button_with_title, c"@40@0:8@16@24:32";
+        "checkboxWithTitle:target:action:" => checkbox_with_title, c"@40@0:8@16@24:32";
     });
     methods!(class, {
         "setImage:" => button_set_image, c"v24@0:8@16";
@@ -2318,6 +2464,8 @@ pub(crate) fn install() {
         "font" => button_font, c"@16@0:8";
         "setAlternateTitle:" => button_set_alternate_title, c"v24@0:8@16";
         "alternateTitle" => button_alternate_title, c"@16@0:8";
+        "setAttributedAlternateTitle:" => button_set_attributed_alternate_title, c"v24@0:8@16";
+        "attributedAlternateTitle" => crate::props::get_object, c"@16@0:8";
         "setAttributedTitle:" => button_set_attributed_title, c"v24@0:8@16";
         "attributedTitle" => button_attributed_title, c"@16@0:8";
         "setKeyEquivalent:" => button_set_key_equivalent, c"v24@0:8@16";
@@ -2332,6 +2480,12 @@ pub(crate) fn install() {
         "performClick:" => button_perform_click, c"v24@0:8@16";
         "mouseDown:" => button_mouse_down, c"v24@0:8@16";
         "mouseUp:" => button_mouse_up, c"v24@0:8@16";
+    });
+
+    let class = objc::class::lookup(c"NSButtonCell").expect("declared before its methods");
+    methods!(class, {
+        "drawBezelWithFrame:inView:" => button_cell_draw_bezel_with_frame,
+            c"v56@0:8{CGRect={CGPoint=dd}{CGSize=dd}}16@48";
     });
 
     let class = objc::class::lookup(c"NSImageView").expect("declared before its methods");
@@ -2384,6 +2538,45 @@ pub(crate) fn install() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn button_cell_draw_bezel_uses_its_frame_and_control_view() {
+        crate::bootstrap();
+        let button_class = objc::class::lookup(c"NSButton").expect("NSButton");
+        let button = objc::object::create_instance(button_class, 0);
+        write(buttons(), button, slot::NOT_BORDERED, 0);
+
+        let cell = crate::cell::cell_of(button);
+        let cell_class = objc::class::lookup(c"NSButtonCell").expect("NSButtonCell");
+        let selector = objc::sel::get("drawBezelWithFrame:inView:");
+        let method = cell_class
+            .method(selector)
+            .expect("button-cell bezel method");
+        // SAFETY: the registered IMP and type encoding match this Objective-C signature.
+        assert_eq!(
+            unsafe { std::ffi::CStr::from_ptr(method.types()) },
+            c"v56@0:8{CGRect={CGPoint=dd}{CGSize=dd}}16@48"
+        );
+
+        let frame = NSRect {
+            origin: NSPoint { x: 3.0, y: 5.0 },
+            size: NSSize {
+                width: 24.0,
+                height: 16.0,
+            },
+        };
+        let (pixels, width, height) =
+            button_surface(button, frame, false).expect("bordered buttons have a bezel");
+        assert_eq!((width, height), (24, 16));
+        assert!(pixels.chunks_exact(4).any(|pixel| pixel[3] != 0));
+
+        // SAFETY: the selector is registered above and receives a live button cell,
+        // a CGRect, and the NSButton that owns that cell.
+        let draw: unsafe extern "C" fn(Id, Sel, NSRect, Id) =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        unsafe { draw(cell, selector, frame, button) };
+        objc::arc::release(button);
+    }
 
     #[test]
     fn button_title_is_retained_and_read_back() {

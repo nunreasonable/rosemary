@@ -235,6 +235,9 @@ pub struct RunLoop {
     /// loop runs inside the default one, and `CFRunLoopCopyCurrentMode` names
     /// the inner.
     running: Mutex<Vec<String>>,
+    /// `CFRunLoopPerformBlock`'s blocks: each a copy this loop owns, and the
+    /// modes it may run in.
+    blocks: Mutex<Vec<(Vec<String>, usize)>>,
 }
 
 pub const DEFAULT_MODE: &str = "kCFRunLoopDefaultMode";
@@ -259,7 +262,45 @@ impl RunLoop {
             waker: (Mutex::new(false), Condvar::new()),
             waiting: AtomicBool::new(false),
             running: Mutex::new(Vec::new()),
+            blocks: Mutex::new(Vec::new()),
         }
+    }
+
+    /// Queue `block`, a copy this loop takes over, to run the next time the
+    /// loop turns in one of `modes`.
+    pub fn perform_block(&self, modes: &[String], block: usize) {
+        let mut names = Vec::new();
+        for mode in modes {
+            names.extend(self.names(mode));
+        }
+        self.blocks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push((names, block));
+    }
+
+    /// Run the queued blocks that may run in `mode`; true if any ran.
+    fn run_blocks(&self, mode: &str) -> bool {
+        let due: Vec<usize> = {
+            let mut blocks = self.blocks.lock().unwrap_or_else(|e| e.into_inner());
+            let (due, kept) = blocks
+                .drain(..)
+                .partition::<Vec<_>, _>(|(modes, _)| modes.iter().any(|m| m == mode));
+            *blocks = kept;
+            due.into_iter().map(|(_, block)| block).collect()
+        };
+        for block in &due {
+            // SAFETY: a `void (^)(void)` copied by `CFRunLoopPerformBlock`,
+            // whose `invoke` takes the block alone.
+            unsafe {
+                if let Some(invoke) = objc::block::invoke(*block as objc::object::Id) {
+                    let f: unsafe extern "C" fn(usize) = std::mem::transmute(invoke);
+                    f(*block);
+                }
+            }
+            objc::block::release(*block as objc::object::Id);
+        }
+        !due.is_empty()
     }
 
     /// The mode the innermost run in progress is in, or `None` when the loop
@@ -570,13 +611,18 @@ impl RunLoop {
             let mut handled = false;
             crate::socket::poll();
             self.observe(mode, activity::BEFORE_TIMERS);
+            // A fired timer is not a handled *source*: `returnAfterSourceHandled`
+            // concerns sources alone, and a loop whose timer is always due (tao's
+            // `ControlFlow::Poll`) must still reach `BeforeWaiting`, where toolkits
+            // drain the work other threads queued for them.
             for timer in &timers {
-                handled |= timer.fire(now);
+                timer.fire(now);
             }
             self.observe(mode, activity::BEFORE_SOURCES);
             for source in &sources {
                 handled |= source.fire();
             }
+            handled |= self.run_blocks(mode);
             if handled && return_after_source {
                 self.observe(mode, activity::EXIT);
                 return result::HANDLED_SOURCE;
@@ -724,24 +770,29 @@ static MAIN: Mutex<Option<Arc<RunLoop>>> = Mutex::new(None);
 /// "First caller" is not the main thread: Unity's joystick thread asks for its
 /// own loop before the main thread does, and main-loop timers then fired there.
 pub fn current() -> Arc<RunLoop> {
-    CURRENT.with(|cell| {
-        Arc::clone(cell.get_or_init(|| {
-            // SAFETY: no arguments; answers from thread ids.
-            let made = match unsafe { darwin::pthread::main_np() } != 0 {
+    // SAFETY: no arguments; answers from thread ids.
+    let on_main = || unsafe { darwin::pthread::main_np() } != 0;
+    CURRENT
+        .try_with(|cell| {
+            Arc::clone(cell.get_or_init(|| match on_main() {
                 true => main(),
                 false => fresh(),
-            };
-            if std::env::var_os("ROSEMARY_TRACE_RUNLOOP").is_some() {
-                eprintln!(
-                    "rosemary: runloop: thread {} gets {:p} (main {:p})",
-                    darwin::pthread::id(),
-                    Arc::as_ptr(&made),
-                    Arc::as_ptr(&main()),
-                );
+            }))
+        })
+        .unwrap_or_else(|_| {
+            // Asked from a destructor as the thread exits - a guest's `atexit`
+            // handler, say - when this thread's slot is already gone. The
+            // pointer the caller gets must stay valid, so a loop made now is
+            // kept for the rest of the process.
+            match on_main() {
+                true => main(),
+                false => {
+                    let loop_ = fresh();
+                    std::mem::forget(Arc::clone(&loop_));
+                    loop_
+                }
             }
-            made
-        }))
-    })
+        })
 }
 
 /// The main thread's run loop, made if nothing has asked for it yet.
@@ -1094,5 +1145,37 @@ mod tests {
         loop_.remove_source(&source, COMMON_MODES);
         assert_eq!(loop_.run_in_mode("Modal", 0.0, true), result::FINISHED);
         assert_eq!(loop_.run_in_mode(DEFAULT_MODE, 0.0, true), result::FINISHED);
+    }
+
+    /// tao runs `ControlFlow::Poll` with a timer that is always due and drains
+    /// work other threads queued for it from `BeforeWaiting`. A fired timer is not
+    /// a handled source, so a run that returns after one must still get there.
+    #[test]
+    fn a_due_timer_does_not_end_a_return_after_source_run_early() {
+        thread_local! {
+            static SEEN: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+        }
+        unsafe extern "C" fn observer(_: CFTypeRef, what: u32, _: *mut c_void) {
+            if what == activity::BEFORE_WAITING {
+                SEEN.with(|s| s.set(s.get() + 1));
+            }
+        }
+        unsafe extern "C" fn timer_cb(_: CFTypeRef, _: *mut c_void) {}
+        let loop_ = Arc::new(RunLoop::new());
+        loop_.add_observer(
+            &new_observer(activity::BEFORE_WAITING, true, 0, Some(observer), 0),
+            DEFAULT_MODE,
+        );
+        loop_.add_timer(
+            &new_timer(
+                Duration::ZERO,
+                Some(Duration::from_millis(1)),
+                Some(timer_cb),
+                0,
+            ),
+            DEFAULT_MODE,
+        );
+        loop_.run_in_mode(DEFAULT_MODE, 0.01, true);
+        assert!(SEEN.with(|s| s.get()) > 0);
     }
 }

@@ -1,6 +1,15 @@
 use super::*;
+use std::sync::atomic::Ordering;
 
 impl Gpu {
+    /// Test controlled device-wide queue contention while AppKit presents
+    /// another window. No guest or production path calls this.
+    #[cfg(test)]
+    pub(crate) fn with_queue_locked_for_test(&self, body: impl FnOnce()) {
+        let _queue = self.queue.lock().expect("Vulkan queue");
+        body();
+    }
+
     pub fn push_descriptor_api(&self) -> Option<&ash::khr::push_descriptor::Device> {
         self.push_descriptor_api.as_ref()
     }
@@ -11,6 +20,9 @@ impl Gpu {
         command_buffer: vk::CommandBuffer,
         fence: vk::Fence,
     ) -> Result<(), String> {
+        if self.lost.load(Ordering::Acquire) {
+            return Err("Vulkan logical device is lost".into());
+        }
         let buffers = [command_buffer];
         let submit = vk::SubmitInfo::default().command_buffers(&buffers);
         {
@@ -20,8 +32,12 @@ impl Gpu {
             unsafe { self.device.reset_fences(&[fence]) }
                 .map_err(|error| format!("vkResetFences failed with {error:?}"))?;
             // SAFETY: as above; the command buffer has finished recording.
-            unsafe { self.device.queue_submit(*queue, &[submit], fence) }
-                .map_err(|error| format!("vkQueueSubmit failed with {error:?}"))?;
+            if let Err(error) = unsafe { self.device.queue_submit(*queue, &[submit], fence) } {
+                if error == vk::Result::ERROR_DEVICE_LOST {
+                    crate::swapchain::record_device_loss(self);
+                }
+                return Err(format!("vkQueueSubmit failed with {error:?}"));
+            }
         }
         // Outside the queue lock: this destroys buffers and images.
         self.retire_deferred();
@@ -87,6 +103,9 @@ impl Gpu {
         wait: &[(vk::Semaphore, vk::PipelineStageFlags)],
         signal: &[vk::Semaphore],
     ) -> Result<(), String> {
+        if self.lost.load(Ordering::Acquire) {
+            return Err("Vulkan logical device is lost".into());
+        }
         let buffers = [command_buffer];
         let wait_semaphores = wait.iter().map(|(s, _)| *s).collect::<Vec<_>>();
         let wait_stages = wait.iter().map(|(_, stage)| *stage).collect::<Vec<_>>();
@@ -103,8 +122,48 @@ impl Gpu {
             .map_err(|error| format!("vkResetFences failed with {error:?}"))?;
         // SAFETY: as above; the command buffer has finished recording and
         // every borrowed slice lives across the call.
-        unsafe { self.device.queue_submit(*queue, &[submit], fence) }
-            .map_err(|error| format!("vkQueueSubmit failed with {error:?}"))
+        let result = unsafe { self.device.queue_submit(*queue, &[submit], fence) };
+        if matches!(result, Err(vk::Result::ERROR_DEVICE_LOST)) {
+            crate::swapchain::record_device_loss(self);
+        }
+        result.map_err(|error| format!("vkQueueSubmit failed with {error:?}"))
+    }
+
+    /// Recover from a failed vkQueueSubmit after successful image acquisition.
+    /// A failed submission does not consume the acquisition semaphore; a
+    /// synchronization-only submission waits for its WSI signal without
+    /// referencing an image or replaying the failed command buffer.
+    /// Reuse is permitted only after the recovery fence has signaled.
+    pub fn consume_acquired_semaphore(
+        &self,
+        acquired: vk::Semaphore,
+        fence: vk::Fence,
+    ) -> Result<(), String> {
+        if self.lost.load(Ordering::Acquire) {
+            return Err("Vulkan logical device is lost".into());
+        }
+        let semaphores = [acquired];
+        let stages = [vk::PipelineStageFlags::TOP_OF_PIPE];
+        let submit = vk::SubmitInfo::default()
+            .wait_semaphores(&semaphores)
+            .wait_dst_stage_mask(&stages);
+        {
+            let queue = self.queue.lock().expect("Vulkan queue");
+            // The failed render submission did not associate the fence with
+            // queued work. Reset here even if recording failed before the
+            // original vkResetFences operation.
+            self.fence_result(
+                unsafe { self.device.reset_fences(&[fence]) },
+                "vkResetFences",
+            )?;
+            if let Err(error) = unsafe { self.device.queue_submit(*queue, &[submit], fence) } {
+                if error == vk::Result::ERROR_DEVICE_LOST {
+                    crate::swapchain::record_device_loss(self);
+                }
+                return Err(format!("vkQueueSubmit acquire recovery failed: {error:?}"));
+            }
+        }
+        self.wait(fence)
     }
 
     /// Queue one swapchain image for presentation.
@@ -119,6 +178,9 @@ impl Gpu {
         wait: vk::Semaphore,
         fence: Option<vk::Fence>,
     ) -> Result<bool, vk::Result> {
+        if self.lost.load(Ordering::Acquire) {
+            return Err(vk::Result::ERROR_DEVICE_LOST);
+        }
         let api = self
             .swapchain_api
             .as_ref()
@@ -137,10 +199,16 @@ impl Gpu {
             fence_info = vk::SwapchainPresentFenceInfoEXT::default().fences(&fences);
             info = info.push_next(&mut fence_info);
         }
+        let _commits = sdl3::video::vulkan::surface_commit_guard();
+        let _wsi = self.wsi.lock().expect("Vulkan WSI");
         let queue = self.queue.lock().expect("Vulkan queue");
         // SAFETY: the queue is held exclusively, every borrowed slice lives
         // across the call, and the image was acquired from this swapchain.
-        unsafe { api.queue_present(*queue, &info) }
+        let result = unsafe { api.queue_present(*queue, &info) };
+        if matches!(result, Err(vk::Result::ERROR_DEVICE_LOST)) {
+            crate::swapchain::record_device_loss(self);
+        }
+        result
     }
 
     /// Wait until the queue has finished everything submitted to it,
@@ -158,12 +226,42 @@ impl Gpu {
         let _ = unsafe { self.device.queue_wait_idle(*queue) };
     }
 
+    /// Every fence query and wait must publish device loss just like queue
+    /// submission. The same device can back more than one SDL window.
+    pub fn fence_result<T>(
+        &self,
+        result: Result<T, vk::Result>,
+        operation: &str,
+    ) -> Result<T, String> {
+        result.map_err(|error| {
+            if error == vk::Result::ERROR_DEVICE_LOST {
+                crate::swapchain::record_device_loss(self);
+            }
+            format!("{operation} failed with {error:?}")
+        })
+    }
+
+    pub fn fence_signaled(&self, fence: vk::Fence) -> Result<bool, String> {
+        // SAFETY: this GPU owns the live fence.
+        self.fence_result(
+            unsafe { self.device.get_fence_status(fence) },
+            "vkGetFenceStatus",
+        )
+    }
+
+    pub fn wait_fence_timeout(&self, fence: vk::Fence, timeout: u64) -> Result<bool, String> {
+        // SAFETY: this GPU owns the live fence.
+        match unsafe { self.device.wait_for_fences(&[fence], true, timeout) } {
+            Ok(()) => Ok(true),
+            Err(vk::Result::TIMEOUT) => Ok(false),
+            Err(error) => self.fence_result(Err(error), "vkWaitForFences"),
+        }
+    }
+
     /// Wait for a submitted command buffer's fence.
     pub fn wait(&self, fence: vk::Fence) -> Result<(), String> {
         crate::stats::timed(crate::stats::Counter::FenceWaitMicros, || {
-            // SAFETY: the fence belongs to this device and the submission above.
-            unsafe { self.device.wait_for_fences(&[fence], true, u64::MAX) }
-                .map_err(|error| format!("vkWaitForFences failed with {error:?}"))
+            self.wait_fence_timeout(fence, u64::MAX).map(|_| ())
         })
     }
 
@@ -183,6 +281,9 @@ impl Gpu {
     /// putting a fresh texture into a usable layout, and copying bytes a guest
     /// handed to `-replaceRegion:`. Those go through here.
     pub fn one_shot(&self, body: impl FnOnce(&Device, vk::CommandBuffer)) -> Result<(), String> {
+        if self.lost.load(Ordering::Acquire) {
+            return Err("Vulkan logical device is lost".into());
+        }
         crate::stats::count(crate::stats::Counter::ImmediateCalls);
         crate::stats::timed(crate::stats::Counter::ImmediateMicros, || {
             self.one_shot_inner(body)

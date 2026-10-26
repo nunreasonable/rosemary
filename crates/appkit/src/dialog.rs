@@ -610,6 +610,9 @@ fn modal_loop(dialog: &mut Dialog) -> (usize, bool) {
         // for as long as the dialog is up.
         crate::opengl::release_for_other_threads();
         crate::script::run();
+        // Modal input restrictions do not suspend SDL surface creation or
+        // completion of Metal readbacks on the video thread.
+        crate::event::service_modal_presentation();
         let scripted = MODAL.with_borrow_mut(|modal| modal.as_mut()?.1.pop_front());
         let Some(event) = scripted.or_else(|| sdl3::video::wait(50)) else {
             continue;

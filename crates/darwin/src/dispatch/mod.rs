@@ -93,20 +93,6 @@ fn main_queue() -> u64 {
     queue::main_queue()
 }
 
-/// `void dispatch_resume(dispatch_object_t)`. Only sources are ever
-/// suspended here: a queue's suspend count is not kept, so resuming one has
-/// nothing to undo.
-unsafe extern "C" fn resume(object: u64) {
-    source::resume(object);
-}
-
-/// `void dispatch_suspend(dispatch_object_t)`.
-///
-/// FIXME (ACCURACY): a queue is not suspended - its work keeps running.
-unsafe extern "C" fn suspend(object: u64) {
-    source::suspend(object);
-}
-
 /// `void dispatch_activate(dispatch_object_t)`: an inactive object is a
 /// suspended one that this resumes once.
 unsafe extern "C" fn activate(object: u64) {
@@ -174,8 +160,8 @@ exports::exports! {
         "dispatch_set_context" => object::set_context,
         "dispatch_get_context" => object::get_context,
         "dispatch_set_finalizer_f" => object::set_finalizer_f,
-        "dispatch_resume" => resume,
-        "dispatch_suspend" => suspend,
+        "dispatch_resume" => queue::resume,
+        "dispatch_suspend" => queue::suspend,
         "dispatch_activate" => activate,
         "dispatch_queue_attr_make_with_qos_class" => queue_attr_make_with_qos_class,
         "dispatch_walltime" => walltime,

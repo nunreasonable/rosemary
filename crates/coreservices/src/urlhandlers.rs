@@ -17,15 +17,8 @@ pub unsafe extern "C" fn LSRegisterURL(_url: *const c_void, _update: u8) -> i32 
     NO_ERR
 }
 
-/// `OSStatus LSSetDefaultHandlerForURLScheme(CFStringRef scheme, CFStringRef
-/// bundleID)`.
-pub unsafe extern "C" fn LSSetDefaultHandlerForURLScheme(_scheme: *const c_void, _bundle: *const c_void) -> i32 {
-    NO_ERR
-}
-
 exports::exports! {
     functions {
         "LSRegisterURL" => LSRegisterURL,
-        "LSSetDefaultHandlerForURLScheme" => LSSetDefaultHandlerForURLScheme,
     }
 }

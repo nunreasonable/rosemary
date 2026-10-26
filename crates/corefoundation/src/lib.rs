@@ -9,6 +9,7 @@
 
 pub mod api;
 pub mod base;
+pub mod boxed;
 pub mod calendar;
 pub mod callbacks;
 pub mod collections;
@@ -93,6 +94,8 @@ exports::exports! {
         "CFStringCreateMutableCopy" => api::CFStringCreateMutableCopy,
         "CFStringUppercase" => api::CFStringUppercase,
         "CFStringLowercase" => api::CFStringLowercase,
+        "CFStringNormalize" => api::CFStringNormalize,
+        "CFStringTransform" => api::CFStringTransform,
         "CFStringGetCharacterAtIndex" => api::CFStringGetCharacterAtIndex,
         "CFStringGetCharacters" => api::CFStringGetCharacters,
         "CFStringGetCharactersPtr" => api::CFStringGetCharactersPtr,
@@ -116,6 +119,7 @@ exports::exports! {
         "CFArrayCreateMutable" => api::CFArrayCreateMutable,
         "CFArrayAppendValue" => api::CFArrayAppendValue,
         "CFArrayExchangeValuesAtIndices" => api::CFArrayExchangeValuesAtIndices,
+        "CFArraySortValues" => api::CFArraySortValues,
         "CFArrayCreateCopy" => api::CFArrayCreateCopy,
         "CFArrayCreateMutableCopy" => api::CFArrayCreateMutableCopy,
         "CFArrayInsertValueAtIndex" => api::CFArrayInsertValueAtIndex,
@@ -135,6 +139,7 @@ exports::exports! {
         "CFDictionaryGetValue" => api::CFDictionaryGetValue,
         "CFDictionaryGetValueIfPresent" => api::CFDictionaryGetValueIfPresent,
         "CFDictionaryContainsKey" => api::CFDictionaryContainsKey,
+        "CFDictionaryContainsValue" => api::CFDictionaryContainsValue,
         "CFDictionaryGetKeysAndValues" => api::CFDictionaryGetKeysAndValues,
         "CFDictionaryCreateMutable" => api::CFDictionaryCreateMutable,
         "CFDictionarySetValue" => api::CFDictionarySetValue,
@@ -204,6 +209,7 @@ exports::exports! {
         "CFRunLoopRun" => api::CFRunLoopRun,
         "CFRunLoopStop" => api::CFRunLoopStop,
         "CFRunLoopWakeUp" => api::CFRunLoopWakeUp,
+        "CFRunLoopPerformBlock" => api::CFRunLoopPerformBlock,
         "CFRunLoopSourceCreate" => api::CFRunLoopSourceCreate,
         "CFRunLoopSourceSignal" => api::CFRunLoopSourceSignal,
         "CFRunLoopSourceInvalidate" => api::CFRunLoopSourceInvalidate,
@@ -279,10 +285,9 @@ exports::exports! {
 /// **variable**: the guest loads the symbol's address and then loads the object
 /// out of it, so those go through [`base::global_cell`].
 ///
-/// `kCFAllocatorDefault` and its relatives are cells holding null. Null *is* the
-/// default allocator in Apple's CoreFoundation, and this runtime has only the
-/// one - so a guest comparing against it, or passing it along, gets the right
-/// answer.
+/// `kCFAllocatorDefault` is NULL. Other standard allocator globals are
+/// distinct immortal CF objects, allowing callers to distinguish malloc-backed
+/// choices from custom allocator callbacks and kCFAllocatorNull.
 pub fn data_symbols() -> Vec<(String, u64)> {
     bootstrap();
     static EMPTY_ARRAY: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
@@ -345,14 +350,26 @@ pub fn data_symbols() -> Vec<(String, u64)> {
         "_kCFAbsoluteTimeIntervalSince1970".to_string(),
         &INTERVAL_SINCE_1970 as *const f64 as usize as u64,
     ));
-    for name in [
-        "_kCFAllocatorDefault",
-        "_kCFAllocatorSystemDefault",
-        "_kCFAllocatorMalloc",
-        "_kCFAllocatorMallocZone",
-        "_kCFAllocatorNull",
+    out.push((
+        "_kCFAllocatorDefault".to_string(),
+        base::global_cell("_kCFAllocatorDefault", 0),
+    ));
+    for (name, kind) in [
+        (
+            "_kCFAllocatorSystemDefault",
+            api::StandardAllocator::SystemDefault,
+        ),
+        ("_kCFAllocatorMalloc", api::StandardAllocator::Malloc),
+        (
+            "_kCFAllocatorMallocZone",
+            api::StandardAllocator::MallocZone,
+        ),
+        ("_kCFAllocatorNull", api::StandardAllocator::Null),
     ] {
-        out.push((name.to_string(), base::global_cell(name, 0)));
+        out.push((
+            name.to_string(),
+            base::global_cell(name, api::standard_allocator(kind) as usize as u64),
+        ));
     }
     // The run loop's mode names, which a guest passes straight back in and
     // which `CFRunLoopAddSource` compares as strings.
@@ -370,6 +387,21 @@ pub fn data_symbols() -> Vec<(String, u64)> {
         out.push((
             name.to_string(),
             base::global_cell(name, base::interned_name(mode)),
+        ));
+    }
+    for (symbol, text) in [
+        (
+            "_kCFStringTransformStripCombiningMarks",
+            api::TRANSFORM_STRIP_COMBINING_MARKS,
+        ),
+        (
+            "_kCFStringTransformStripDiacritics",
+            api::TRANSFORM_STRIP_DIACRITICS,
+        ),
+    ] {
+        out.push((
+            symbol.to_string(),
+            base::global_cell(symbol, base::interned_name(text)),
         ));
     }
     // The string-valued globals, each of which is exactly its own name without
@@ -430,7 +462,10 @@ static KEY_STRINGS: &[(&str, &str)] = &[
     ("__kCFSystemVersionProductNameKey", "ProductName"),
     ("__kCFSystemVersionProductVersionKey", "ProductVersion"),
     ("__kCFSystemVersionBuildVersionKey", "ProductBuildVersion"),
-    ("__kCFSystemVersionProductVersionExtraKey", "ProductVersionExtra"),
+    (
+        "__kCFSystemVersionProductVersionExtraKey",
+        "ProductVersionExtra",
+    ),
     // CFError.c's user-info keys, which are Foundation's.
     ("_kCFErrorDescriptionKey", "NSDescription"),
     ("_kCFErrorLocalizedDescriptionKey", "NSLocalizedDescription"),
@@ -493,11 +528,79 @@ mod tests {
     use std::ffi::c_char;
 
     #[test]
-    fn custom_allocator_has_identity_but_default_is_null() {
+    fn exported_standard_allocators_keep_distinct_identities() {
+        bootstrap();
+        let names = data_symbols();
+        let get = |name: &str| -> api::CFAllocatorRef {
+            let address = names.iter().find(|(n, _)| n == name).unwrap().1;
+            // SAFETY: these globals are stable, pointer-sized cells.
+            unsafe { *(address as *const api::CFAllocatorRef) }
+        };
+        assert!(get("_kCFAllocatorDefault").is_null());
+        let system = get("_kCFAllocatorSystemDefault");
+        let malloc = get("_kCFAllocatorMalloc");
+        let zone = get("_kCFAllocatorMallocZone");
+        let null = get("_kCFAllocatorNull");
+        assert!(!system.is_null());
+        assert_ne!(system, malloc);
+        assert_ne!(system, zone);
+        assert_ne!(malloc, null);
+        assert!(api::supports_malloc_allocator(system));
+        assert!(api::supports_malloc_allocator(malloc));
+        assert!(api::supports_malloc_allocator(zone));
+        assert!(!api::supports_malloc_allocator(null));
+        // The getter is the current non-null allocator; the global default
+        // constant is a separate NULL sentinel meaning "use the current one".
+        assert_eq!(unsafe { api::CFAllocatorGetDefault() }, system);
+        assert_ne!(unsafe { api::CFAllocatorGetDefault() }, malloc);
+        // SAFETY: exported allocator objects are immortal CFAllocators.
+        unsafe {
+            assert_eq!(api::CFGetTypeID(system), api::CFAllocatorGetTypeID());
+            api::CFRelease(system);
+            api::CFRelease(system);
+            assert_eq!(api::CFGetTypeID(system), api::CFAllocatorGetTypeID());
+            assert_eq!(api::CFRetain(system), system);
+            api::CFRelease(system);
+            assert_eq!(api::CFAllocatorGetDefault(), system);
+        }
+    }
+
+    /// The host's CoreFoundation reads an allocator as its own, so none of
+    /// this runtime's objects may reach it.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_host_framework_is_never_handed_one_of_this_runtimes_allocators() {
+        bootstrap();
+        assert!(api::host_allocator(std::ptr::null()).is_null());
+        // SAFETY: this implementation does not inspect the callback context.
+        let custom = unsafe { api::CFAllocatorCreate(std::ptr::null(), std::ptr::null()) };
+        for allocator in [
+            unsafe { api::CFAllocatorGetDefault() },
+            api::standard_allocator(api::StandardAllocator::Malloc),
+            api::standard_allocator(api::StandardAllocator::MallocZone),
+            api::standard_allocator(api::StandardAllocator::Null),
+            custom,
+        ] {
+            let host = api::host_allocator(allocator);
+            // SAFETY: null or an allocator object.
+            assert!(
+                host.is_null() || unsafe { foreign::is(host) },
+                "{allocator:p}"
+            );
+        }
+        // SAFETY: the allocator this test created.
+        unsafe { api::CFRelease(custom) };
+    }
+
+    #[test]
+    fn custom_allocator_has_identity_and_current_default_is_system() {
         bootstrap();
         // SAFETY: this implementation does not inspect the callback context.
         unsafe {
-            assert!(api::CFAllocatorGetDefault().is_null());
+            assert_eq!(
+                api::CFAllocatorGetDefault(),
+                api::standard_allocator(api::StandardAllocator::SystemDefault)
+            );
             let allocator = api::CFAllocatorCreate(std::ptr::null(), std::ptr::null());
             assert!(!allocator.is_null());
             assert_eq!(api::CFGetTypeID(allocator), api::CFAllocatorGetTypeID());

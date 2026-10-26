@@ -8,7 +8,7 @@
 //! a level-triggered event (a message still queued) fire once per handling
 //! rather than once per look.
 //!
-//! Kinds with nothing behind them here - memory pressure, a vnode, a signal,
+//! Kinds with nothing behind them here - memory pressure, a vnode,
 //! a Mach send right's death - are accepted and never fire, which is what each
 //! of them does on a Mac where the event does not happen.
 
@@ -42,7 +42,10 @@ const TYPES: [(Type, &str); 12] = [
     (Type::DataReplace, "__dispatch_source_type_data_replace"),
     (Type::MachSend, "__dispatch_source_type_mach_send"),
     (Type::MachRecv, "__dispatch_source_type_mach_recv"),
-    (Type::MemoryPressure, "__dispatch_source_type_memorypressure"),
+    (
+        Type::MemoryPressure,
+        "__dispatch_source_type_memorypressure",
+    ),
     (Type::Proc, "__dispatch_source_type_proc"),
     (Type::Read, "__dispatch_source_type_read"),
     (Type::Signal, "__dispatch_source_type_signal"),
@@ -93,6 +96,7 @@ impl Handler {
 
 #[derive(Default)]
 struct State {
+    signal: Option<SignalWatch>,
     event: Handler,
     cancel: Handler,
     registration: Handler,
@@ -112,6 +116,56 @@ struct State {
     deadline: u64,
     interval: u64,
     armed: bool,
+}
+
+struct SignalWatch(i32);
+
+impl SignalWatch {
+    fn new(signum: u64) -> Option<Self> {
+        const EVFILT_SIGNAL: i16 = -6;
+        const EV_ADD: u16 = 0x0001;
+        const EV_CLEAR: u16 = 0x0020;
+        let queue = Self(crate::kqueue::kqueue());
+        if queue.0 < 0 {
+            return None;
+        }
+        let change = crate::kqueue::Kevent {
+            ident: signum as usize,
+            filter: EVFILT_SIGNAL,
+            flags: EV_ADD | EV_CLEAR,
+            ..Default::default()
+        };
+        let result = unsafe {
+            crate::kqueue::kevent(
+                queue.0,
+                &change,
+                1,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null(),
+            )
+        };
+        (result == 0).then_some(queue)
+    }
+
+    fn collect(fd: i32) -> Option<u64> {
+        let mut event = crate::kqueue::Kevent::default();
+        let timeout = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: libc::c_long::from(POLL_MS) * 1_000_000,
+        };
+        let result =
+            unsafe { crate::kqueue::kevent(fd, std::ptr::null(), 0, &mut event, 1, &timeout) };
+        (result == 1 && event.data > 0).then_some(event.data as u64)
+    }
+}
+
+impl Drop for SignalWatch {
+    fn drop(&mut self) {
+        if self.0 >= 0 {
+            unsafe { crate::net::descriptor::close(self.0) };
+        }
+    }
 }
 
 #[repr(C)]
@@ -180,7 +234,9 @@ pub(super) fn set_queue(handle: u64, queue: u64) -> bool {
         q => q,
     };
     object::retain(queue);
-    let old = source.queue.swap(queue, std::sync::atomic::Ordering::AcqRel);
+    let old = source
+        .queue
+        .swap(queue, std::sync::atomic::Ordering::AcqRel);
     // SAFETY: the reference the source held on its old queue.
     unsafe { object::release(old) };
     true
@@ -210,7 +266,9 @@ fn update(handle: u64, f: impl FnOnce(&mut State)) {
 
 fn set_handler(handle: u64, pick: fn(&mut State) -> &mut Handler, handler: Handler) {
     let mut old = Handler::None;
-    update(handle, |state| old = std::mem::replace(pick(state), handler));
+    update(handle, |state| {
+        old = std::mem::replace(pick(state), handler)
+    });
     old.release();
 }
 
@@ -295,7 +353,9 @@ pub unsafe extern "C" fn merge_data(handle: u64, value: u64) {
 /// `uintptr_t dispatch_source_get_data(dispatch_source_t)`.
 pub unsafe extern "C" fn get_data(handle: u64) -> u64 {
     // SAFETY: a live source.
-    unsafe { source(handle) }.map_or(0, |s| s.state.lock().unwrap_or_else(|e| e.into_inner()).data)
+    unsafe { source(handle) }.map_or(0, |s| {
+        s.state.lock().unwrap_or_else(|e| e.into_inner()).data
+    })
 }
 
 /// `uintptr_t dispatch_source_get_handle(dispatch_source_t)`.
@@ -343,13 +403,26 @@ pub(super) fn resume(handle: u64) -> bool {
     state.suspended = state.suspended.saturating_sub(1);
     let start = state.suspended == 0 && !state.watching && !state.cancelled;
     if start {
+        if source.kind == Type::Signal {
+            state.signal = SignalWatch::new(source.handle);
+            if state.signal.is_none() {
+                eprintln!("rosemary: cannot register dispatch signal source");
+                return true;
+            }
+        }
         state.watching = true;
         if let registration @ (Handler::Block(_) | Handler::Function(_)) = state.registration {
             state.registration = Handler::None;
             object::retain(handle);
             let work = Box::into_raw(Box::new((handle, registration))) as u64;
             // SAFETY: the source's queue, and a function of this module's.
-            unsafe { super::queue::async_f(source.queue.load(std::sync::atomic::Ordering::Acquire), work, run_once as *const () as u64) };
+            unsafe {
+                super::queue::async_f(
+                    source.queue.load(std::sync::atomic::Ordering::Acquire),
+                    work,
+                    run_once as *const () as u64,
+                )
+            };
         }
     }
     drop(state);
@@ -361,6 +434,10 @@ pub(super) fn resume(handle: u64) -> bool {
             .stack_size(256 * 1024)
             .spawn(move || watch(handle));
         if spawned.is_err() {
+            let mut state = source.state.lock().unwrap_or_else(|e| e.into_inner());
+            state.watching = false;
+            state.signal.take();
+            drop(state);
             // SAFETY: the reference taken for the watcher that did not start.
             unsafe { object::release(handle) };
         }
@@ -420,7 +497,10 @@ unsafe extern "C" fn fire(context: *mut c_void) {
     if trace() {
         // SAFETY: the watcher's reference keeps it alive.
         if let Some(source) = unsafe { source(handle) } {
-            eprintln!("rosemary: dispatch source: {:?} on {:#x} fires", source.kind, source.handle);
+            eprintln!(
+                "rosemary: dispatch source: {:?} on {:#x} fires",
+                source.kind, source.handle
+            );
         }
     }
     // SAFETY: the reference the watcher took keeps it alive.
@@ -461,7 +541,13 @@ fn send_cancel(handle: u64, state: &mut State) {
     object::retain(handle);
     let work = Box::into_raw(Box::new((handle, handler))) as u64;
     // SAFETY: the source's queue, and a function of this module's.
-    unsafe { super::queue::async_f(source.queue.load(std::sync::atomic::Ordering::Acquire), work, run_once as *const () as u64) };
+    unsafe {
+        super::queue::async_f(
+            source.queue.load(std::sync::atomic::Ordering::Acquire),
+            work,
+            run_once as *const () as u64,
+        )
+    };
 }
 
 /// How long the watcher sleeps between looks at a descriptor, so that a
@@ -470,7 +556,11 @@ const POLL_MS: i32 = 50;
 
 /// Whether `fd` is ready for `events` within `ms`.
 fn poll_fd(fd: i32, events: i16, ms: i32) -> bool {
-    let mut p = libc::pollfd { fd, events, revents: 0 };
+    let mut p = libc::pollfd {
+        fd,
+        events,
+        revents: 0,
+    };
     // SAFETY: one `pollfd`, on the stack.
     unsafe { libc::poll(&mut p, 1, ms) > 0 && p.revents != 0 }
 }
@@ -502,8 +592,7 @@ fn look(source: &Source, ms: i32) -> Option<u64> {
             }
             let pid = source.handle as i32;
             // SAFETY: probing for existence only.
-            let alive = unsafe { libc::kill(pid, 0) } == 0
-                || crate::errno::get() != libc::ESRCH;
+            let alive = unsafe { libc::kill(pid, 0) } == 0 || crate::errno::get() != libc::ESRCH;
             match alive {
                 true => {
                     std::thread::sleep(std::time::Duration::from_millis(ms as u64));
@@ -526,21 +615,43 @@ fn watch(handle: u64) {
         // Wait while there is nothing to do: suspended, or the last handler
         // still running.
         while !state.cancelled && (state.suspended > 0 || state.in_flight) {
-            state = source.changed.wait(state).unwrap_or_else(|e| e.into_inner());
+            state = source
+                .changed
+                .wait(state)
+                .unwrap_or_else(|e| e.into_inner());
         }
         if state.cancelled {
             if !state.in_flight {
+                state.signal.take();
                 send_cancel(handle, &mut state);
                 break;
             }
-            state = source.changed.wait(state).unwrap_or_else(|e| e.into_inner());
+            state = source
+                .changed
+                .wait(state)
+                .unwrap_or_else(|e| e.into_inner());
             drop(state);
             continue;
         }
         let ready = match source.kind {
+            Type::Signal => {
+                let fd = state.signal.as_ref().expect("registered before watching").0;
+                drop(state);
+                let seen = SignalWatch::collect(fd);
+                state = source.state.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(count) = seen {
+                    state.pending = state.pending.wrapping_add(count);
+                }
+                !state.cancelled && state.suspended == 0 && state.pending != 0
+            }
             Type::Timer => {
                 if !state.armed || state.deadline == time::FOREVER {
-                    drop(source.changed.wait(state).unwrap_or_else(|e| e.into_inner()));
+                    drop(
+                        source
+                            .changed
+                            .wait(state)
+                            .unwrap_or_else(|e| e.into_inner()),
+                    );
                     continue;
                 }
                 match time::remaining(state.deadline) {
@@ -567,14 +678,24 @@ fn watch(handle: u64) {
             }
             Type::DataAdd | Type::DataOr | Type::DataReplace => {
                 if state.pending == 0 {
-                    drop(source.changed.wait(state).unwrap_or_else(|e| e.into_inner()));
+                    drop(
+                        source
+                            .changed
+                            .wait(state)
+                            .unwrap_or_else(|e| e.into_inner()),
+                    );
                     continue;
                 }
                 true
             }
             Type::Read | Type::Write | Type::MachRecv | Type::Proc => {
                 if fired_proc {
-                    drop(source.changed.wait(state).unwrap_or_else(|e| e.into_inner()));
+                    drop(
+                        source
+                            .changed
+                            .wait(state)
+                            .unwrap_or_else(|e| e.into_inner()),
+                    );
                     continue;
                 }
                 drop(state);
@@ -594,7 +715,12 @@ fn watch(handle: u64) {
             }
             // Nothing here produces these events.
             _ => {
-                drop(source.changed.wait(state).unwrap_or_else(|e| e.into_inner()));
+                drop(
+                    source
+                        .changed
+                        .wait(state)
+                        .unwrap_or_else(|e| e.into_inner()),
+                );
                 continue;
             }
         };
@@ -603,9 +729,73 @@ fn watch(handle: u64) {
             drop(state);
             // SAFETY: the source's queue; the watcher's reference keeps the
             // source alive until the handler is done, since it waits for it.
-            unsafe { super::queue::async_f(source.queue.load(std::sync::atomic::Ordering::Acquire), handle, fire as *const () as u64) };
+            unsafe {
+                super::queue::async_f(
+                    source.queue.load(std::sync::atomic::Ordering::Acquire),
+                    handle,
+                    fire as *const () as u64,
+                )
+            };
         }
     }
     // SAFETY: the reference `resume` took for this thread.
     unsafe { object::release(handle) };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static DELIVERIES: AtomicU64 = AtomicU64::new(0);
+    static CANCELLED: AtomicU64 = AtomicU64::new(0);
+
+    unsafe extern "C" fn record_signal(context: *mut c_void) {
+        DELIVERIES.fetch_add(unsafe { get_data(context as u64) }, Ordering::Release);
+    }
+
+    unsafe extern "C" fn record_cancel(_context: *mut c_void) {
+        CANCELLED.fetch_add(1, Ordering::Release);
+    }
+
+    fn wait_for(mut condition: impl FnMut() -> bool) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while !condition() {
+            assert!(std::time::Instant::now() < deadline, "handler did not run");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn signal_counts_survive_suspension_and_stop_at_cancellation() {
+        let signum = crate::signal::signum::SIGWINCH;
+        let host = crate::signal::signal_to_host(signum).unwrap();
+        let queue = super::super::queue::create_serial("signal source test");
+        unsafe {
+            let s = source_create(
+                type_address("__dispatch_source_type_signal"),
+                signum as u64,
+                0,
+                queue,
+            );
+            object::set_context(s, s as *mut c_void);
+            set_event_handler_f(s, record_signal as *const () as u64);
+            set_cancel_handler_f(s, record_cancel as *const () as u64);
+            resume(s);
+            libc::raise(host);
+            wait_for(|| DELIVERIES.load(Ordering::Acquire) == 1);
+            suspend(s);
+            libc::raise(host);
+            libc::raise(host);
+            assert_eq!(DELIVERIES.load(Ordering::Acquire), 1);
+            resume(s);
+            wait_for(|| DELIVERIES.load(Ordering::Acquire) == 3);
+            cancel(s);
+            wait_for(|| CANCELLED.load(Ordering::Acquire) == 1);
+            libc::raise(host);
+            assert_eq!(DELIVERIES.load(Ordering::Acquire), 3);
+            object::release(s);
+            object::release(queue);
+        }
+    }
 }
