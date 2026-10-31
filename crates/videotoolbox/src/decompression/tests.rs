@@ -407,6 +407,7 @@ fn every_entry_point_and_key_a_video_decoder_imports_resolves() {
         "_kVTCompressionPropertyKey_UsingHardwareAcceleratedVideoEncoder",
         "_kVTVideoEncoderList_CodecType",
         "_kVTVideoEncoderList_EncoderName",
+        "_kVTVideoEncoderList_IsHardwareAccelerated",
     ] {
         assert!(symbols.iter().any(|(n, _)| n == name), "{name}");
     }
