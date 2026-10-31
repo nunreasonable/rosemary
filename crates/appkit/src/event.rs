@@ -5,11 +5,13 @@ use sdl3::keycodes::{keymod, scancode};
 use crate::nsevent::{self, Fields, kind};
 use crate::window;
 
-/// Drain SDL's queue once, delivering what this tree can deliver.
+/// Drain SDL's queue once, delivering what this tree can deliver. True if at
+/// least one SDL event was waiting, which is the only sign of life the
+/// window system itself gives between polls - see `application::idle_slice`.
 ///
 /// `app` is the application, which is the object a window notification is posted
 /// about when the event names no window this crate made.
-pub fn pump(app: Id) {
+pub fn pump(app: Id) -> bool {
     let _ = app;
     // Before anything else: a thread waiting for a GL context this one holds is
     // a thread that is not drawing, and reaching here is what says this one has
@@ -20,7 +22,9 @@ pub fn pump(app: Id) {
     debug_key();
     crate::script::run();
     trace_views();
+    let mut delivered = false;
     while let Some(event) = sdl3::video::poll() {
+        delivered = true;
         deliver(event);
     }
     service_presentation();
@@ -29,8 +33,12 @@ pub fn pump(app: Id) {
     for hook in hooks {
         hook();
     }
+    // A session `-beginDraggingSessionWithItems:` started runs here, in the
+    // event loop, after the call that started it has returned.
+    crate::dragging::run_pending();
     crate::application::check_last_window_closed();
     crate::backing::pump();
+    delivered
 }
 
 /// Service SDL surface work and publication on the video thread. Both the
@@ -690,6 +698,7 @@ pub(crate) fn deliver_past_modal(event: sdl3::video::Event) {
                 // guest capture; otherwise later motion could leak past the edge.
                 if !down {
                     capture_mouse_button(id, button, false, false);
+                    crate::dragging::release_unreported(crate::button::number(button));
                 }
                 return;
             }
