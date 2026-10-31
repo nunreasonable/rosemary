@@ -199,6 +199,21 @@ pub(crate) unsafe fn is_buffer(handle: *const c_void) -> bool {
     unsafe { storage(handle) }.is_some()
 }
 
+/// Whether `allocator` is one `CFAllocatorCreate` made, whose callbacks this
+/// CoreFoundation never runs.
+///
+/// FIXME (ACCURACY): a block such an allocator is asked for comes from
+/// malloc and goes back to free, as every CoreFoundation constructor here
+/// treats its allocator; Apple's calls the allocator's own callbacks.
+fn is_created_allocator(allocator: *const c_void) -> bool {
+    // SAFETY: a non-null object the caller passed as a CFAllocatorRef.
+    !allocator.is_null()
+        && unsafe {
+            corefoundation::api::CFGetTypeID(allocator)
+                == corefoundation::api::CFAllocatorGetTypeID()
+        }
+}
+
 /// Creates a single-block buffer. Caller memory is taken only with
 /// `kCFAllocatorNull` as its block allocator, which says nobody frees it: the
 /// caller keeps it alive and the buffer only reads and writes it. Memory some
@@ -276,7 +291,9 @@ pub unsafe extern "C" fn CMBlockBufferCreateWithMemoryBlock(
         // the distinguished null allocator explicitly cannot provide.
         return ALLOC_FAILED;
     }
-    if !corefoundation::api::supports_malloc_allocator(block_allocator) {
+    if !corefoundation::api::supports_malloc_allocator(block_allocator)
+        && !is_created_allocator(block_allocator)
+    {
         return BAD_CUSTOM_SOURCE;
     }
     let mut storage = Storage {
@@ -1607,6 +1624,59 @@ mod tests {
         }
         // Still the caller's to use, and to drop.
         assert_eq!(memory, *b"xxxxxxxx");
+    }
+
+    /// Roblox's H.264 samples: a block its own `CFAllocatorCreate` allocator
+    /// is asked for, assured now and then filled.
+    #[test]
+    fn a_created_allocator_backs_a_block_it_is_asked_for() {
+        corefoundation::bootstrap();
+        let (mut block, mut bytes) = (core::ptr::null(), [0u8; 4]);
+        unsafe {
+            let allocator =
+                corefoundation::api::CFAllocatorCreate(core::ptr::null(), core::ptr::null());
+            assert_eq!(
+                CMBlockBufferCreateWithMemoryBlock(
+                    core::ptr::null(),
+                    core::ptr::null_mut(),
+                    4,
+                    allocator,
+                    core::ptr::null(),
+                    0,
+                    4,
+                    ASSURE_NOW,
+                    &mut block,
+                ),
+                0
+            );
+            assert_eq!(
+                CMBlockBufferReplaceDataBytes(b"abcd".as_ptr().cast(), block, 0, 4),
+                0
+            );
+            assert_eq!(
+                CMBlockBufferCopyDataBytes(block, 0, 4, bytes.as_mut_ptr().cast()),
+                0
+            );
+            let mut lent = core::ptr::null();
+            assert_eq!(
+                CMBlockBufferCreateWithMemoryBlock(
+                    core::ptr::null(),
+                    bytes.as_mut_ptr().cast(),
+                    4,
+                    allocator,
+                    core::ptr::null(),
+                    0,
+                    4,
+                    0,
+                    &mut lent,
+                ),
+                BAD_CUSTOM_SOURCE,
+                "memory for the allocator to free is still not taken"
+            );
+            corefoundation::api::CFRelease(block);
+            corefoundation::api::CFRelease(allocator);
+        }
+        assert_eq!(&bytes, b"abcd");
     }
 
     #[test]
