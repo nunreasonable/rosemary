@@ -7,4 +7,5 @@ license.workspace = true
 [dependencies]
 exports.workspace = true
 corefoundation.workspace = true
+corevideo.workspace = true
 objc.workspace = true
