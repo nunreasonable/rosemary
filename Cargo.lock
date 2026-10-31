@@ -617,6 +617,7 @@ dependencies = [
  "corefoundation",
  "darwin",
  "exports",
+ "ffmpeg",
  "libc",
  "sdl3",
  "static_init",
