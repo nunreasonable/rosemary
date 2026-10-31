@@ -149,6 +149,28 @@ pub fn set_general_text_and_html(text: Option<Vec<u8>>, html: Option<Vec<u8>>) -
 /// text. See [`crate::pasteboard_manager`].
 pub(crate) const CLIPBOARD: &[u8] = GENERAL.as_bytes();
 
+/// `NSPasteboardNameDrag`, the board a dragging session carries.
+const DRAG: &str = "Apple CFPasteboard drag";
+
+/// The drag pasteboard, which is the same object every time it is asked for.
+pub(crate) fn drag_board() -> Id {
+    named(DRAG.as_bytes())
+}
+
+/// The types a pasteboard object holds, for matching a drag against the types
+/// a destination registered.
+pub(crate) fn types_of(receiver: Id) -> Vec<Vec<u8>> {
+    let mut all = boards().lock().unwrap_or_else(|e| e.into_inner());
+    if is_general(&all, receiver)
+        && let Some(board) = board_mut(&mut all, receiver)
+    {
+        sync_system_text(board);
+    }
+    board_mut(&mut all, receiver)
+        .map(|board| board.entries.iter().map(|entry| entry.ty.clone()).collect())
+        .unwrap_or_default()
+}
+
 /// The flavour types a named board currently holds.
 ///
 /// The general board is synchronised with the desktop's clipboard first, for the
@@ -258,7 +280,7 @@ fn entry_mut<'a>(board: &'a mut Board, ty: &[u8]) -> &'a mut Entry {
     board.entries.last_mut().expect("entry just pushed")
 }
 
-fn strings(values: impl IntoIterator<Item = Vec<u8>>) -> Id {
+pub(crate) fn strings(values: impl IntoIterator<Item = Vec<u8>>) -> Id {
     let values: Vec<CFTypeRef> = values
         .into_iter()
         .map(|value| corefoundation::string::from_bytes(&value, false))
@@ -571,6 +593,9 @@ unsafe extern "C" fn write_objects(receiver: Id, _sel: Sel, objects: Id) -> u8 {
     let Some(objects) = (unsafe { collections::array(objects as CFTypeRef) }) else {
         return 0;
     };
+    if !objects.values.is_empty() && objects.values.iter().all(|object| is_item(*object as Id)) {
+        return write_items(receiver, &objects.values);
+    }
     if objects.values.is_empty() || !objects.values.iter().all(|object| is_string(*object as Id)) {
         return 0;
     }
@@ -644,6 +669,183 @@ unsafe extern "C" fn read_objects(receiver: Id, _sel: Sel, classes: Id, _options
 
 unsafe extern "C" fn release_globally(_receiver: Id, _sel: Sel) {}
 
+/// `NSPasteboardItem`: the flavours of one item, held by the item itself so
+/// one made for a drag can be filled before any board is chosen.
+#[repr(C)]
+struct Item {
+    isa: *const std::ffi::c_void,
+    /// Boxed `(type, bytes)` pairs in the order they were set, or null for
+    /// an item nothing has been written to.
+    entries: *mut Vec<(Vec<u8>, Vec<u8>)>,
+}
+
+pub const ITEM_INSTANCE_SIZE: usize = size_of::<Item>();
+
+fn is_item(object: Id) -> bool {
+    // SAFETY: null or an object this runtime allocated.
+    unsafe { objc::object::class_of(object) }.is_some_and(|class| {
+        objc::class::lookup(c"NSPasteboardItem")
+            .is_some_and(|item| class.chain().any(|ancestor| std::ptr::eq(ancestor, item)))
+    })
+}
+
+fn item_entries<'a>(receiver: Id) -> &'a mut Vec<(Vec<u8>, Vec<u8>)> {
+    // SAFETY: every method below is installed on `NSPasteboardItem`, whose
+    // instances have this layout.
+    let item = unsafe { &mut *(receiver as *mut Item) };
+    if item.entries.is_null() {
+        item.entries = Box::into_raw(Box::default());
+    }
+    // SAFETY: a box this module made and only `-dealloc` frees.
+    unsafe { &mut *item.entries }
+}
+
+fn item_with(entries: Vec<(Vec<u8>, Vec<u8>)>) -> Id {
+    let class = objc::class::lookup(c"NSPasteboardItem").expect("declared before its methods");
+    let item = objc::object::create_instance(class, 0);
+    *item_entries(item) = entries;
+    objc::arc::autorelease(item)
+}
+
+fn set_item_bytes(receiver: Id, ty: Vec<u8>, bytes: Vec<u8>) -> u8 {
+    let entries = item_entries(receiver);
+    match entries.iter_mut().find(|(existing, _)| *existing == ty) {
+        Some((_, value)) => *value = bytes,
+        None => entries.push((ty, bytes)),
+    }
+    1
+}
+
+fn item_bytes(receiver: Id, ty: Id) -> Option<Vec<u8>> {
+    let ty = type_bytes(ty);
+    item_entries(receiver)
+        .iter()
+        .find(|(existing, _)| *existing == ty)
+        .map(|(_, bytes)| bytes.clone())
+}
+
+unsafe extern "C" fn item_types(receiver: Id, _sel: Sel) -> Id {
+    strings(item_entries(receiver).iter().map(|(ty, _)| ty.clone()))
+}
+
+unsafe extern "C" fn item_set_data(receiver: Id, _sel: Sel, data: Id, ty: Id) -> u8 {
+    match unsafe { collections::data(data as CFTypeRef) } {
+        Some(bytes) => set_item_bytes(receiver, type_bytes(ty), bytes.clone()),
+        None => 0,
+    }
+}
+
+unsafe extern "C" fn item_set_string(receiver: Id, _sel: Sel, string: Id, ty: Id) -> u8 {
+    if string.is_null() {
+        return 0;
+    }
+    set_item_bytes(receiver, type_bytes(ty), type_bytes(string))
+}
+
+unsafe extern "C" fn item_data_for_type(receiver: Id, _sel: Sel, ty: Id) -> Id {
+    match item_bytes(receiver, ty) {
+        // SAFETY: a new data object.
+        Some(bytes) => unsafe { api::CFAutorelease(collections::new_data(bytes)) as Id },
+        None => std::ptr::null_mut(),
+    }
+}
+
+unsafe extern "C" fn item_string_for_type(receiver: Id, _sel: Sel, ty: Id) -> Id {
+    match item_bytes(receiver, ty) {
+        // SAFETY: a new string object.
+        Some(bytes) => unsafe {
+            api::CFAutorelease(corefoundation::string::from_bytes(&bytes, false)) as Id
+        },
+        None => std::ptr::null_mut(),
+    }
+}
+
+unsafe extern "C" fn item_available_type(receiver: Id, _sel: Sel, types: Id) -> Id {
+    let held = item_entries(receiver);
+    let Some(ty) = unsafe { collections::array(types as CFTypeRef) }.and_then(|array| {
+        array
+            .values
+            .iter()
+            .map(|value| type_bytes(*value as Id))
+            .find(|ty| held.iter().any(|(existing, _)| existing == ty))
+    }) else {
+        return std::ptr::null_mut();
+    };
+    // SAFETY: a new string object.
+    unsafe { api::CFAutorelease(corefoundation::string::from_bytes(&ty, false)) as Id }
+}
+
+unsafe extern "C" fn item_dealloc(receiver: Id, _sel: Sel) {
+    // SAFETY: an item of this module's layout, with its last reference gone.
+    let item = unsafe { &mut *(receiver as *mut Item) };
+    if !item.entries.is_null() {
+        // SAFETY: the box `item_entries` made.
+        drop(unsafe { Box::from_raw(item.entries) });
+        item.entries = std::ptr::null_mut();
+    }
+    objc::arc::finalize(receiver);
+}
+
+/// `-pasteboardItems`: a board here holds one item, as the Pasteboard Manager
+/// module says, so this is that item - a copy of the flavours that have bytes,
+/// which is what can be written to another board - or none for an empty board.
+unsafe extern "C" fn pasteboard_items(receiver: Id, _sel: Sel) -> Id {
+    let entries: Vec<(Vec<u8>, Vec<u8>)> = {
+        let mut all = boards().lock().unwrap_or_else(|e| e.into_inner());
+        if is_general(&all, receiver)
+            && let Some(board) = board_mut(&mut all, receiver)
+        {
+            sync_system_text(board);
+        }
+        board_mut(&mut all, receiver)
+            .map(|board| {
+                board
+                    .entries
+                    .iter()
+                    .filter_map(|entry| Some((entry.ty.clone(), entry.data.clone()?)))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let items: Vec<CFTypeRef> = match entries.is_empty() {
+        true => Vec::new(),
+        false => vec![item_with(entries) as CFTypeRef],
+    };
+    let array = collections::new_array(&items, Policy::from_type_callbacks(), false);
+    // SAFETY: a new Objective-C object.
+    unsafe { api::CFAutorelease(array) as Id }
+}
+
+/// `-writeObjects:` for pasteboard items: the board is cleared and takes
+/// every item's flavours.
+///
+/// FIXME (ACCURACY): a board here has one item, so a flavour two items both
+/// carry keeps only the last item's bytes.
+fn write_items(receiver: Id, items: &[CFTypeRef]) -> u8 {
+    let entries: Vec<(Vec<u8>, Vec<u8>)> = items
+        .iter()
+        .flat_map(|item| item_entries(*item as Id).clone())
+        .collect();
+    let mut all = boards().lock().unwrap_or_else(|e| e.into_inner());
+    let general = is_general(&all, receiver);
+    let Some(board) = board_mut(&mut all, receiver) else {
+        return 0;
+    };
+    clear(board);
+    let mut system_text = None;
+    for (ty, bytes) in entries {
+        if general && ty == STRING.as_bytes() {
+            system_text = Some(bytes.clone());
+        }
+        entry_mut(board, &ty).data = Some(bytes);
+    }
+    drop(all);
+    if let Some(text) = system_text {
+        let _ = sdl3::clipboard::set_text(&text);
+    }
+    1
+}
+
 pub(crate) fn install() {
     let class = class();
     class_methods!(class, {
@@ -672,6 +874,17 @@ pub(crate) fn install() {
         "canReadObjectForClasses:options:" => can_read_objects, c"c32@0:8@16@24";
         "readObjectsForClasses:options:" => read_objects, c"@32@0:8@16@24";
         "releaseGlobally" => release_globally, c"v16@0:8";
+        "pasteboardItems" => pasteboard_items, c"@16@0:8";
+    });
+    let item = objc::class::lookup(c"NSPasteboardItem").expect("declared before its methods");
+    methods!(item, {
+        "types" => item_types, c"@16@0:8";
+        "setData:forType:" => item_set_data, c"c32@0:8@16@24";
+        "setString:forType:" => item_set_string, c"c32@0:8@16@24";
+        "dataForType:" => item_data_for_type, c"@24@0:8@16";
+        "stringForType:" => item_string_for_type, c"@24@0:8@16";
+        "availableTypeFromArray:" => item_available_type, c"@24@0:8@16";
+        "dealloc" => item_dealloc, c"v16@0:8";
     });
 }
 
@@ -703,6 +916,44 @@ mod tests {
             unsafe { foundation::string::bytes(array.values[0] as Id) },
             STRING.as_bytes()
         );
+    }
+
+    #[test]
+    fn written_pasteboard_items_replace_the_contents_and_read_back_as_one_item() {
+        crate::bootstrap();
+        let name = corefoundation::string::from_bytes(b"pasteboard-items-test", false) as Id;
+        let board = unsafe {
+            pasteboard_with_name(
+                std::ptr::null_mut(),
+                objc::sel::get("pasteboardWithName:"),
+                name,
+            )
+        };
+        let stale = corefoundation::string::from_bytes(b"public.stale", false) as Id;
+        let ty = corefoundation::string::from_bytes(b"com.example.item", false) as Id;
+        let text = corefoundation::string::from_bytes(b"payload", false) as Id;
+        let class = objc::class::lookup(c"NSPasteboardItem").expect("NSPasteboardItem");
+        let item = objc::object::create_instance(class, 0);
+        unsafe {
+            set_string(board, objc::sel::get("setString:forType:"), text, stale);
+            item_set_string(item, objc::sel::get("setString:forType:"), text, ty);
+        }
+        let objects =
+            collections::new_array(&[item as CFTypeRef], Policy::from_type_callbacks(), false)
+                as Id;
+        assert_eq!(
+            unsafe { write_objects(board, objc::sel::get("writeObjects:"), objects) },
+            1
+        );
+        assert_eq!(types_of(board), [b"com.example.item".to_vec()]);
+        let items = unsafe { pasteboard_items(board, objc::sel::get("pasteboardItems")) };
+        let items = unsafe { collections::array(items as CFTypeRef) }.expect("array");
+        assert_eq!(items.values.len(), 1);
+        let read = unsafe {
+            item_string_for_type(items.values[0] as Id, objc::sel::get("stringForType:"), ty)
+        };
+        assert_eq!(unsafe { foundation::string::bytes(read) }, b"payload");
+        objc::arc::release(item);
     }
 
     #[test]
