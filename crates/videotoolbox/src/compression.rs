@@ -76,6 +76,10 @@ pub(crate) const KEYS: &[(&str, &str)] = &[
     ),
     ("_kVTVideoEncoderList_CodecType", "CodecType"),
     ("_kVTVideoEncoderList_EncoderName", "EncoderName"),
+    (
+        "_kVTVideoEncoderList_IsHardwareAccelerated",
+        "IsHardwareAccelerated",
+    ),
 ];
 
 /// `VTCompressionOutputCallback`, never called.
