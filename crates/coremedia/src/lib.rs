@@ -1,7 +1,7 @@
 #![allow(clippy::missing_safety_doc)]
 
 mod attachment;
-mod block_buffer;
+pub mod block_buffer;
 pub mod format_description;
 mod h264;
 pub mod sample_buffer;
