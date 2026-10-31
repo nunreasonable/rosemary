@@ -1,19 +1,11 @@
+// FIXME (PORTABILITY): entire module is unportable and contains too much #[cfg] - prefer cfg!() where platform specificity is truly needed
+// and build abstractions
+
 use std::ffi::{CStr, CString, c_char, c_void};
 
-/// `XATTR_NOFOLLOW`, the one Darwin option with a host counterpart - and it has
-/// one only as a different function (`lgetxattr`, `extattr_get_link`).
 const NOFOLLOW: i32 = 0x0001;
-
-/// Darwin's `XATTR_CREATE`, which is not this host's number.
-#[cfg(not(target_os = "macos"))]
 const CREATE: i32 = 0x0002;
-
-/// Darwin's `XATTR_REPLACE`, likewise.
-#[cfg(not(target_os = "macos"))]
 const REPLACE: i32 = 0x0004;
-
-/// Darwin's `ENOATTR`: the attribute named is not on the file.
-#[cfg(target_os = "linux")]
 const ENOATTR: i32 = 93;
 
 /// Whether this host's `errno` means the attribute named is not on the file.
