@@ -128,14 +128,7 @@ pub unsafe extern "C" fn assert_rtn(
 
 pub unsafe extern "C" fn srandomdev() {
     let mut seed = [0u8; 4];
-    let read = unsafe {
-        libc::getrandom(
-            seed.as_mut_ptr().cast::<c_void>(),
-            seed.len(),
-            0 as libc::c_uint,
-        )
-    };
-    if read < seed.len() as isize {
+    if getrandom::fill(&mut seed).is_err() {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.subsec_nanos());
