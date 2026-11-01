@@ -297,6 +297,7 @@ struct Api {
     SDL_GetModState: Option<unsafe extern "C" fn() -> u16>,
     SDL_GetKeyFromScancode: Option<unsafe extern "C" fn(u32, u16, bool) -> u32>,
     SDL_SetHint: Option<unsafe extern "C" fn(*const c_char, *const c_char) -> bool>,
+    SDL_GetHint: Option<unsafe extern "C" fn(*const c_char) -> *const c_char>,
     SDL_ResetHint: Option<unsafe extern "C" fn(*const c_char) -> bool>,
     SDL_GetSystemTheme: Option<unsafe extern "C" fn() -> c_int>,
     SDL_GetCurrentVideoDriver: Option<unsafe extern "C" fn() -> *const c_char>,
@@ -533,6 +534,7 @@ fn api() -> Option<&'static Api> {
             SDL_GetModState,
             SDL_GetKeyFromScancode,
             SDL_SetHint,
+            SDL_GetHint,
             SDL_ResetHint,
             SDL_GetSystemTheme,
             SDL_GetCurrentVideoDriver,
@@ -2173,14 +2175,16 @@ pub mod video {
         }
     }
 
-    /// Start the video subsystem, once.
-    ///
-    /// SDL refuses to create a window without it, and there is no earlier point
-    /// to do it from: a program that never opens a window should not have paid
-    /// for a display connection.
     pub fn init_video() -> bool {
         let mut up = VIDEO_UP.lock().unwrap_or_else(|e| e.into_inner());
         if !*up {
+            if cfg!(target_os = "linux") && get_hint(c"SDL_VIDEO_DRIVER").is_none() {
+                // Hack for an SDL bug where SDL mistakenly classifies Niri as incapable of being
+                // a Wayland compositor, yet somehow capable of being an Xwayland one.
+                // Unsure if this is a Niri or SDL bug to be honest, it literally ONLY happens on Niri.
+                // Also kmsdrm is here because it's awesome
+                set_hint(c"SDL_VIDEO_DRIVER", c"wayland,x11,kmsdrm");
+            }
             *up = super::init(super::init::VIDEO).is_ok();
             if *up {
                 // This thread now owns the event queue: see [`super::pump`].
@@ -4819,14 +4823,24 @@ pub mod video {
         true
     }
 
-    /// `SDL_SetHint`, for the hints this tree has to override rather than
-    /// leave at SDL's default. False on a host whose SDL does not have it.
     pub fn set_hint(name: &CStr, value: &CStr) -> bool {
         let Some(f) = api().and_then(|a| a.SDL_SetHint) else {
             return false;
         };
         // SAFETY: two NUL-terminated strings.
         unsafe { f(name.as_ptr(), value.as_ptr()) }
+    }
+
+    pub fn get_hint(name: &CStr) -> Option<&CStr> {
+        let Some(f) = api().and_then(|a| a.SDL_GetHint) else {
+            return None;
+        };
+        let hint = unsafe { f(name.as_ptr()) };
+        if hint.is_null() {
+            return None;
+        } else {
+            unsafe { Some(CStr::from_ptr(hint)) }
+        }
     }
 
     /// Whether SDL's video driver is Wayland's. False until video has
