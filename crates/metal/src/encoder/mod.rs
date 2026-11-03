@@ -111,6 +111,13 @@ impl PartialEq for DescriptorEntry {
 
 impl Eq for DescriptorEntry {}
 
+/// A descriptor set a command buffer wrote, with what it was written with.
+struct WrittenSet {
+    layout: vk::DescriptorSetLayout,
+    entries: Vec<DescriptorEntry>,
+    set: vk::DescriptorSet,
+}
+
 /// The descriptor set last written for one set index, reused while the
 /// resources a draw needs are the ones it already holds.
 #[derive(Default)]
@@ -157,6 +164,10 @@ pub(crate) struct CommandBuffer {
     /// thousands of times.
     retained: Vec<OwnedObjcRef>,
     retained_set: AddressSet,
+    /// Every descriptor set this command buffer wrote, by layout and contents.
+    /// A set is never written again once a draw has used it, and lives as long
+    /// as the command buffer's pools, so any encoder of it may reuse one.
+    written_sets: std::collections::HashMap<u64, WrittenSet>,
     /// Chunks `-setBytes:` copies are cut from, and how far into the last
     /// one the copies have reached.
     uploads: Vec<GpuBuffer>,

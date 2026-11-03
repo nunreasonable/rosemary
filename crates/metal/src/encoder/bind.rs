@@ -479,10 +479,30 @@ impl Encoder {
                 sets[index] = cache.set;
                 continue;
             }
+            let key = set_key(layouts[index], &self.wanted[index]);
+            if let Some(written) = command.written_sets.get(&key)
+                && written.layout == layouts[index]
+                && written.entries == self.wanted[index]
+            {
+                stats::count(Counter::DescriptorSetReuses);
+                cache.layout = layouts[index];
+                cache.set = written.set;
+                std::mem::swap(&mut cache.entries, &mut self.wanted[index]);
+                sets[index] = written.set;
+                continue;
+            }
             let set = command.allocate_set(layouts[index])?;
             cache.layout = layouts[index];
             cache.set = set;
             std::mem::swap(&mut cache.entries, &mut self.wanted[index]);
+            command.written_sets.insert(
+                key,
+                WrittenSet {
+                    layout: layouts[index],
+                    entries: cache.entries.clone(),
+                    set,
+                },
+            );
             sets[index] = set;
             fresh[index] = true;
         }
@@ -847,4 +867,23 @@ impl Encoder {
         stats::count(Counter::Draws);
         Some((device, vk_command))
     }
+}
+
+/// A descriptor set's layout and contents, hashed over what
+/// `DescriptorEntry`'s equality compares.
+fn set_key(layout: vk::DescriptorSetLayout, entries: &[DescriptorEntry]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    layout.hash(&mut hasher);
+    for entry in entries {
+        (
+            entry.binding,
+            entry.kind,
+            entry.handle,
+            entry.offset,
+            entry.range,
+        )
+            .hash(&mut hasher);
+    }
+    hasher.finish()
 }

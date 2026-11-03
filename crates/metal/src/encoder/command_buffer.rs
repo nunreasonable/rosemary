@@ -60,6 +60,7 @@ pub(super) unsafe extern "C" fn new_command_buffer(receiver: Id, _sel: Sel) -> I
             descriptor_pools: Vec::new(),
             retained: Vec::new(),
             retained_set: AddressSet::default(),
+            written_sets: Default::default(),
             uploads: Vec::new(),
             upload_used: 0,
             framebuffers: Vec::new(),
