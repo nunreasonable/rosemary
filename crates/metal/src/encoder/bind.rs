@@ -36,6 +36,7 @@ pub(crate) fn new_encoder(command_buffer: Id, kind: Kind) -> Id {
             bound: Default::default(),
             set_cache: Default::default(),
             wanted: Default::default(),
+            recent_sets: Default::default(),
             dynamic_offsets: Vec::new(),
             vertex_buffers: [(vk::Buffer::null(), 0); SLOTS],
             index_buffer: (vk::Buffer::null(), 0, vk::IndexType::UINT16),
@@ -479,6 +480,14 @@ impl Encoder {
                 sets[index] = cache.set;
                 continue;
             }
+            if stats::enabled() {
+                count_reusable_set(
+                    command,
+                    &mut self.recent_sets[index],
+                    layouts[index],
+                    &self.wanted[index],
+                );
+            }
             let set = command.allocate_set(layouts[index])?;
             cache.layout = layouts[index];
             cache.set = set;
@@ -846,5 +855,44 @@ impl Encoder {
         gpu::milestone("draw");
         stats::count(Counter::Draws);
         Some((device, vk_command))
+    }
+}
+
+/// How many recent sets `count_reusable_set` compares a new one with.
+const RECENT_SETS: usize = 8;
+
+/// `ROSEMARY_METAL_STATS`: count a set about to be written whose layout and
+/// contents match one of the encoder's last few, or any the command buffer
+/// already wrote - what a longer-lived cache would have reused.
+fn count_reusable_set(
+    command: &mut CommandBuffer,
+    recent: &mut std::collections::VecDeque<u64>,
+    layout: vk::DescriptorSetLayout,
+    entries: &[DescriptorEntry],
+) {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    layout.hash(&mut hasher);
+    for entry in entries {
+        (
+            entry.binding,
+            entry.kind,
+            entry.handle,
+            entry.offset,
+            entry.range,
+        )
+            .hash(&mut hasher);
+    }
+    let key = hasher.finish();
+    if recent.contains(&key) {
+        stats::count(Counter::DescriptorSetRecentHits);
+    } else {
+        if recent.len() == RECENT_SETS {
+            recent.pop_front();
+        }
+        recent.push_back(key);
+    }
+    if !command.written_sets.insert(key as usize) {
+        stats::count(Counter::DescriptorSetCommandHits);
     }
 }

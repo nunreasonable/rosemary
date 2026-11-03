@@ -162,6 +162,8 @@ pub(crate) struct CommandBuffer {
     /// that asks for it: the guest keeps its buffers and textures alive until
     /// the work completes, so binding one retains nothing.
     retains_resources: bool,
+    /// `ROSEMARY_METAL_STATS`: the keys of every set this command buffer wrote.
+    written_sets: AddressSet,
     /// Chunks `-setBytes:` copies are cut from, and how far into the last
     /// one the copies have reached.
     uploads: Vec<GpuBuffer>,
@@ -236,6 +238,9 @@ pub(crate) struct Encoder {
     set_cache: [SetCache; SETS],
     /// Scratch for the entries a draw needs, kept to avoid an allocation.
     wanted: [Vec<DescriptorEntry>; SETS],
+    /// `ROSEMARY_METAL_STATS`: the keys of the last sets this encoder wrote,
+    /// to count how often a longer cache would have reused one.
+    recent_sets: [std::collections::VecDeque<u64>; SETS],
     /// The buffer set's dynamic offsets for the draw, in binding order.
     dynamic_offsets: Vec<u32>,
     vertex_buffers: [(vk::Buffer, u64); SLOTS],
