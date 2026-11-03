@@ -257,7 +257,27 @@ pub unsafe extern "C" fn CVDisplayLinkStart(handle: *mut c_void) -> i32 {
             // thread pointer - its parent's on a new thread until it enters.
             let _darwin = darwin::tls::DarwinThread::enter();
             let mut next = std::time::Instant::now() + period;
+            // `ROSEMARY_METAL_STATS`: the rate this link really runs at.
+            let trace = std::env::var_os("ROSEMARY_METAL_STATS").is_some_and(|v| v != "0");
+            if trace {
+                eprintln!(
+                    "rosemary: CVDisplayLink: started, period {:.3} ms",
+                    period.as_secs_f64() * 1e3
+                );
+            }
+            let (mut window, mut fires) = (std::time::Instant::now(), 0u64);
             while running.load(Ordering::Acquire) {
+                if trace {
+                    fires += 1;
+                    let elapsed = window.elapsed().as_secs_f64();
+                    if elapsed >= 5.0 {
+                        eprintln!(
+                            "rosemary: CVDisplayLink: {:.0} fires/s",
+                            fires as f64 / elapsed
+                        );
+                        (window, fires) = (std::time::Instant::now(), 0);
+                    }
+                }
                 let now = std::time::Instant::now();
                 if next > now {
                     std::thread::sleep(next - now);
