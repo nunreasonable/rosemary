@@ -51,9 +51,9 @@ pub(super) unsafe extern "C" fn set_buffer<const STAGE: usize>(
         *slot = binding;
     }
     // Metal retains what an encoder binds, and a guest is entitled to release
-    // its own reference the moment the call returns. The command buffer's
-    // reference outlives the work the binding is recorded into.
-    encoder.command().retain(buffer);
+    // its own reference the moment the call returns - unless it asked for
+    // unretained references, and so keeps the buffer alive itself.
+    encoder.command().retain_resource(buffer);
 }
 
 /// `-setBytes:length:atIndex:` and its per-stage spellings.
@@ -126,7 +126,7 @@ pub(super) unsafe extern "C" fn set_texture<const STAGE: usize>(
 ) {
     // SAFETY: an encoder of this crate's.
     let encoder = unsafe { object::body::<Encoder>(receiver) };
-    encoder.command().retain(texture);
+    encoder.command().retain_resource(texture);
     if let Some(slot) = encoder.textures[STAGE].get_mut(index as usize) {
         *slot = texture;
     }

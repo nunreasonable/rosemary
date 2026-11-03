@@ -63,14 +63,16 @@ pub(super) unsafe extern "C" fn set_error_options(receiver: Id, _sel: Sel, value
     unsafe { object::body::<CommandBufferDescriptor>(receiver) }.error_options = value;
 }
 
-/// `-commandBufferWithDescriptor:`. Every command buffer retains what it
-/// uses, which unretained references allow; per-encoder execution status
-/// is not reported, so `errorOptions` adds nothing to a failure's error.
+/// `-commandBufferWithDescriptor:`. Per-encoder execution status is not
+/// reported, so `errorOptions` adds nothing to a failure's error.
 pub(super) unsafe extern "C" fn new_command_buffer_with_descriptor(
     receiver: Id,
-    sel: Sel,
-    _descriptor: Id,
+    _sel: Sel,
+    descriptor: Id,
 ) -> Id {
-    // SAFETY: forwards to the plain form on the same queue.
-    unsafe { new_command_buffer(receiver, sel) }
+    let retains_resources = descriptor.is_null()
+        // SAFETY: a descriptor of this crate's.
+        || unsafe { object::body::<CommandBufferDescriptor>(descriptor) }.retained_references;
+    // SAFETY: a command queue of this crate's.
+    unsafe { make_command_buffer(receiver, retains_resources) }
 }

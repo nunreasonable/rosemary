@@ -2,6 +2,19 @@ use super::*;
 
 pub(super) unsafe extern "C" fn new_command_buffer(receiver: Id, _sel: Sel) -> Id {
     // SAFETY: a command queue of this crate's.
+    unsafe { make_command_buffer(receiver, true) }
+}
+
+pub(super) unsafe extern "C" fn new_unretained_command_buffer(receiver: Id, _sel: Sel) -> Id {
+    // SAFETY: as above.
+    unsafe { make_command_buffer(receiver, false) }
+}
+
+/// # Safety
+///
+/// `receiver` is a command queue of this crate's.
+pub(super) unsafe fn make_command_buffer(receiver: Id, retains_resources: bool) -> Id {
+    // SAFETY: the caller's promise.
     let queue = unsafe { object::body::<CommandQueue>(receiver) };
     let gpu = queue.gpu;
     let context = match gpu.acquire_context() {
@@ -60,6 +73,7 @@ pub(super) unsafe extern "C" fn new_command_buffer(receiver: Id, _sel: Sel) -> I
             descriptor_pools: Vec::new(),
             retained: Vec::new(),
             retained_set: AddressSet::default(),
+            retains_resources,
             uploads: Vec::new(),
             upload_used: 0,
             framebuffers: Vec::new(),

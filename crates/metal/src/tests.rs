@@ -1600,6 +1600,38 @@ unsafe fn set_bytes_named(encoder: Id, selector: &str, bytes: &[u8], index: u64)
     unsafe { call(encoder, sel, bytes.as_ptr(), bytes.len() as u64, index) };
 }
 
+/// `-commandBufferWithUnretainedReferences` leaves a bound buffer's lifetime to
+/// the guest, as Metal does; an ordinary command buffer holds one reference.
+#[test]
+fn only_a_retaining_command_buffer_retains_a_bound_buffer() {
+    isolate_metal_fixture!();
+    let Some(device) = gpu_device() else {
+        return;
+    };
+    // SAFETY: objects this test made, sent the selectors they implement.
+    unsafe {
+        let queue = new_command_queue(device, std::ptr::null());
+        let buffer = new_buffer(device, std::ptr::null(), 256, 0);
+        let pool = objc::arc::pool_push();
+        for (selector, extra) in [
+            ("commandBufferWithUnretainedReferences", 0),
+            ("commandBuffer", 1),
+        ] {
+            let before = objc::arc::retain_count(buffer);
+            let command = send(queue, selector);
+            let encoder = send(command, "computeCommandEncoder");
+            set_buffer_at(encoder, buffer, 0, 0);
+            assert_eq!(
+                objc::arc::retain_count(buffer),
+                before + extra,
+                "{selector}"
+            );
+            send_void(encoder, "endEncoding");
+        }
+        objc::arc::pool_pop(pool);
+    }
+}
+
 /// The CPU cost of recording: many dispatches and draws with the per-call
 /// binding churn a game's frame has, timed from the first bind to the end of
 /// `-commit`, and split into issuing the calls and committing. The draws run

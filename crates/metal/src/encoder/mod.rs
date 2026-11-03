@@ -158,6 +158,10 @@ pub(crate) struct CommandBuffer {
     /// thousands of times.
     retained: Vec<OwnedObjcRef>,
     retained_set: AddressSet,
+    /// False for `-commandBufferWithUnretainedReferences` and a descriptor
+    /// that asks for it: the guest keeps its buffers and textures alive until
+    /// the work completes, so binding one retains nothing.
+    retains_resources: bool,
     /// Chunks `-setBytes:` copies are cut from, and how far into the last
     /// one the copies have reached.
     uploads: Vec<GpuBuffer>,
@@ -301,6 +305,14 @@ impl CommandBuffer {
     pub(super) fn retain(&mut self, object: Id) {
         if !object.is_null() && self.retained_set.insert(object as usize) {
             self.retained.push(OwnedObjcRef::retain(object));
+        }
+    }
+
+    /// Retain a buffer or texture the recording uses, unless the guest asked
+    /// for unretained references.
+    pub(super) fn retain_resource(&mut self, resource: Id) {
+        if self.retains_resources {
+            self.retain(resource);
         }
     }
 
@@ -504,7 +516,7 @@ pub(crate) fn install() {
         "device" => queue_device, c"@16@0:8";
         "commandBuffer" => new_command_buffer, c"@16@0:8";
         "dealloc" => queue_dealloc, c"v16@0:8";
-        "commandBufferWithUnretainedReferences" => new_command_buffer, c"@16@0:8";
+        "commandBufferWithUnretainedReferences" => new_unretained_command_buffer, c"@16@0:8";
         "commandBufferWithDescriptor:" => new_command_buffer_with_descriptor, c"@24@0:8@16";
         "setLabel:" => crate::no_op, c"v24@0:8@16";
     });
