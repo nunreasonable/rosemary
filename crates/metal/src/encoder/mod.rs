@@ -5,6 +5,7 @@ mod compute;
 mod parallel;
 mod pass;
 mod queue;
+mod record;
 mod render;
 mod retire;
 mod state;
@@ -797,5 +798,10 @@ pub(crate) fn install() {
             set_raster_value as *const std::ffi::c_void,
             c"v24@0:8Q16",
         );
+    }
+    // Off unless asked for, and then every method above keeps its
+    // implementation: see `record`.
+    if record::enabled() {
+        record::install();
     }
 }

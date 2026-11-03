@@ -64,6 +64,8 @@ counters!(
     ImmediateCalls = "immediate_calls",
     ImmediateMicros = "immediate_micros",
     DeferredTransfers = "deferred_transfers",
+    RecordJobs = "record_jobs",
+    RecordDrainMicros = "record_drain_micros",
 );
 
 #[allow(clippy::declare_interior_mutable_const)]

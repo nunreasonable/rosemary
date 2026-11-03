@@ -1602,8 +1602,10 @@ unsafe fn set_bytes_named(encoder: Id, selector: &str, bytes: &[u8], index: u64)
 
 /// The CPU cost of recording: many dispatches and draws with the per-call
 /// binding churn a game's frame has, timed from the first bind to the end of
-/// `-commit`. Run with `cargo test --release -p metal -- --ignored
-/// --nocapture recording_cost`.
+/// `-commit`, and split into issuing the calls and committing. The draws run
+/// twice, the second time with some work of the guest's own between them, which
+/// is what `ROSEMARY_METAL_RECORD_THREAD` overlaps recording with. Run with
+/// `cargo test --release -p metal -- --ignored --nocapture recording_cost`.
 #[test]
 #[ignore = "a benchmark, not a check"]
 fn recording_cost() {
@@ -1646,10 +1648,11 @@ fn recording_cost() {
             dispatch(encoder, 1);
         }
         send_void(encoder, "endEncoding");
+        let issued = start.elapsed();
         send_void(command, "commit");
         let recorded = start.elapsed();
         send_void(command, "waitUntilCompleted");
-        recorded
+        (issued, recorded)
     };
     objc::arc::pool_pop(pool);
 
@@ -1730,34 +1733,59 @@ fn recording_cost() {
         send_number(attachment, "setLoadAction:", 2);
         send_number(attachment, "setStoreAction:", 1);
 
-        let pool = objc::arc::pool_push();
-        let start = std::time::Instant::now();
-        let command = send(queue, "commandBuffer");
-        let encoder = render_encoder(command, pass);
-        send_with_object(encoder, "setRenderPipelineState:", state);
-        for index in 0..DRAWS {
-            set_buffer_named(
-                encoder,
-                "setVertexBuffer:offset:atIndex:",
-                buffers[index % 2],
-                0,
-                0,
-            );
-            draw(encoder, 3);
-        }
-        send_void(encoder, "endEncoding");
-        send_void(command, "commit");
-        let recorded = start.elapsed();
-        send_void(command, "waitUntilCompleted");
-        objc::arc::pool_pop(pool);
-        recorded
+        let frame = |guest_work: std::time::Duration| {
+            let pool = objc::arc::pool_push();
+            let start = std::time::Instant::now();
+            let command = send(queue, "commandBuffer");
+            let encoder = render_encoder(command, pass);
+            send_with_object(encoder, "setRenderPipelineState:", state);
+            for index in 0..DRAWS {
+                let until = std::time::Instant::now() + guest_work;
+                while std::time::Instant::now() < until {
+                    std::hint::spin_loop();
+                }
+                set_buffer_named(
+                    encoder,
+                    "setVertexBuffer:offset:atIndex:",
+                    buffers[index % 2],
+                    0,
+                    0,
+                );
+                draw(encoder, 3);
+            }
+            send_void(encoder, "endEncoding");
+            let issued = start.elapsed();
+            send_void(command, "commit");
+            let recorded = start.elapsed();
+            send_void(command, "waitUntilCompleted");
+            objc::arc::pool_pop(pool);
+            (issued, recorded)
+        };
+        [frame(std::time::Duration::ZERO), frame(GUEST_WORK_PER_DRAW)]
     };
+    let per_call =
+        |time: std::time::Duration, calls: usize| time.as_secs_f64() * 1e6 / calls as f64;
+    let mode = match std::env::var_os("ROSEMARY_METAL_RECORD_THREAD") {
+        Some(value) if value != "0" => "on the record thread",
+        _ => "on the calling thread",
+    };
+    eprintln!("recording {mode}:");
     eprintln!(
-        "recording: {:.2} us/dispatch, {:.2} us/draw",
-        compute.as_secs_f64() * 1e6 / DISPATCHES as f64,
-        render.as_secs_f64() * 1e6 / DRAWS as f64,
+        "  dispatch: {:.2} us issued, {:.2} us to the end of commit",
+        per_call(compute.0, DISPATCHES),
+        per_call(compute.1, DISPATCHES),
     );
+    for ((issued, recorded), label) in render.into_iter().zip(["draw", "draw + guest work"]) {
+        eprintln!(
+            "  {label}: {:.2} us issued, {:.2} us to the end of commit",
+            per_call(issued, DRAWS),
+            per_call(recorded, DRAWS),
+        );
+    }
 }
+
+/// What a guest might spend on its own between two draws, for `recording_cost`.
+const GUEST_WORK_PER_DRAW: std::time::Duration = std::time::Duration::from_micros(2);
 
 /// `MTLVisibilityResultMode`.
 const VISIBILITY_DISABLED: u64 = 0;

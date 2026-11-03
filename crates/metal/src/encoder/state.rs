@@ -67,6 +67,9 @@ pub(super) unsafe extern "C" fn set_buffer<const STAGE: usize>(
 /// A game calls this for nearly every draw, so it must not make an object: a
 /// whole `MTLBuffer` here was a heap lock, a `VkBuffer`, a memory bind and two
 /// trips through the Objective-C runtime's global retain table per call.
+/// Metal's limit on the bytes of one `-setBytes:`.
+pub(super) const SET_BYTES_LIMIT: u64 = 4096;
+
 pub(super) unsafe extern "C" fn set_bytes<const STAGE: usize>(
     receiver: Id,
     _sel: Sel,
@@ -74,10 +77,9 @@ pub(super) unsafe extern "C" fn set_bytes<const STAGE: usize>(
     length: u64,
     index: u64,
 ) {
-    const LIMIT: u64 = 4096;
     // SAFETY: an encoder of this crate's.
     let encoder = unsafe { object::body::<Encoder>(receiver) };
-    if bytes.is_null() || length == 0 || length > LIMIT {
+    if bytes.is_null() || length == 0 || length > SET_BYTES_LIMIT {
         gpu::trace(format!("setBytes:length:atIndex: refused {length} byte(s)"));
         return;
     }
