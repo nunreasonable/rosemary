@@ -66,8 +66,7 @@ counters!(
     DeferredTransfers = "deferred_transfers",
     RecordJobs = "record_jobs",
     RecordDrainMicros = "record_drain_micros",
-    DescriptorSetRecentHits = "descriptor_set_recent_hits",
-    DescriptorSetCommandHits = "descriptor_set_command_hits",
+    DescriptorSetReuses = "descriptor_set_reuses",
 );
 
 #[allow(clippy::declare_interior_mutable_const)]

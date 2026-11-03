@@ -74,7 +74,7 @@ pub(super) unsafe fn make_command_buffer(receiver: Id, retains_resources: bool) 
             retained: Vec::new(),
             retained_set: AddressSet::default(),
             retains_resources,
-            written_sets: AddressSet::default(),
+            written_sets: Default::default(),
             uploads: Vec::new(),
             upload_used: 0,
             framebuffers: Vec::new(),

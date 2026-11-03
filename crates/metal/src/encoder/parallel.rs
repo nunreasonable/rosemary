@@ -99,7 +99,7 @@ pub(super) unsafe extern "C" fn new_sub_encoder(receiver: Id, _sel: Sel) -> Id {
             retained: Vec::new(),
             retained_set: AddressSet::default(),
             retains_resources: parent.retains_resources,
-            written_sets: AddressSet::default(),
+            written_sets: Default::default(),
             uploads: Vec::new(),
             upload_used: 0,
             framebuffers: Vec::new(),
