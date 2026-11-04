@@ -96,6 +96,9 @@ pub(crate) struct Drawable {
 struct Presentation {
     handlers: Vec<usize>,
     presented_time: f64,
+    /// `ROSEMARY_METAL_STATS`: when the drawable was handed to presentation,
+    /// to time how long its presented handlers wait.
+    queued: Option<std::time::Instant>,
 }
 
 /// Three drawable images let the guest record ahead without ever writing an
@@ -478,6 +481,12 @@ fn run_presented_handlers(drawable: Id, presented: bool) {
             true => darwin::mach::media_time(),
             false => 0.0,
         };
+        if let Some(queued) = presentation.queued.take().filter(|_| presented) {
+            let micros = queued.elapsed().as_micros() as u64;
+            crate::stats::count(crate::stats::Counter::PresentedFrames);
+            crate::stats::add(crate::stats::Counter::PresentedLatencyMicros, micros);
+            crate::stats::peak(crate::stats::Counter::PresentedLatencyPeakMicros, micros);
+        }
         std::mem::take(&mut presentation.handlers)
     };
     for block in handlers {
@@ -571,7 +580,12 @@ pub(crate) fn enqueue(drawable: Id) {
         return;
     }
     // SAFETY: a drawable of this crate's, checked above.
-    let gpu = unsafe { object::body::<Drawable>(drawable) }.gpu;
+    let described = unsafe { object::body::<Drawable>(drawable) };
+    if crate::stats::enabled() {
+        described.presentation.lock().expect("drawable presentation").queued =
+            Some(std::time::Instant::now());
+    }
+    let gpu = described.gpu;
     let presenter = &gpu.presenter;
     presenter.worker.call_once(|| {
         std::thread::Builder::new()

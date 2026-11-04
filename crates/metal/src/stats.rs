@@ -67,6 +67,9 @@ counters!(
     RecordJobs = "record_jobs",
     RecordDrainMicros = "record_drain_micros",
     DescriptorSetReuses = "descriptor_set_reuses",
+    PresentedFrames = "presented_frames",
+    PresentedLatencyMicros = "presented_latency_micros",
+    PresentedLatencyPeakMicros = "presented_latency_micros_peak",
 );
 
 #[allow(clippy::declare_interior_mutable_const)]
