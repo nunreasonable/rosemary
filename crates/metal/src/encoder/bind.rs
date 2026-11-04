@@ -870,10 +870,11 @@ impl Encoder {
 }
 
 /// A descriptor set's layout and contents, hashed over what
-/// `DescriptorEntry`'s equality compares.
+/// `DescriptorEntry`'s equality compares. Fx rather than SipHash: it runs
+/// for most draws, and a collision only costs the comparison after it.
 fn set_key(layout: vk::DescriptorSetLayout, entries: &[DescriptorEntry]) -> u64 {
     use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    let mut hasher = rustc_hash::FxHasher::default();
     layout.hash(&mut hasher);
     for entry in entries {
         (

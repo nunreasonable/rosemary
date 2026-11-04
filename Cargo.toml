@@ -57,6 +57,7 @@ webpki = { package = "rustls-webpki", version = "0.103", default-features = fals
 webpki-roots = "1"
 ureq = { version = "3", default-features = false, features = ["rustls", "gzip", "cookies"] }
 static_init = "1.0.4"
+rustc-hash = "2.1"
 owned_ttf_parser = "0.25"
 tiny-skia = { version = "0.11.4", default-features = false, features = ["std", "simd"] }
 ab_glyph_rasterizer = "0.1.9"

@@ -172,7 +172,7 @@ pub(crate) struct CommandBuffer {
     /// Every descriptor set this command buffer wrote, by layout and contents.
     /// A set is never written again once a draw has used it, and lives as long
     /// as the command buffer's pools, so any encoder of it may reuse one.
-    written_sets: std::collections::HashMap<u64, WrittenSet>,
+    written_sets: rustc_hash::FxHashMap<u64, WrittenSet>,
     /// Chunks `-setBytes:` copies are cut from, and how far into the last
     /// one the copies have reached.
     uploads: Vec<GpuBuffer>,
