@@ -681,9 +681,13 @@ impl RunLoop {
             return;
         }
         let timeout = deadline.saturating_duration_since(Instant::now());
-        let (mut woken, _) = condition
+        let start = sleep_trace::enabled().then(Instant::now);
+        let (mut woken, waited) = condition
             .wait_timeout(woken, timeout)
             .unwrap_or_else(|e| e.into_inner());
+        if let Some(start) = start {
+            sleep_trace::record(timeout, start.elapsed(), !waited.timed_out());
+        }
         *woken = false;
     }
 }
@@ -1238,5 +1242,64 @@ mod tests {
         );
         loop_.run_in_mode(DEFAULT_MODE, 0.01, true);
         assert!(SEEN.with(|s| s.get()) > 0);
+    }
+}
+
+/// `ROSEMARY_METAL_STATS`: how the main thread's loop sleeps, every five
+/// seconds - how often, for how long against what it asked for, and how often
+/// something woke it before its timer was due.
+mod sleep_trace {
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+
+    pub fn enabled() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("ROSEMARY_METAL_STATS").is_some_and(|v| v != "0"))
+            // SAFETY: no arguments; answers about the calling thread.
+            && unsafe { darwin::pthread::main_np() } != 0
+    }
+
+    struct Window {
+        since: Option<Instant>,
+        sleeps: u64,
+        signalled: u64,
+        asked: Duration,
+        slept: Duration,
+    }
+
+    static WINDOW: Mutex<Window> = Mutex::new(Window {
+        since: None,
+        sleeps: 0,
+        signalled: 0,
+        asked: Duration::ZERO,
+        slept: Duration::ZERO,
+    });
+
+    pub fn record(asked: Duration, slept: Duration, signalled: bool) {
+        let mut w = WINDOW.lock().unwrap_or_else(|e| e.into_inner());
+        let since = *w.since.get_or_insert_with(Instant::now);
+        w.sleeps += 1;
+        w.signalled += u64::from(signalled);
+        w.asked += asked;
+        w.slept += slept;
+        let elapsed = since.elapsed().as_secs_f64();
+        if elapsed >= 5.0 {
+            let sleeps = w.sleeps.max(1) as f64;
+            eprintln!(
+                "rosemary: run loop: {:.0} sleeps/s, {:.1} ms/s asleep, {:.0} us asked and {:.0} us slept on average, {:.0}% woken early",
+                w.sleeps as f64 / elapsed,
+                w.slept.as_secs_f64() * 1e3 / elapsed,
+                w.asked.as_secs_f64() * 1e6 / sleeps,
+                w.slept.as_secs_f64() * 1e6 / sleeps,
+                w.signalled as f64 * 100.0 / sleeps,
+            );
+            *w = Window {
+                since: Some(Instant::now()),
+                sleeps: 0,
+                signalled: 0,
+                asked: Duration::ZERO,
+                slept: Duration::ZERO,
+            };
+        }
     }
 }
