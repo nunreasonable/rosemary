@@ -776,6 +776,17 @@ use metal_translate::ir;
 /// are compute kernels, so the render test states the program it draws with
 /// rather than parsing one.
 fn triangle_library() -> metal_translate::TranslatedLibrary {
+    textured_triangle_library(0, 0, 0)
+}
+
+/// The red triangle, with a fragment stage that declares `buffers` constant
+/// buffers, `textures` sampled 2D textures and `samplers` samplers it never
+/// reads: what a draw binds, for measuring the cost of binding.
+fn textured_triangle_library(
+    buffers: u32,
+    textures: u32,
+    samplers: u32,
+) -> metal_translate::TranslatedLibrary {
     let float4 = ir::Type::Vector {
         element: Box::new(ir::Type::Float { bits: 32 }),
         lanes: 4,
@@ -796,11 +807,61 @@ fn triangle_library() -> metal_translate::TranslatedLibrary {
             terminator: ir::Terminator::Return(Some(ir::Operand::Value(ir::ValueId(0)))),
         }],
     };
+    let texture = ir::Type::Texture(ir::TextureType {
+        dimension: ir::TextureDimension::D2,
+        array: false,
+        multisampled: false,
+        depth: false,
+        texel: Box::new(ir::Type::Float { bits: 32 }),
+        signed: false,
+        access: ir::Access::Sample,
+    });
+    let constants = ir::Type::Pointer {
+        space: ir::AddressSpace::Constant,
+        pointee: Box::new(float4.clone()),
+    };
+    let resource_types: Vec<(ir::ResourceKind, ir::Type, ir::Access, u32)> = (0..buffers)
+        .map(|index| {
+            (
+                ir::ResourceKind::Buffer,
+                constants.clone(),
+                ir::Access::Read,
+                index,
+            )
+        })
+        .chain((0..textures).map(|index| {
+            (
+                ir::ResourceKind::Texture,
+                texture.clone(),
+                ir::Access::Sample,
+                index,
+            )
+        }))
+        .chain((0..samplers).map(|index| {
+            (
+                ir::ResourceKind::Sampler,
+                ir::Type::Sampler,
+                ir::Access::Read,
+                index,
+            )
+        }))
+        .collect();
     let fragment = ir::Function {
         name: "triangle_fragment".to_string(),
         result: float4.clone(),
-        parameters: Vec::new(),
-        values: Vec::new(),
+        parameters: resource_types
+            .iter()
+            .enumerate()
+            .map(|(argument, (_, ty, _, _))| ir::Parameter {
+                value: ir::ValueId(argument as u32),
+                name: format!("resource{argument}"),
+                ty: ty.clone(),
+            })
+            .collect(),
+        values: resource_types
+            .iter()
+            .map(|(_, ty, _, _)| ty.clone())
+            .collect(),
         blocks: vec![ir::Block {
             id: ir::BlockId(0),
             name: "entry".to_string(),
@@ -844,7 +905,20 @@ fn triangle_library() -> metal_translate::TranslatedLibrary {
             ir::EntryPoint {
                 function: 1,
                 stage: ir::Stage::Fragment,
-                resources: Vec::new(),
+                resources: resource_types
+                    .iter()
+                    .enumerate()
+                    .map(|(argument, (kind, ty, access, index))| ir::Resource {
+                        argument: argument as u32,
+                        kind: *kind,
+                        index: *index,
+                        count: 1,
+                        access: *access,
+                        ty: ty.clone(),
+                        name: None,
+                        inline_sampler: None,
+                    })
+                    .collect(),
                 inputs: Vec::new(),
                 outputs: vec![ir::StageOutput {
                     field: None,
@@ -1522,6 +1596,30 @@ unsafe fn set_buffer_named(encoder: Id, selector: &str, buffer: Id, offset: u64,
     unsafe { call(encoder, sel, buffer, offset, index) };
 }
 
+unsafe fn send_number_object(receiver: Id, selector: &str, value: u64) -> Id {
+    let sel = objc::sel::get(selector);
+    // SAFETY: an object the runtime allocated.
+    let method = unsafe { objc::object::class_of(receiver) }
+        .and_then(|class| class.method(sel))
+        .expect("the selector is registered");
+    // SAFETY: the caller guarantees the signature.
+    let call: unsafe extern "C" fn(Id, Sel, u64) -> Id =
+        unsafe { std::mem::transmute(method.implementation()) };
+    unsafe { call(receiver, sel, value) }
+}
+
+unsafe fn set_object_named(encoder: Id, selector: &str, object: Id, index: u64) {
+    let sel = objc::sel::get(selector);
+    // SAFETY: an object the runtime allocated.
+    let method = unsafe { objc::object::class_of(encoder) }
+        .and_then(|class| class.method(sel))
+        .expect("the selector is registered");
+    // SAFETY: the registered signature.
+    let call: unsafe extern "C" fn(Id, Sel, Id, u64) =
+        unsafe { std::mem::transmute(method.implementation()) };
+    unsafe { call(encoder, sel, object, index) };
+}
+
 /// # Safety
 ///
 /// `encoder` must be an `RosemaryMTLCommandEncoder` inside a render pass.
@@ -1635,8 +1733,9 @@ fn only_a_retaining_command_buffer_retains_a_bound_buffer() {
 /// The CPU cost of recording: many dispatches and draws with the per-call
 /// binding churn a game's frame has, timed from the first bind to the end of
 /// `-commit`, and split into issuing the calls and committing. The draws run
-/// twice, the second time with some work of the guest's own between them, which
-/// is what `ROSEMARY_METAL_RECORD_THREAD` overlaps recording with. Run with
+/// alone, with some work of the guest's own between them (what
+/// `ROSEMARY_METAL_RECORD_THREAD` overlaps recording with), and binding
+/// textures in sets the command buffer already wrote or has to write. Run with
 /// `cargo test --release -p metal -- --ignored --nocapture recording_cost`.
 #[test]
 #[ignore = "a benchmark, not a check"]
@@ -1688,61 +1787,101 @@ fn recording_cost() {
     };
     objc::arc::pool_pop(pool);
 
-    let library = retain_library(device, triangle_library(), None, vec![0, 0], None);
+    let plain = retain_library(device, triangle_library(), None, vec![0, 0], None);
+    let textured = retain_library(
+        device,
+        textured_triangle_library(1, BENCH_TEXTURES, BENCH_SAMPLERS),
+        None,
+        vec![0, 0],
+        None,
+    );
     // SAFETY: as in `a_translated_triangle_draws_on_the_gpu`.
     let render = unsafe {
-        let vertex = new_function_with_name(
-            library,
-            std::ptr::null(),
-            foundation::string::from_str("triangle_vertex"),
-        );
-        let fragment = new_function_with_name(
-            library,
-            std::ptr::null(),
-            foundation::string::from_str("triangle_fragment"),
-        );
-        let vertex_descriptor = object::make(
-            c"MTLVertexDescriptor",
-            resource::VertexDescriptor {
-                layouts: [resource::VertexLayout::default(); resource::VERTEX_SLOTS],
-                attributes: [resource::VertexAttribute::default(); resource::VERTEX_SLOTS],
-                layout_objects: std::ptr::null_mut(),
-                attribute_objects: std::ptr::null_mut(),
-            },
-        );
-        send_number(
-            element_at(send(vertex_descriptor, "layouts"), 0),
-            "setStride:",
-            16,
-        );
-        let attribute = element_at(send(vertex_descriptor, "attributes"), 0);
-        send_number(attribute, "setFormat:", 31);
-        send_number(attribute, "setBufferIndex:", 0);
-        let descriptor = object::make(
-            c"MTLRenderPipelineDescriptor",
-            pipeline::RenderPipelineDescriptor {
-                vertex_function: vertex,
-                fragment_function: fragment,
-                vertex_descriptor,
-                colors: [pipeline::ColorAttachment::fresh(); pipeline::COLOR_ATTACHMENTS],
-                depth_format: 0,
-                stencil_format: 0,
-                sample_count: 1,
-                alpha_to_coverage: false,
-                alpha_to_one: false,
-                rasterization: true,
-                color_objects: std::ptr::null_mut(),
-            },
-        );
-        send_number(
-            element_at(send(descriptor, "colorAttachments"), 0),
-            "setPixelFormat:",
-            80,
-        );
-        let mut error = std::ptr::null_mut();
-        let state = new_render_pipeline(device, std::ptr::null(), descriptor, &mut error);
+        let render_state = |library: Id| {
+            let vertex = new_function_with_name(
+                library,
+                std::ptr::null(),
+                foundation::string::from_str("triangle_vertex"),
+            );
+            let fragment = new_function_with_name(
+                library,
+                std::ptr::null(),
+                foundation::string::from_str("triangle_fragment"),
+            );
+            let vertex_descriptor = object::make(
+                c"MTLVertexDescriptor",
+                resource::VertexDescriptor {
+                    layouts: [resource::VertexLayout::default(); resource::VERTEX_SLOTS],
+                    attributes: [resource::VertexAttribute::default(); resource::VERTEX_SLOTS],
+                    layout_objects: std::ptr::null_mut(),
+                    attribute_objects: std::ptr::null_mut(),
+                },
+            );
+            send_number(
+                element_at(send(vertex_descriptor, "layouts"), 0),
+                "setStride:",
+                16,
+            );
+            let attribute = element_at(send(vertex_descriptor, "attributes"), 0);
+            send_number(attribute, "setFormat:", 31);
+            send_number(attribute, "setBufferIndex:", 0);
+            let descriptor = object::make(
+                c"MTLRenderPipelineDescriptor",
+                pipeline::RenderPipelineDescriptor {
+                    vertex_function: vertex,
+                    fragment_function: fragment,
+                    vertex_descriptor,
+                    colors: [pipeline::ColorAttachment::fresh(); pipeline::COLOR_ATTACHMENTS],
+                    depth_format: 0,
+                    stencil_format: 0,
+                    sample_count: 1,
+                    alpha_to_coverage: false,
+                    alpha_to_one: false,
+                    rasterization: true,
+                    color_objects: std::ptr::null_mut(),
+                },
+            );
+            send_number(
+                element_at(send(descriptor, "colorAttachments"), 0),
+                "setPixelFormat:",
+                80,
+            );
+            let mut error = std::ptr::null_mut();
+            new_render_pipeline(device, std::ptr::null(), descriptor, &mut error)
+        };
+        let plain = render_state(plain);
+        let textured = render_state(textured);
+        let gpu = gpu_of(device).expect("a Vulkan device");
+        let sampled = |_| {
+            resource::new_texture(
+                gpu,
+                resource::TextureDescriptor {
+                    texture_type: 2,
+                    pixel_format: 80,
+                    width: 64,
+                    height: 64,
+                    depth: 1,
+                    mipmap_level_count: 1,
+                    sample_count: 1,
+                    array_length: 1,
+                    storage_mode: 2,
+                    usage: gpu::USAGE_SHADER_READ,
+                },
+            )
+        };
+        // One more texture than slots, so the slot a draw rebinds always gets
+        // a texture it did not hold, but the sets repeat and stay cached.
+        let textures: Vec<Id> = (0..=BENCH_TEXTURES).map(sampled).collect();
+        // A view per draw, so every draw needs a set the command buffer has
+        // not written.
+        let views: Vec<Id> = (0..DRAWS)
+            .map(|_| send_number_object(textures[0], "newTextureViewWithPixelFormat:", 80))
+            .collect();
+        let samplers: Vec<Id> = (0..BENCH_SAMPLERS)
+            .map(|_| resource::new_sampler(gpu, &resource::SamplerDescriptor::default()))
+            .collect();
         let target = resource::new_texture(
-            gpu_of(device).expect("a Vulkan device"),
+            gpu,
             resource::TextureDescriptor {
                 texture_type: 2,
                 pixel_format: 80,
@@ -1765,13 +1904,46 @@ fn recording_cost() {
         send_number(attachment, "setLoadAction:", 2);
         send_number(attachment, "setStoreAction:", 1);
 
-        let frame = |guest_work: std::time::Duration| {
+        // A textured draw sets new constants, rebinds one texture slot to the
+        // next of `textures` and sets the samplers again to the ones they
+        // hold, as games do.
+        let frame = |guest_work: std::time::Duration, textures: &[Id]| {
+            let bind_textures = !textures.is_empty();
             let pool = objc::arc::pool_push();
             let start = std::time::Instant::now();
             let command = send(queue, "commandBuffer");
             let encoder = render_encoder(command, pass);
+            let state = if bind_textures { textured } else { plain };
             send_with_object(encoder, "setRenderPipelineState:", state);
+            if bind_textures {
+                for slot in 0..BENCH_TEXTURES as usize {
+                    set_object_named(
+                        encoder,
+                        "setFragmentTexture:atIndex:",
+                        textures[slot],
+                        slot as u64,
+                    );
+                }
+            }
             for index in 0..DRAWS {
+                if bind_textures {
+                    let slot = index % BENCH_TEXTURES as usize;
+                    set_object_named(
+                        encoder,
+                        "setFragmentTexture:atIndex:",
+                        textures[index % textures.len()],
+                        slot as u64,
+                    );
+                    set_bytes_named(encoder, "setFragmentBytes:length:atIndex:", &[0; 16], 0);
+                    for (slot, sampler) in samplers.iter().enumerate() {
+                        set_object_named(
+                            encoder,
+                            "setFragmentSamplerState:atIndex:",
+                            *sampler,
+                            slot as u64,
+                        );
+                    }
+                }
                 let until = std::time::Instant::now() + guest_work;
                 while std::time::Instant::now() < until {
                     std::hint::spin_loop();
@@ -1793,7 +1965,18 @@ fn recording_cost() {
             objc::arc::pool_pop(pool);
             (issued, recorded)
         };
-        [frame(std::time::Duration::ZERO), frame(GUEST_WORK_PER_DRAW)]
+        let frames = || {
+            [
+                frame(std::time::Duration::ZERO, &[]),
+                frame(GUEST_WORK_PER_DRAW, &[]),
+                frame(std::time::Duration::ZERO, &textures),
+                frame(std::time::Duration::ZERO, &views),
+            ]
+        };
+        // The first round makes the descriptor pools and touches their
+        // memory, which a game pays once rather than every frame.
+        frames();
+        frames()
     };
     let per_call =
         |time: std::time::Duration, calls: usize| time.as_secs_f64() * 1e6 / calls as f64;
@@ -1807,7 +1990,12 @@ fn recording_cost() {
         per_call(compute.0, DISPATCHES),
         per_call(compute.1, DISPATCHES),
     );
-    for ((issued, recorded), label) in render.into_iter().zip(["draw", "draw + guest work"]) {
+    for ((issued, recorded), label) in render.into_iter().zip([
+        "draw",
+        "draw + guest work",
+        "textured draw, cached sets",
+        "textured draw, new sets",
+    ]) {
         eprintln!(
             "  {label}: {:.2} us issued, {:.2} us to the end of commit",
             per_call(issued, DRAWS),
@@ -1818,6 +2006,10 @@ fn recording_cost() {
 
 /// What a guest might spend on its own between two draws, for `recording_cost`.
 const GUEST_WORK_PER_DRAW: std::time::Duration = std::time::Duration::from_micros(2);
+
+/// The fragment textures and samplers of a textured draw in `recording_cost`.
+const BENCH_TEXTURES: u32 = 4;
+const BENCH_SAMPLERS: u32 = 2;
 
 /// `MTLVisibilityResultMode`.
 const VISIBILITY_DISABLED: u64 = 0;
