@@ -742,9 +742,6 @@ fn presenter_retry_delay(streak: u32, busy: bool) -> std::time::Duration {
     }
 }
 
-/// How long the presentation thread waits on a swapchain copy at a time.
-const COPY_WAIT: std::time::Duration = std::time::Duration::from_millis(100);
-
 fn present_worker(gpu: &'static Gpu) {
     ON_PRESENT_WORKER.set(true);
     let presenter = &gpu.presenter;
@@ -783,12 +780,6 @@ fn present_worker(gpu: &'static Gpu) {
                 objc::arc::release(drawable);
             },
         );
-        // Nothing signals when a swapchain copy finishes, so without this its
-        // drawable's presented handlers run only when a later `-nextDrawable`
-        // or present happens to look - two frames late. A guest pacing its
-        // frames by those handlers then queues more and waits for nothing.
-        // The next copy runs behind this one on the queue anyway.
-        while crate::swapchain::wait_copied(COPY_WAIT) {}
         if !deferred.is_empty() {
             deferred_streak = if deferred.len() == submitted {
                 deferred_streak.saturating_add(1)
