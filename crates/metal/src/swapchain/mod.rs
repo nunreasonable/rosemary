@@ -1,4 +1,5 @@
 mod corners;
+mod overlay;
 mod present;
 mod scene;
 use scene::{SceneBlender, SceneLayer, ScenePlacement, ScenePrepared, SceneRollbackLayer};
@@ -326,6 +327,8 @@ struct Swapchain {
     /// been submitted. Failure requires retiring this swapchain, not simply
     /// resetting a fence and reusing the signaled acquisition semaphore.
     acquired_unsubmitted: Option<(vk::Semaphore, vk::Fence)>,
+    /// The `ROSEMARY_OVERLAY_IMAGE` picture as uploaded for this swapchain.
+    overlay: Option<UploadedOverlay>,
     #[cfg(test)]
     injected_recovery_error: Option<vk::Result>,
     #[cfg(test)]
@@ -813,6 +816,16 @@ struct Frame {
     backing: Option<Arc<BackingImageLease>>,
     /// Retained scene source images referenced by the GPU command buffer.
     scene_reads: Vec<Arc<BackingImageLease>>,
+}
+
+/// An overlay picture in a buffer the frames copy from, and what it was made
+/// for: a new picture or a new swapchain format means another upload.
+struct UploadedOverlay {
+    generation: u64,
+    format: vk::Format,
+    width: u32,
+    height: u32,
+    buffer: gpu::GpuBuffer,
 }
 
 struct PresentFence {
@@ -4916,6 +4929,7 @@ impl Swapchain {
             #[cfg(test)]
             injected_queue_submit_error: None,
             acquired_unsubmitted: None,
+            overlay: None,
             #[cfg(test)]
             injected_recovery_error: None,
             #[cfg(test)]
@@ -5281,6 +5295,89 @@ impl Swapchain {
     /// Presentation fences cover the presentation engine's access to the
     /// image and wait semaphore. On an older device, only making the queue
     /// idle supplies that guarantee.
+    /// Copy the overlay picture, if one is asked for, into a corner of
+    /// `target`, which holds the finished frame in `TRANSFER_DST_OPTIMAL`.
+    fn record_overlay(&mut self, command_buffer: vk::CommandBuffer, target: vk::Image) {
+        let Some(badge) = overlay::current() else {
+            return;
+        };
+        let Some((x, y)) =
+            overlay::origin(overlay::corner(), self.extent, badge.width, badge.height)
+        else {
+            return;
+        };
+        let stale = self.overlay.as_ref().is_none_or(|uploaded| {
+            uploaded.generation != badge.generation || uploaded.format != self.format
+        });
+        if stale {
+            if let Some(old) = self.overlay.take() {
+                // Frames in flight may still read the old picture. It changes
+                // once per server joined, so waiting here costs nothing.
+                self.gpu.wait_queue_idle();
+                self.gpu.destroy_buffer(old.buffer);
+            }
+            let Some(texels) = overlay::texels(&badge, self.format) else {
+                return;
+            };
+            let buffer = match self.gpu.create_staging_buffer(texels.len() as u64) {
+                Ok(buffer) => buffer,
+                Err(reason) => {
+                    gpu::trace_once(format!("overlay picture not uploaded: {reason}"));
+                    return;
+                }
+            };
+            // SAFETY: a fresh host-visible mapping at least this long, which no
+            // submission reads yet.
+            unsafe {
+                std::ptr::copy_nonoverlapping(texels.as_ptr(), buffer.contents, texels.len())
+            };
+            self.overlay = Some(UploadedOverlay {
+                generation: badge.generation,
+                format: self.format,
+                width: badge.width,
+                height: badge.height,
+                buffer,
+            });
+        }
+        let Some(uploaded) = &self.overlay else {
+            return;
+        };
+        let device = &self.gpu.device;
+        let region = vk::BufferImageCopy::default()
+            .image_subresource(vk::ImageSubresourceLayers {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                mip_level: 0,
+                base_array_layer: 0,
+                layer_count: 1,
+            })
+            .image_offset(vk::Offset3D { x, y, z: 0 })
+            .image_extent(vk::Extent3D {
+                width: uploaded.width,
+                height: uploaded.height,
+                depth: 1,
+            });
+        // SAFETY: recording into this frame's command buffer, after the frame's
+        // own copy into `target`, which the barrier orders this one behind.
+        unsafe {
+            barrier(
+                device,
+                command_buffer,
+                target,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                vk::AccessFlags::TRANSFER_WRITE,
+                vk::AccessFlags::TRANSFER_WRITE,
+            );
+            device.cmd_copy_buffer_to_image(
+                command_buffer,
+                uploaded.buffer.buffer,
+                target,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                &[region],
+            );
+        }
+    }
+
     fn idle(&mut self) {
         // At least one present omitted its maintenance1 fence because an old
         // fence was still pending. Even if that *old* fence signals later, it
@@ -5702,6 +5799,7 @@ impl Swapchain {
                     }
                 }
             }
+            self.record_overlay(command_buffer, target);
             transition_to_present(device, command_buffer, target);
             device
                 .end_command_buffer(command_buffer)
@@ -5901,6 +5999,10 @@ fn acquire_image(
 impl Drop for Swapchain {
     fn drop(&mut self) {
         self.idle();
+        if let Some(overlay) = self.overlay.take() {
+            // Nothing reads it after the wait above.
+            self.gpu.destroy_buffer(overlay.buffer);
+        }
         // If both queue submissions failed, the WSI acquire may still be
         // scheduling its semaphore signal. The separate acquire fence proves
         // completion of that signal; queue idle alone does not.
