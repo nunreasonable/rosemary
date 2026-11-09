@@ -824,7 +824,8 @@ struct UploadedOverlay {
     generation: u64,
     format: vk::Format,
     width: u32,
-    height: u32,
+    /// The picture's visible pixels, `(row, first column, length)`.
+    runs: Vec<(u32, u32, u32)>,
     buffer: gpu::GpuBuffer,
 }
 
@@ -5295,15 +5296,20 @@ impl Swapchain {
     /// Presentation fences cover the presentation engine's access to the
     /// image and wait semaphore. On an older device, only making the queue
     /// idle supplies that guarantee.
-    /// Copy the overlay picture, if one is asked for, into a corner of
-    /// `target`, which holds the finished frame in `TRANSFER_DST_OPTIMAL`.
+    /// Copy the overlay picture, if one is asked for, onto `target`, which
+    /// holds the finished frame in `TRANSFER_DST_OPTIMAL`.
     fn record_overlay(&mut self, command_buffer: vk::CommandBuffer, target: vk::Image) {
-        let Some(badge) = overlay::current() else {
+        let Some(shown) = overlay::current() else {
             return;
         };
-        let Some((x, y)) =
-            overlay::origin(overlay::corner(), self.extent, badge.width, badge.height)
-        else {
+        let badge = &shown.badge;
+        let Some((x, y)) = overlay::origin(
+            overlay::position(),
+            self.extent,
+            badge.width,
+            badge.height,
+            shown.shown,
+        ) else {
             return;
         };
         let stale = self.overlay.as_ref().is_none_or(|uploaded| {
@@ -5316,7 +5322,7 @@ impl Swapchain {
                 self.gpu.wait_queue_idle();
                 self.gpu.destroy_buffer(old.buffer);
             }
-            let Some(texels) = overlay::texels(&badge, self.format) else {
+            let Some(texels) = overlay::texels(badge, self.format) else {
                 return;
             };
             let buffer = match self.gpu.create_staging_buffer(texels.len() as u64) {
@@ -5335,27 +5341,46 @@ impl Swapchain {
                 generation: badge.generation,
                 format: self.format,
                 width: badge.width,
-                height: badge.height,
+                runs: overlay::runs(badge),
                 buffer,
             });
         }
         let Some(uploaded) = &self.overlay else {
             return;
         };
-        let device = &self.gpu.device;
-        let region = vk::BufferImageCopy::default()
-            .image_subresource(vk::ImageSubresourceLayers {
-                aspect_mask: vk::ImageAspectFlags::COLOR,
-                mip_level: 0,
-                base_array_layer: 0,
-                layer_count: 1,
+        // While it slides, the rows outside the window are left out.
+        let regions: Vec<_> = uploaded
+            .runs
+            .iter()
+            .filter_map(|&(row, column, length)| {
+                let into = y + row as i32;
+                (0..self.extent.height as i32).contains(&into).then(|| {
+                    let texel = u64::from(row * uploaded.width + column);
+                    vk::BufferImageCopy::default()
+                        .buffer_offset(texel * overlay::TEXEL_BYTES as u64)
+                        .image_subresource(vk::ImageSubresourceLayers {
+                            aspect_mask: vk::ImageAspectFlags::COLOR,
+                            mip_level: 0,
+                            base_array_layer: 0,
+                            layer_count: 1,
+                        })
+                        .image_offset(vk::Offset3D {
+                            x: x + column as i32,
+                            y: into,
+                            z: 0,
+                        })
+                        .image_extent(vk::Extent3D {
+                            width: length,
+                            height: 1,
+                            depth: 1,
+                        })
+                })
             })
-            .image_offset(vk::Offset3D { x, y, z: 0 })
-            .image_extent(vk::Extent3D {
-                width: uploaded.width,
-                height: uploaded.height,
-                depth: 1,
-            });
+            .collect();
+        if regions.is_empty() {
+            return;
+        }
+        let device = &self.gpu.device;
         // SAFETY: recording into this frame's command buffer, after the frame's
         // own copy into `target`, which the barrier orders this one behind.
         unsafe {
@@ -5373,7 +5398,7 @@ impl Swapchain {
                 uploaded.buffer.buffer,
                 target,
                 vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                &[region],
+                &regions,
             );
         }
     }
