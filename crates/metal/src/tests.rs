@@ -124,6 +124,99 @@ fn device_registers_the_metal_object_graph() {
     }
 }
 
+#[test]
+fn texture_descriptor_copies_preserve_settings_and_are_independent() {
+    isolate_metal_fixture!();
+    bootstrap();
+    let class = objc::class::lookup(c"MTLTextureDescriptor").expect("registered");
+    let fields = [
+        ("textureType", "setTextureType:", MTL_TEXTURE_TYPE_CUBE),
+        (
+            "pixelFormat",
+            "setPixelFormat:",
+            MTL_PIXEL_FORMAT_RGBA8_UNORM,
+        ),
+        ("width", "setWidth:", 64),
+        ("height", "setHeight:", 32),
+        ("depth", "setDepth:", 2),
+        ("mipmapLevelCount", "setMipmapLevelCount:", 3),
+        ("sampleCount", "setSampleCount:", 4),
+        ("arrayLength", "setArrayLength:", 6),
+        ("storageMode", "setStorageMode:", MTL_STORAGE_MODE_MANAGED),
+        (
+            "usage",
+            "setUsage:",
+            gpu::USAGE_SHADER_READ | gpu::USAGE_RENDER_TARGET,
+        ),
+    ];
+    // SAFETY: objects this test owns, sent their registered selectors.
+    unsafe {
+        let original = send(send(objc::class::ptr(class) as Id, "alloc"), "init");
+        for &(_, setter, value) in &fields {
+            send_number(original, setter, value);
+        }
+        let (copy_with_zone, sel) = method::<
+            unsafe extern "C" fn(Id, Sel, *mut std::ffi::c_void) -> Id,
+        >(original, "copyWithZone:");
+        let copies = [
+            copy_with_zone(original, sel, std::ptr::null_mut()),
+            send(original, "copy"),
+        ];
+        assert_ne!(copies[0], copies[1]);
+        for &copy in &copies {
+            assert!(!copy.is_null());
+            assert_ne!(copy, original);
+            assert_eq!(send_number_result(copy, "retainCount"), 1);
+            for &(getter, _, value) in &fields {
+                assert_eq!(send_number_result(copy, getter), value, "{getter}");
+            }
+        }
+        send_number(original, "setWidth:", 128);
+        send_number(copies[0], "setHeight:", 16);
+        assert_eq!(send_number_result(original, "height"), 32);
+        assert_eq!(send_number_result(copies[1], "height"), 32);
+        objc::arc::release(original);
+        for copy in copies {
+            assert_eq!(send_number_result(copy, "width"), 64);
+            objc::arc::release(copy);
+        }
+    }
+}
+
+#[test]
+fn texture_descriptor_copies_report_native_zone_argument() {
+    isolate_metal_fixture!();
+    bootstrap();
+    let class = objc::class::lookup(c"MTLTextureDescriptor").expect("registered");
+    let copy_sel = objc::sel::get("copyWithZone:");
+    let registered = class.method(copy_sel).expect("registered");
+    // SAFETY: the registered method and objects created by this test.
+    unsafe {
+        let types = objc::api::method_getTypeEncoding(std::ptr::from_ref(registered).cast());
+        // Captured from macOS 15.6.1, Metal.framework 368.52.
+        assert_eq!(std::ffi::CStr::from_ptr(types), c"@24@0:8^{_NSZone=}16");
+        let pool = objc::arc::pool_push();
+        let descriptor = send(send(objc::class::ptr(class) as Id, "alloc"), "init");
+        let (signature, sel) = method::<unsafe extern "C" fn(Id, Sel, Sel) -> Id>(
+            descriptor,
+            "methodSignatureForSelector:",
+        );
+        let signature = signature(descriptor, sel, copy_sel);
+        assert!(!signature.is_null());
+        assert_eq!(send_number_result(signature, "numberOfArguments"), 3);
+        let (argument, sel) = method::<unsafe extern "C" fn(Id, Sel, u64) -> *const std::ffi::c_char>(
+            signature,
+            "getArgumentTypeAtIndex:",
+        );
+        assert_eq!(
+            std::ffi::CStr::from_ptr(argument(signature, sel, 2)),
+            c"^{_NSZone=}"
+        );
+        objc::arc::release(descriptor);
+        objc::arc::pool_pop(pool);
+    }
+}
+
 /// A device which answers "no" to every family and feature set reads as
 /// unusable: a game asks before it decides which renderer to run.
 #[test]
@@ -1142,9 +1235,20 @@ unsafe fn element_at(receiver: Id, index: u64) -> Id {
 #[test]
 fn a_multisampled_depth_attachment_resolves_into_its_destination() {
     isolate_metal_fixture!();
-    let Some(device) = gpu_device() else {
-        return;
-    };
+    if let Some(device) = gpu_device() {
+        check_depth_resolve(device);
+    }
+}
+
+#[test]
+fn a_multisampled_depth_attachment_resolves_without_dynamic_rendering() {
+    isolate_metal_fixture!();
+    if let Some(device) = gpu_device_without_dynamic_rendering() {
+        check_depth_resolve(device);
+    }
+}
+
+fn check_depth_resolve(device: Id) {
     let gpu = gpu_of(device).expect("a Vulkan device");
     const SAMPLES: u64 = 4;
     const SIZE: u64 = 8;
@@ -1333,6 +1437,167 @@ fn a_multisampled_depth_attachment_resolves_into_its_destination() {
         assert!(
             (depth - 0.5).abs() < 1.0e-5,
             "the depth resolve wrote {depth}, not the drawn 0.5"
+        );
+        if gpu.dynamic_rendering {
+            // The resolve is the pass's, not the pipeline's: the draw used
+            // the pipeline compiled when the state was made.
+            let state = object::body::<pipeline::RenderPipeline>(state);
+            assert_eq!(state.variant_count(), 1);
+        }
+    }
+}
+
+/// A render pipeline descriptor drawing `triangle_library`'s triangle into
+/// one BGRA8 target, owned by the caller.
+fn triangle_pipeline_descriptor(device: Id) -> Id {
+    let library = retain_library(device, triangle_library(), None, vec![0, 0], None);
+    // SAFETY: a library this test made.
+    let (vertex, fragment) = unsafe {
+        (
+            new_function_with_name(
+                library,
+                std::ptr::null(),
+                foundation::string::from_str("triangle_vertex"),
+            ),
+            new_function_with_name(
+                library,
+                std::ptr::null(),
+                foundation::string::from_str("triangle_fragment"),
+            ),
+        )
+    };
+    let vertex_descriptor = object::make(
+        c"MTLVertexDescriptor",
+        resource::VertexDescriptor {
+            layouts: [resource::VertexLayout::default(); resource::VERTEX_SLOTS],
+            attributes: [resource::VertexAttribute::default(); resource::VERTEX_SLOTS],
+            layout_objects: std::ptr::null_mut(),
+            attribute_objects: std::ptr::null_mut(),
+        },
+    );
+    // SAFETY: objects this test made, sent the selectors they implement.
+    unsafe {
+        send_number(
+            element_at(send(vertex_descriptor, "layouts"), 0),
+            "setStride:",
+            16,
+        );
+        let attribute = element_at(send(vertex_descriptor, "attributes"), 0);
+        send_number(attribute, "setFormat:", 31); // MTLVertexFormatFloat4
+        send_number(attribute, "setBufferIndex:", 0);
+    }
+    let descriptor = object::make(
+        c"MTLRenderPipelineDescriptor",
+        pipeline::RenderPipelineDescriptor {
+            vertex_function: vertex,
+            fragment_function: fragment,
+            vertex_descriptor,
+            colors: [pipeline::ColorAttachment::fresh(); pipeline::COLOR_ATTACHMENTS],
+            depth_format: 0,
+            stencil_format: 0,
+            sample_count: 1,
+            alpha_to_coverage: false,
+            alpha_to_one: false,
+            rasterization: true,
+            input_topology: 0,
+            color_objects: std::ptr::null_mut(),
+        },
+    );
+    // SAFETY: a descriptor this test made.
+    unsafe {
+        send_number(
+            element_at(send(descriptor, "colorAttachments"), 0),
+            "setPixelFormat:",
+            BGRA8,
+        );
+    }
+    descriptor
+}
+
+/// A global block whose `invoke` is `imp`: copying one is a no-op, so a
+/// test needs no copy or dispose helpers.
+#[repr(C)]
+struct GlobalBlock {
+    isa: *const std::ffi::c_void,
+    flags: i32,
+    reserved: i32,
+    invoke: *const std::ffi::c_void,
+    descriptor: *const [u64; 2],
+}
+
+/// `Block_descriptor_1`: reserved, then the block's size.
+static GLOBAL_BLOCK_DESCRIPTOR: [u64; 2] = [0, size_of::<GlobalBlock>() as u64];
+
+impl GlobalBlock {
+    fn new(imp: *const std::ffi::c_void) -> Box<Self> {
+        let isa = objc::class::lookup(c"__NSGlobalBlock__")
+            .map(|class| objc::class::ptr(class) as *const std::ffi::c_void)
+            .expect("registered by `objc::block`");
+        Box::new(Self {
+            isa,
+            // BLOCK_IS_GLOBAL.
+            flags: 1 << 28,
+            reserved: 0,
+            invoke: imp,
+            descriptor: &GLOBAL_BLOCK_DESCRIPTOR,
+        })
+    }
+
+    fn id(&self) -> Id {
+        self as *const Self as Id
+    }
+}
+
+/// What a creation handler was handed, retained, and the thread it ran on.
+static CREATED: Mutex<Option<(usize, bool, std::thread::ThreadId)>> = Mutex::new(None);
+static CREATED_READY: std::sync::Condvar = std::sync::Condvar::new();
+
+unsafe extern "C" fn record_creation(_block: Id, object: Id, error: Id) {
+    *CREATED.lock().expect("creation record") = Some((
+        objc::arc::retain(object) as usize,
+        error.is_null(),
+        std::thread::current().id(),
+    ));
+    CREATED_READY.notify_all();
+}
+
+/// `newRenderPipelineStateWithDescriptor:completionHandler:` compiles on
+/// another thread, from the descriptor as it was when the call was made.
+#[test]
+fn an_asynchronous_render_pipeline_compiles_off_the_calling_thread() {
+    isolate_metal_fixture!();
+    let Some(device) = gpu_device() else {
+        return;
+    };
+    let descriptor = triangle_pipeline_descriptor(device);
+    let block = GlobalBlock::new(record_creation as *const std::ffi::c_void);
+    // SAFETY: a device, descriptor and handler this test made.
+    unsafe {
+        compile::new_render_pipeline(device, std::ptr::null(), descriptor, block.id());
+        // Three samples is no sample count: compiled from the live
+        // descriptor, the pipeline would fail.
+        send_number(descriptor, "setSampleCount:", 3);
+    }
+    let (created, _) = CREATED_READY
+        .wait_timeout_while(
+            CREATED.lock().expect("creation record"),
+            std::time::Duration::from_secs(60),
+            |created| created.is_none(),
+        )
+        .expect("creation record");
+    let (state, no_error, thread) = created.expect("the handler ran");
+    assert!(state != 0 && no_error, "the pipeline was not made");
+    assert_ne!(thread, std::thread::current().id());
+    if gpu_of(device)
+        .expect("a Vulkan device")
+        .dynamic_render_state
+    {
+        // SAFETY: the render pipeline state the handler was given.
+        let state = unsafe { object::body::<pipeline::RenderPipeline>(state as Id) };
+        assert_eq!(
+            state.variant_count(),
+            1,
+            "compiled before it was handed over"
         );
     }
 }
@@ -1836,8 +2101,8 @@ unsafe fn send_number_result(receiver: Id, selector: &str) -> u64 {
 
 /// # Safety
 ///
-/// `texture` must be an `RosemaryMTLTexture` of four bytes a texel, and
-/// `bytes` must cover the region at `bytes_per_row`.
+/// `texture` must be an `RosemaryMTLTexture`, and `bytes` must cover the
+/// region at `bytes_per_row`.
 unsafe fn replace_region(texture: Id, region: [u64; 4], bytes: &[u8], bytes_per_row: u64) {
     #[repr(C)]
     struct Region {
@@ -3004,9 +3269,20 @@ fn passes_sharing_nothing_record_no_barrier_between_them() {
 #[test]
 fn a_texture_bound_after_drawing_began_waits_for_the_pass_which_drew_it() {
     isolate_metal_fixture!();
-    let Some(device) = gpu_device() else {
-        return;
-    };
+    if let Some(device) = gpu_device() {
+        check_split_pass_sees_earlier_pass(device);
+    }
+}
+
+#[test]
+fn a_split_render_pass_continues_without_dynamic_rendering() {
+    isolate_metal_fixture!();
+    if let Some(device) = gpu_device_without_dynamic_rendering() {
+        check_split_pass_sees_earlier_pass(device);
+    }
+}
+
+fn check_split_pass_sees_earlier_pass(device: Id) {
     let fixture = SamplingDraw::new(device);
     let red = fixture.filled(RED);
     let (drawn, target) = (fixture.target(), fixture.target());
@@ -3152,6 +3428,61 @@ fn culling_and_winding_change_without_another_pipeline() {
         assert_all(&pixels[2], BLUE_PIXEL, "unculled");
         let gpu = gpu_of(device).expect("a Vulkan device");
         if gpu.dynamic_render_state {
+            let state = object::body::<crate::pipeline::RenderPipeline>(fixture.state);
+            assert_eq!(state.variant_count(), 1);
+        }
+    }
+}
+
+/// Fill and depth clip mode are set per draw where the device can: wireframe
+/// leaves the middle of the triangle undrawn, clamping changes nothing for a
+/// triangle inside the depth range, and neither compiles another pipeline.
+#[test]
+fn fill_and_depth_clip_modes_change_without_another_pipeline() {
+    isolate_metal_fixture!();
+    if let Some(device) = gpu_device() {
+        check_fill_and_depth_clip_modes(device);
+    }
+}
+
+#[test]
+fn fill_and_depth_clip_modes_draw_without_dynamic_rendering() {
+    isolate_metal_fixture!();
+    if let Some(device) = gpu_device_without_dynamic_rendering() {
+        check_fill_and_depth_clip_modes(device);
+    }
+}
+
+fn check_fill_and_depth_clip_modes(device: Id) {
+    const FILL: u64 = 0;
+    const LINES: u64 = 1;
+    const CLIP: u64 = 0;
+    const CLAMP: u64 = 1;
+    let fixture = SamplingDraw::new(device);
+    let blue = fixture.filled(BLUE);
+    let cases = [(FILL, CLIP), (LINES, CLIP), (FILL, CLAMP)];
+    let targets: Vec<Id> = cases.iter().map(|_| fixture.target()).collect();
+    // SAFETY: objects this test made, sent the selectors they implement.
+    unsafe {
+        let command = send(fixture.queue, "commandBuffer");
+        for (&(fill, clip), &target) in cases.iter().zip(&targets) {
+            let pass = render_encoder(command, single_target_pass(target, LOAD_CLEAR, RED));
+            fixture.prepare(pass, blue);
+            send_number(pass, "setTriangleFillMode:", fill);
+            send_number(pass, "setDepthClipMode:", clip);
+            draw(pass, 3);
+            send_void(pass, "endEncoding");
+        }
+        let pixels = fixture.read(command, &targets);
+        let middle = (HAZARD_SIZE / 2 * HAZARD_SIZE + HAZARD_SIZE / 2) as usize;
+        assert_all(&pixels[0], BLUE_PIXEL, "filled");
+        assert_eq!(pixels[1][middle], RED_PIXEL, "inside a wireframe triangle");
+        assert_all(&pixels[2], BLUE_PIXEL, "clamped");
+        if gpu_of(device)
+            .expect("a Vulkan device")
+            .dynamic_raster
+            .is_some()
+        {
             let state = object::body::<crate::pipeline::RenderPipeline>(fixture.state);
             assert_eq!(state.variant_count(), 1);
         }
@@ -3513,9 +3844,20 @@ fn an_accumulating_pass_adds_to_the_held_result() {
 #[test]
 fn parallel_sub_encoders_add_into_one_result() {
     isolate_metal_fixture!();
-    let Some(device) = gpu_device() else {
-        return;
-    };
+    if let Some(device) = gpu_device() {
+        check_parallel_sub_encoders(device);
+    }
+}
+
+#[test]
+fn parallel_sub_encoders_inherit_a_render_pass_without_dynamic_rendering() {
+    isolate_metal_fixture!();
+    if let Some(device) = gpu_device_without_dynamic_rendering() {
+        check_parallel_sub_encoders(device);
+    }
+}
+
+fn check_parallel_sub_encoders(device: Id) {
     let Some(fixture) = covering_draw(device) else {
         return;
     };
@@ -4318,6 +4660,16 @@ fn gpu_device_without_push_descriptors() -> Option<Id> {
     Some(device)
 }
 
+/// A device which begins passes through render passes and compiles fill and
+/// depth clip mode into its pipelines, as one without dynamic rendering does.
+fn gpu_device_without_dynamic_rendering() -> Option<Id> {
+    gpu::TEST_WITHOUT_DYNAMIC_RENDERING.store(true, Ordering::Release);
+    let device = gpu_device()?;
+    let gpu = gpu_of(device).expect("a GPU");
+    assert!(!gpu.dynamic_rendering && gpu.dynamic_raster.is_none());
+    Some(device)
+}
+
 fn check_remembered_sets_keep_their_textures(device: Id) {
     let kernel = kernel_from_source(
         device,
@@ -4790,6 +5142,74 @@ fn a_new_buffer_reads_zero_over_a_range_bytes_were_written_to() {
             }
             objc::arc::release(read_back);
         }
+    }
+}
+
+/// A texture cut from a heap range an earlier texture used must read as
+/// zeros, as fresh memory does, including formats Vulkan cannot clear.
+#[test]
+fn a_new_texture_reads_zero_over_a_range_texels_were_written_to() {
+    isolate_metal_fixture!();
+    let Some(device) = gpu_device() else {
+        return;
+    };
+    const SIZE: u64 = 64;
+    const ROUNDS: usize = 4;
+    const RGBA8_UNORM: u64 = 70;
+    const BC1_RGBA: u64 = 130;
+    let gpu = gpu_of(device).expect("a Vulkan device");
+    for (format, row_bytes) in [(RGBA8_UNORM, SIZE * 4), (BC1_RGBA, SIZE / 4 * 8)] {
+        let rows = match format {
+            BC1_RGBA => SIZE / 4,
+            _ => SIZE,
+        };
+        let length = (row_bytes * rows) as usize;
+        let make = || {
+            let texture = resource::new_texture(
+                gpu,
+                resource::TextureDescriptor {
+                    texture_type: 2,
+                    pixel_format: format,
+                    width: SIZE,
+                    height: SIZE,
+                    depth: 1,
+                    mipmap_level_count: 1,
+                    sample_count: 1,
+                    array_length: 1,
+                    storage_mode: 0,
+                    usage: gpu::USAGE_SHADER_READ,
+                },
+            );
+            assert!(!texture.is_null());
+            texture
+        };
+        let mut reused = false;
+        for round in 0..ROUNDS {
+            let dirty = make();
+            let bytes = vec![0xAB_u8; length];
+            let mut read = vec![0_u8; length];
+            // SAFETY: a texture this test made, and bytes covering it.
+            unsafe {
+                replace_region(dirty, [0, 0, SIZE, SIZE], &bytes, row_bytes);
+                get_bytes(dirty, [0, 0, SIZE, SIZE], &mut read, row_bytes);
+            }
+            assert!(read == bytes, "format {format}, round {round}");
+            objc::arc::release(dirty);
+            let clean = make();
+            // SAFETY: a texture this test made.
+            let image = unsafe { &object::body::<resource::Texture>(clean).image };
+            reused |= image
+                .heap
+                .is_some_and(|(_, allocation)| !allocation.pristine);
+            // SAFETY: as above.
+            unsafe { get_bytes(clean, [0, 0, SIZE, SIZE], &mut read, row_bytes) };
+            assert!(
+                read.iter().all(|byte| *byte == 0),
+                "format {format}, round {round}"
+            );
+            objc::arc::release(clean);
+        }
+        assert!(reused, "format {format} never landed on a reused range");
     }
 }
 
