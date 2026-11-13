@@ -13,6 +13,7 @@ pub mod boxed;
 pub mod calendar;
 pub mod callbacks;
 pub mod collections;
+pub mod decl;
 mod diskarbitration;
 pub mod eightbit;
 /// Only on Darwin: nowhere else is there another CoreFoundation to meet.
@@ -50,21 +51,14 @@ pub fn bootstrap() {
 
 exports::exports! {
     functions {
-        "CFRetain" => api::CFRetain,
-        "CFRelease" => api::CFRelease,
         "CFAutorelease" => api::CFAutorelease,
         "CFMakeCollectable" => api::CFMakeCollectable,
         "CFGetRetainCount" => api::CFGetRetainCount,
-        "CFGetTypeID" => api::CFGetTypeID,
         "CFCopyDescription" => api::CFCopyDescription,
         "CFShow" => api::CFShow,
-        "CFEqual" => api::CFEqual,
-        "CFHash" => api::CFHash,
         "CFAllocatorGetTypeID" => api::CFAllocatorGetTypeID,
         "CFAllocatorGetDefault" => api::CFAllocatorGetDefault,
         "CFAllocatorCreate" => api::CFAllocatorCreate,
-        "CFStringGetTypeID" => api::CFStringGetTypeID,
-        "CFStringCreateWithCString" => api::CFStringCreateWithCString,
         "CFStringCreateWithFileSystemRepresentation" => api::CFStringCreateWithFileSystemRepresentation,
         "CFStringCreateWithCStringNoCopy" => api::CFStringCreateWithCStringNoCopy,
         "CFStringCreateWithBytes" => api::CFStringCreateWithBytes,
@@ -72,11 +66,9 @@ exports::exports! {
         "CFStringCreateWithCharactersNoCopy" => api::CFStringCreateWithCharactersNoCopy,
         "CFStringCreateCopy" => api::CFStringCreateCopy,
         "CFStringCreateWithSubstring" => api::CFStringCreateWithSubstring,
-        "CFStringGetLength" => api::CFStringGetLength,
         "CFStringGetIntValue" => api::CFStringGetIntValue,
         "CFStringGetDoubleValue" => api::CFStringGetDoubleValue,
         "CFStringGetMaximumSizeForEncoding" => api::CFStringGetMaximumSizeForEncoding,
-        "CFStringGetCString" => api::CFStringGetCString,
         "CFStringGetCStringPtr" => api::CFStringGetCStringPtr,
         "CFStringGetBytes" => api::CFStringGetBytes,
         "CFStringCreateExternalRepresentation" => api::CFStringCreateExternalRepresentation,
@@ -109,13 +101,8 @@ exports::exports! {
         "CFStringGetFileSystemRepresentation" => api::CFStringGetFileSystemRepresentation,
         "CFStringGetMaximumSizeOfFileSystemRepresentation"
             => api::CFStringGetMaximumSizeOfFileSystemRepresentation,
-        "CFArrayGetTypeID" => api::CFArrayGetTypeID,
         "CFArrayCreate" => api::CFArrayCreate,
         "CFArrayApplyFunction" => api::CFArrayApplyFunction,
-        "CFArrayGetCount" => api::CFArrayGetCount,
-        "CFArrayGetValueAtIndex" => api::CFArrayGetValueAtIndex,
-        "CFArrayCreateMutable" => api::CFArrayCreateMutable,
-        "CFArrayAppendValue" => api::CFArrayAppendValue,
         "CFArrayExchangeValuesAtIndices" => api::CFArrayExchangeValuesAtIndices,
         "CFArraySortValues" => api::CFArraySortValues,
         "CFArrayCreateCopy" => api::CFArrayCreateCopy,
@@ -126,34 +113,20 @@ exports::exports! {
         "CFSetApplyFunction" => api::CFSetApplyFunction,
         "CFSetGetCount" => api::CFSetGetCount,
         "CFSetGetValues" => api::CFSetGetValues,
-        "CFDictionaryGetTypeID" => api::CFDictionaryGetTypeID,
         "CFDictionaryCreate" => api::CFDictionaryCreate,
-        "CFDictionaryGetCount" => api::CFDictionaryGetCount,
         "CFDictionaryGetCountOfKey" => api::CFDictionaryGetCountOfKey,
         "CFDictionaryCreateCopy" => api::CFDictionaryCreateCopy,
         "CFDictionaryCreateMutableCopy" => api::CFDictionaryCreateMutableCopy,
         "CFDictionaryApplyFunction" => api::CFDictionaryApplyFunction,
-        "CFDictionaryGetValue" => api::CFDictionaryGetValue,
         "CFDictionaryGetValueIfPresent" => api::CFDictionaryGetValueIfPresent,
         "CFDictionaryContainsKey" => api::CFDictionaryContainsKey,
         "CFDictionaryGetKeysAndValues" => api::CFDictionaryGetKeysAndValues,
-        "CFDictionaryCreateMutable" => api::CFDictionaryCreateMutable,
-        "CFDictionarySetValue" => api::CFDictionarySetValue,
         "CFDictionaryAddValue" => api::CFDictionaryAddValue,
-        "CFNumberGetTypeID" => api::CFNumberGetTypeID,
-        "CFBooleanGetTypeID" => api::CFBooleanGetTypeID,
-        "CFBooleanGetValue" => api::CFBooleanGetValue,
-        "CFNumberCreate" => api::CFNumberCreate,
-        "CFNumberGetValue" => api::CFNumberGetValue,
         "CFNumberGetType" => api::CFNumberGetType,
         "CFNumberIsFloatType" => api::CFNumberIsFloatType,
         "CFNumberGetByteSize" => api::CFNumberGetByteSize,
-        "CFDataGetTypeID" => api::CFDataGetTypeID,
-        "CFDataCreate" => api::CFDataCreate,
         "CFDataCreateWithBytesNoCopy" => api::CFDataCreateWithBytesNoCopy,
         "CFDataCreateCopy" => api::CFDataCreateCopy,
-        "CFDataGetLength" => api::CFDataGetLength,
-        "CFDataGetBytePtr" => api::CFDataGetBytePtr,
         "CFDataGetMutableBytePtr" => api::CFDataGetMutableBytePtr,
         "CFDataSetLength" => api::CFDataSetLength,
         "CFDataIncreaseLength" => api::CFDataIncreaseLength,
@@ -239,7 +212,6 @@ exports::exports! {
         "CFArrayAppendArray" => api::CFArrayAppendArray,
         "CFRunLoopRemoveSource" => api::CFRunLoopRemoveSource,
         "CFRunLoopContainsSource" => api::CFRunLoopContainsSource,
-        "CFAbsoluteTimeGetCurrent" => api::CFAbsoluteTimeGetCurrent,
         "CFRunLoopTimerCreate" => api::CFRunLoopTimerCreate,
         "CFRunLoopTimerGetContext" => api::CFRunLoopTimerGetContext,
         "CFRunLoopAddTimer" => api::CFRunLoopAddTimer,
@@ -249,6 +221,7 @@ exports::exports! {
         "CFRunLoopGetNextTimerFireDate" => api::CFRunLoopGetNextTimerFireDate,
     }
     groups {
+        decl,
         calendar,
         preferences,
         propertylist,
@@ -1201,11 +1174,11 @@ mod tests {
 #[cfg(test)]
 mod collection_tests {
     use super::*;
-    use base::CFTypeRef;
+    use base::{CFIndex, CFTypeRef};
     use collections::number_type;
     use std::ffi::c_void;
 
-    fn number(kind: i32, value: i64) -> CFTypeRef {
+    fn number(kind: CFIndex, value: i64) -> CFTypeRef {
         // SAFETY: `value` outlives the call and is wider than any `kind` here.
         unsafe {
             api::CFNumberCreate(
@@ -1465,7 +1438,7 @@ mod collection_tests {
             let n = number(created, 0);
             // SAFETY: a number made above.
             unsafe {
-                assert_eq!(api::CFNumberGetType(n), reported as isize, "{created}");
+                assert_eq!(api::CFNumberGetType(n), reported, "{created}");
                 assert_eq!(api::CFNumberGetByteSize(n), size, "{created}");
                 api::CFRelease(n);
             }
@@ -1499,7 +1472,7 @@ mod collection_tests {
                     1
                 );
                 assert_eq!(read, expected);
-                assert_eq!(api::CFNumberGetType(object), number_type::CHAR as isize);
+                assert_eq!(api::CFNumberGetType(object), number_type::CHAR);
                 assert_eq!(api::CFNumberGetByteSize(object), 1);
                 assert_eq!(api::CFNumberIsFloatType(object), 0);
             }
@@ -1534,7 +1507,7 @@ mod collection_tests {
         // SAFETY: each is laid out as its class's instances are.
         unsafe {
             let int = &int as *const Integer as CFTypeRef;
-            assert_eq!(api::CFNumberGetType(int), number_type::SINT32 as isize);
+            assert_eq!(api::CFNumberGetType(int), number_type::SINT32);
             let mut read: i64 = 0;
             assert_eq!(
                 api::CFNumberGetValue(
@@ -1546,9 +1519,9 @@ mod collection_tests {
             );
             assert_eq!(read, -9);
             let unsigned = &unsigned as *const Integer as CFTypeRef;
-            assert_eq!(api::CFNumberGetType(unsigned), number_type::SINT64 as isize);
+            assert_eq!(api::CFNumberGetType(unsigned), number_type::SINT64);
             let real = &real as *const Double as CFTypeRef;
-            assert_eq!(api::CFNumberGetType(real), number_type::FLOAT64 as isize);
+            assert_eq!(api::CFNumberGetType(real), number_type::FLOAT64);
             assert_eq!(api::CFNumberIsFloatType(real), 1);
         }
     }

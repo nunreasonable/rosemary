@@ -16,7 +16,7 @@ mod mutability {
 }
 
 /// `CFPropertyListFormat`, as `*format` reports it.
-mod format {
+pub(crate) mod format {
     pub const XML_V1_0: i64 = 100;
     pub const BINARY_V1_0: i64 = 200;
 }
@@ -378,7 +378,7 @@ pub unsafe extern "C" fn CFPropertyListCreateData(
     _allocator: CFAllocatorRef,
     list: CFTypeRef,
     format: CFIndex,
-    _options: u64,
+    _options: usize,
     error: *mut CFTypeRef,
 ) -> CFTypeRef {
     if !error.is_null() {
@@ -406,7 +406,6 @@ pub unsafe extern "C" fn CFPropertyListCreateData(
 
 exports::exports! {
     functions {
-        "CFPropertyListCreateData" => CFPropertyListCreateData,
         "CFPropertyListCreateWithData" => CFPropertyListCreateWithData,
         "CFPropertyListCreateFromXMLData" => CFPropertyListCreateFromXMLData,
     }

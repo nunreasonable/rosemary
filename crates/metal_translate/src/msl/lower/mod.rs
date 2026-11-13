@@ -225,10 +225,39 @@ impl<'p> Context<'p> {
         })
     }
 
+    fn zero(&self, ty: &Ty, line: usize) -> Result<Operand> {
+        let elements = match ty {
+            Ty::Scalar(scalar) => return Ok(number_operand(*scalar, Number::Int(0))),
+            Ty::ByteBool => return Ok(number_operand(Scalar::UCHAR, Number::Int(0))),
+            Ty::Vector(scalar, lanes) | Ty::Packed(scalar, lanes) => {
+                vec![number_operand(*scalar, Number::Int(0)); usize::from(*lanes)]
+            }
+            Ty::Matrix {
+                scalar,
+                columns,
+                rows,
+            } => {
+                vec![self.zero(&Ty::Vector(*scalar, *rows), line)?; usize::from(*columns)]
+            }
+            Ty::Array(element, count) => vec![self.zero(element, line)?; *count as usize],
+            Ty::Struct(index) => self.program.structs[*index]
+                .fields
+                .iter()
+                .map(|field| self.zero(&field.ty, line))
+                .collect::<Result<_>>()?,
+            _ => return Err(syntax_error(line, "this type cannot be zero-initialized")),
+        };
+        Ok(Operand::Composite {
+            ty: self.ir(ty),
+            elements,
+        })
+    }
+
     /// A constant initializer: literals, constructors of literals, and lists
     /// of either.
     fn constant(&self, expr: &Expr, ty: &Ty, line: usize) -> Result<Operand> {
         match (ty, &expr.kind) {
+            (_, ExprKind::InitList(items)) if items.is_empty() => self.zero(ty, line),
             (Ty::Array(element, count), ExprKind::InitList(items)) => {
                 if items.len() != *count as usize {
                     return Err(syntax_error(
@@ -814,6 +843,16 @@ impl<'c, 'p> Lowerer<'c, 'p> {
                 let lvalue = self.local_lvalue(ty);
                 if let Some(init) = init {
                     match (&init.kind, ty) {
+                        (
+                            ExprKind::InitList(items),
+                            Ty::Scalar(_) | Ty::Vector(..) | Ty::Matrix { .. },
+                        ) if items.is_empty() => {
+                            let value = Value {
+                                op: self.context.zero(ty, *line)?,
+                                ty: ty.clone(),
+                            };
+                            self.store(&lvalue, value, *line)?;
+                        }
                         (ExprKind::InitList(items), Ty::Array(element, count)) => {
                             if items.len() > *count as usize {
                                 return Err(syntax_error(*line, "too many initializers"));
@@ -827,7 +866,7 @@ impl<'c, 'p> Lowerer<'c, 'p> {
                                         self.convert(value, element, item.line)?
                                     }
                                     None => Value {
-                                        op: self.zero(element, *line)?,
+                                        op: self.context.zero(element, *line)?,
                                         ty: (**element).clone(),
                                     },
                                 };
@@ -1242,6 +1281,7 @@ impl<'c, 'p> Lowerer<'c, 'p> {
         lowerer.globals_base = globals.len() as u32;
         let mut parameters = Vec::new();
         let mut entry = EntryPoint {
+            early_fragment_tests: function.early_fragment_tests,
             function: index,
             stage,
             resources: Vec::new(),

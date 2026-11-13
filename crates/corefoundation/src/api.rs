@@ -1959,7 +1959,7 @@ pub unsafe extern "C" fn CFBooleanGetValue(value: CFTypeRef) -> Boolean {
 
 pub unsafe extern "C" fn CFNumberCreate(
     _allocator: CFAllocatorRef,
-    kind: i32,
+    kind: CFIndex,
     value: *const c_void,
 ) -> CFTypeRef {
     let (Some((width, is_float)), false) = (collections::number_shape(kind), value.is_null())
@@ -1992,7 +1992,7 @@ pub unsafe extern "C" fn CFNumberCreate(
 /// is the only behaviour that makes a working program keep working.
 pub unsafe extern "C" fn CFNumberGetValue(
     number: CFTypeRef,
-    kind: i32,
+    kind: CFIndex,
     out: *mut c_void,
 ) -> Boolean {
     let (Some(n), Some((width, is_float)), false) = (
@@ -2033,7 +2033,7 @@ pub unsafe extern "C" fn CFNumberIsFloatType(number: CFTypeRef) -> Boolean {
 ///
 /// Zero, which is no type, for anything that is not a number.
 pub unsafe extern "C" fn CFNumberGetType(number: CFTypeRef) -> CFIndex {
-    unsafe { collections::number_type(number) }.map_or(0, |kind| kind as CFIndex)
+    unsafe { collections::number_type(number) }.unwrap_or(0)
 }
 
 /// The width of the number's canonical type.
@@ -3389,7 +3389,10 @@ fn absolute_time() -> f64 {
         .unwrap_or(0.0)
 }
 
-pub unsafe extern "C" fn CFAbsoluteTimeGetCurrent() -> f64 {
+pub type CFTimeInterval = f64;
+pub type CFAbsoluteTime = CFTimeInterval;
+
+pub unsafe extern "C" fn CFAbsoluteTimeGetCurrent() -> CFAbsoluteTime {
     absolute_time()
 }
 
@@ -4183,12 +4186,15 @@ mod no_copy_tests {
     /// `bytes` in a fresh `malloc` block.
     fn malloc_copy(bytes: &[u8]) -> *mut u8 {
         // SAFETY: a block of the right size, filled before it is handed out.
-        unsafe {
+        let block = unsafe {
             let block = libc::malloc(bytes.len()).cast::<u8>();
             assert!(!block.is_null());
             std::ptr::copy_nonoverlapping(bytes.as_ptr(), block, bytes.len());
             block
-        }
+        };
+        // A reused address was freed as some earlier block, not as this one.
+        FREED.lock().unwrap().retain(|&freed| freed != block as usize);
+        block
     }
 
     /// Run `body` with `recording_free` as the guest's `free`.

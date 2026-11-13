@@ -114,8 +114,8 @@ impl Lowerer<'_, '_> {
         args: &[Expr],
         line: usize,
     ) -> Result<Value> {
-        if let Some(function) = self.helper(name, args.len(), line)? {
-            return self.inline_call(function, args, line);
+        if let Some(value) = self.call_helper(name, args, line)? {
+            return Ok(value);
         }
         if let Some(op) = atomic_op(name) {
             return self.atomic(name, op, args, line);
@@ -826,13 +826,49 @@ impl Lowerer<'_, '_> {
                 ExprKind::Call { name, .. } if name == "min_lod_clamp" => {
                     return Err(syntax_error(line, "min_lod_clamp is not supported"));
                 }
-                ExprKind::Ident(name) if gather && name.starts_with("component") => {
-                    return Err(syntax_error(line, "a gather component is not supported"));
+                ExprKind::Ident(name) if gather && name.starts_with("component::") => {
+                    if texture_type.depth {
+                        return Err(syntax_error(
+                            line,
+                            "a depth texture gather has no component",
+                        ));
+                    }
+                    if component.is_some() {
+                        return Err(syntax_error(line, "a gather takes one component"));
+                    }
+                    // The offset parameter precedes the component and has no
+                    // conversion from it.
+                    if offset.is_none() {
+                        return Err(syntax_error(
+                            line,
+                            "a gather component must follow an offset",
+                        ));
+                    }
+                    component = Some(match name.as_str() {
+                        "component::x" => 0,
+                        "component::y" => 1,
+                        "component::z" => 2,
+                        "component::w" => 3,
+                        _ => return Err(syntax_error(line, "an unknown gather component")),
+                    });
                 }
                 _ if gather && component.is_none() && offset.is_some() => {
-                    component = Some(self.context.const_index(arg)?);
+                    if texture_type.depth {
+                        return Err(syntax_error(
+                            line,
+                            "a depth texture gather has no component",
+                        ));
+                    }
+                    let index = self.context.const_index(arg)?;
+                    if index > 3 {
+                        return Err(syntax_error(line, "a gather component is out of range"));
+                    }
+                    component = Some(index);
                 }
                 _ => {
+                    if offset.is_some() {
+                        return Err(syntax_error(line, "a sampling call takes one offset"));
+                    }
                     let value = self.rvalue(arg)?;
                     let lanes = value.ty.lanes().unwrap_or(0);
                     let value = self.convert(value, &Ty::of(Scalar::INT, lanes), line)?;

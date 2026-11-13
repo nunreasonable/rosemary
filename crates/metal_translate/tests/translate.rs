@@ -15,6 +15,267 @@ const COPY: &str = include_str!("fixtures/kernel_copy_word.ll");
 const INVERT: &str = include_str!("fixtures/kernel_invert_word.ll");
 const LOOP: &str = include_str!("fixtures/kernel_bounded_loop_word.ll");
 
+#[test]
+fn source_msl_overloads_preserve_reference_updates_and_single_argument_evaluation() {
+    let source = "float pick(thread float& value) { value += 1.0; return value; }
+        float4 pick(thread float4& value) { value += float4(2.0); return value; }
+        fragment float4 probe() {
+            float values[2] = { 1.0, 7.0 };
+            int index = 0;
+            float4 vector = float4(3.0);
+            float scalar = pick(values[index++]);
+            return float4(scalar, float(index), pick(vector).x, values[0]);
+        }";
+    let explicit = source
+        .replace("float pick(", "float pick_scalar(")
+        .replace("float4 pick(", "float4 pick_vector(")
+        .replace("pick(values", "pick_scalar(values")
+        .replace("pick(vector)", "pick_vector(vector)");
+    let target = TargetProfile::vulkan_1_3();
+    let expected = translate_msl(&explicit, &target).unwrap();
+    let actual = translate_msl(source, &target).unwrap();
+    assert_eq!(actual.entries[0].words, expected.entries[0].words);
+}
+
+#[test]
+fn source_msl_value_overloads_use_exact_types_and_reject_unranked_conversions() {
+    let functions = "int choose(int value) { return value + 1; }
+        float choose(float value) { return value + 2.0; }";
+    let source = format!(
+        "{functions}
+        fragment float4 probe() {{ return float4(choose(3), choose(3.0), 0.0, 1.0); }}"
+    );
+    let explicit = source
+        .replace("int choose(", "int choose_int(")
+        .replace("float choose(", "float choose_float(")
+        .replace("choose(3)", "choose_int(3)")
+        .replace("choose(3.0)", "choose_float(3.0)");
+    let target = TargetProfile::vulkan_1_3();
+    assert_eq!(
+        translate_msl(&source, &target).unwrap().entries[0].words,
+        translate_msl(&explicit, &target).unwrap().entries[0].words
+    );
+    let unsupported = format!(
+        "{functions}
+        fragment float4 probe() {{ return float4(choose(true)); }}"
+    );
+    assert!(
+        parse_msl(&unsupported)
+            .unwrap_err()
+            .to_string()
+            .contains("conversion ranking")
+    );
+}
+
+#[test]
+fn source_msl_pointer_overloads_match_packed_and_bool_pointees() {
+    let source = "float first(device packed_float3* values) { return values[0].y; }
+        float first(device float* values) { return values[0]; }
+        float first(device bool* values) { return values[0] ? 1.0 : 0.0; }
+        kernel void probe(device packed_float3* packed [[buffer(0)]],
+            device bool* flags [[buffer(1)]], device float* out [[buffer(2)]]) {
+            out[0] = first(packed);
+            out[1] = first(flags);
+            out[2] = first(out);
+        }";
+    let explicit = source
+        .replace(
+            "float first(device packed",
+            "float first_packed(device packed",
+        )
+        .replace("float first(device bool", "float first_bool(device bool")
+        .replace("first(packed)", "first_packed(packed)")
+        .replace("first(flags)", "first_bool(flags)");
+    let target = TargetProfile {
+        storage_buffer8_bit_access: true,
+        ..TargetProfile::vulkan_1_3()
+    };
+    assert_eq!(
+        translate_msl(source, &target).unwrap().entries[0].words,
+        translate_msl(&explicit, &target).unwrap().entries[0].words
+    );
+}
+
+#[test]
+fn source_msl_empty_global_initializers_preserve_zero_values() {
+    let source = "constant uint2 coordinates = {};
+        constant float3x2 matrix = {};
+        fragment float4 zeros() { return float4(coordinates, matrix[2]); }";
+    let ir = parse_msl(source).unwrap();
+    assert_eq!(ir.globals.len(), 2);
+    let Operand::Composite { elements, .. } = ir.globals[0].initializer.as_ref().unwrap() else {
+        panic!("constant coordinates are a vector");
+    };
+    assert_eq!(elements, &[Operand::u32(0), Operand::u32(0)]);
+    let Operand::Composite { elements, .. } = ir.globals[1].initializer.as_ref().unwrap() else {
+        panic!("constant matrix has columns");
+    };
+    assert_eq!(elements.len(), 3);
+    for column in elements {
+        let Operand::Composite { elements, .. } = column else {
+            panic!("a column is a vector");
+        };
+        assert_eq!(elements, &[Operand::f32(0.0), Operand::f32(0.0)]);
+    }
+    translate_msl(source, &TargetProfile::vulkan_1_3()).unwrap();
+}
+
+#[test]
+fn source_msl_early_fragment_tests_become_an_execution_mode() {
+    for early in [false, true] {
+        let attribute = if early {
+            "[[early_fragment_tests]]"
+        } else {
+            ""
+        };
+        let source = format!("{attribute} fragment float4 color() {{ return float4(1.0); }}");
+        let ir = parse_msl(&source).unwrap();
+        assert_eq!(ir.entries[0].early_fragment_tests, early);
+        let library = translate_msl(&source, &TargetProfile::vulkan_1_3()).unwrap();
+        let spirv = rspirv::dr::load_words(&library.entries[0].words).unwrap();
+        assert_eq!(
+            spirv
+                .execution_modes
+                .iter()
+                .any(
+                    |mode| mode.operands.contains(&rspirv::dr::Operand::ExecutionMode(
+                        rspirv::spirv::ExecutionMode::EarlyFragmentTests
+                    ))
+                ),
+            early
+        );
+    }
+}
+
+#[test]
+fn source_msl_rejects_early_tests_on_other_stages_and_depth_outputs() {
+    for source in [
+        "[[early_fragment_tests]] kernel void work() {}",
+        "[[early_fragment_tests]] vertex float4 position() { return float4(0.0); }",
+        "[[early_fragment_tests(1)]] fragment float4 color() { return float4(0.0); }",
+        "struct Output { float depth [[depth(any)]]; };
+         [[early_fragment_tests]] fragment Output depth() { Output result = {}; return result; }",
+    ] {
+        assert!(parse_msl(source).is_err(), "accepted {source}");
+    }
+    let mut ir = parse_msl("kernel void work() {}").unwrap();
+    ir.entries[0].early_fragment_tests = true;
+    assert!(ir.verify().is_err());
+}
+
+#[test]
+fn source_msl_empty_numeric_initializers_produce_zero_values() {
+    for (ty, expression) in [
+        ("float", "float4(value)"),
+        ("float4", "value"),
+        ("float3x2", "float4(value[0] + value[1], value[2])"),
+    ] {
+        let source = |initializer: &str| {
+            format!(
+                "fragment float4 initialized() {{ {ty} value = {initializer}; return {expression}; }}"
+            )
+        };
+        let target = TargetProfile::vulkan_1_3();
+        let expected = translate_msl(&source(&format!("{ty}(0.0)")), &target).unwrap();
+        let actual = translate_msl(&source("{}"), &target).unwrap();
+        assert_eq!(actual.entries[0].words, expected.entries[0].words, "{ty}");
+    }
+}
+
+#[test]
+fn source_msl_gather_preserves_the_selected_component() {
+    for (name, expected) in [("x", 0), ("y", 1), ("z", 2), ("w", 3)] {
+        let source = format!(
+            "fragment float4 sample_channel(texture2d<float> tex [[texture(0)]],
+                sampler s [[sampler(0)]], float4 position [[position]]) {{
+                return tex.gather(s, position.xy, int2(1, 0), metal::component::{name});
+            }}"
+        );
+        let module = parse_msl(&source).unwrap();
+        let channels: Vec<_> = module.functions[0]
+            .blocks
+            .iter()
+            .flat_map(|block| &block.instructions)
+            .filter_map(|instruction| match instruction.kind {
+                InstructionKind::TextureSample { gather, .. } => gather,
+                _ => None,
+            })
+            .collect();
+        assert_eq!(channels, [expected]);
+        let target = TargetProfile {
+            shader_image_gather_extended: true,
+            ..TargetProfile::vulkan_1_3()
+        };
+        let library = translate_msl(&source, &target).unwrap();
+        let spirv = rspirv::dr::load_words(&library.entries[0].words).unwrap();
+        let gather = spirv
+            .all_inst_iter()
+            .find(|inst| inst.class.opcode == Op::ImageGather)
+            .expect("the gather remains a gather in SPIR-V");
+        let rspirv::dr::Operand::IdRef(component) = gather.operands[2] else {
+            panic!("gather component is an ID");
+        };
+        let constant = spirv
+            .types_global_values
+            .iter()
+            .find(|inst| inst.result_id == Some(component))
+            .unwrap();
+        assert_eq!(
+            constant.operands,
+            [rspirv::dr::Operand::LiteralBit32(expected)]
+        );
+    }
+}
+
+#[test]
+fn source_msl_gather_rejects_invalid_components() {
+    for component in ["component::q", "4", "-1"] {
+        let source = format!(
+            "fragment float4 sample_channel(texture2d<float> tex [[texture(0)]],
+                sampler s [[sampler(0)]], float4 position [[position]]) {{
+                return tex.gather(s, position.xy, int2(0), {component});
+            }}"
+        );
+        assert!(parse_msl(&source).is_err(), "accepted {component}");
+    }
+}
+
+#[test]
+fn source_msl_gather_requires_the_component_after_the_offset() {
+    for args in [
+        "component::y",
+        "component::y, int2(1, 0)",
+        "int2(0), component::y, int2(1, 0)",
+    ] {
+        let source = format!(
+            "fragment float4 sample_channel(texture2d<float> tex [[texture(0)]],
+                sampler s [[sampler(0)]], float4 position [[position]]) {{
+                return tex.gather(s, position.xy, {args});
+            }}"
+        );
+        assert!(parse_msl(&source).is_err(), "accepted gather({args})");
+    }
+}
+
+#[test]
+fn source_msl_depth_gather_rejects_a_component() {
+    let gather = |args: &str| {
+        format!(
+            "fragment float4 gather_depth(depth2d<float> depth [[texture(0)]],
+                sampler s [[sampler(0)]], float4 position [[position]]) {{
+                return depth.gather(s, position.xy{args});
+            }}"
+        )
+    };
+    parse_msl(&gather(", int2(0)")).unwrap();
+    for component in ["component::y", "1"] {
+        let error = parse_msl(&gather(&format!(", int2(0), {component}")))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("has no component"), "{component}: {error}");
+    }
+}
+
 fn store_bitcode() -> Vec<u8> {
     let encoded = include_str!("fixtures/kernel_store_const.bc.hex")
         .trim()
@@ -1067,6 +1328,7 @@ fn emits_a_writable_3d_texture_descriptor_in_its_metal_namespace() {
             }],
         }],
         entries: vec![EntryPoint {
+            early_fragment_tests: false,
             function: 0,
             stage: Stage::Kernel,
             resources: vec![Resource {
@@ -1159,6 +1421,7 @@ fn emits_structured_merges_for_a_loop_containing_a_conditional() {
         globals: Vec::new(),
         functions: vec![function],
         entries: vec![EntryPoint {
+            early_fragment_tests: false,
             function: 0,
             stage: Stage::Fragment,
             resources: Vec::new(),
@@ -1238,6 +1501,7 @@ fn gives_each_short_circuit_selection_its_own_merge() {
         globals: Vec::new(),
         functions: vec![function],
         entries: vec![EntryPoint {
+            early_fragment_tests: false,
             function: 0,
             stage: Stage::Fragment,
             resources: Vec::new(),
@@ -1297,6 +1561,7 @@ fn routes_several_returns_through_one_exit_block() {
             ],
         }],
         entries: vec![EntryPoint {
+            early_fragment_tests: false,
             function: 0,
             stage: Stage::Fragment,
             resources: Vec::new(),
@@ -1414,6 +1679,7 @@ fn a_module_constant_table_becomes_a_private_variable() {
             }],
         }],
         entries: vec![EntryPoint {
+            early_fragment_tests: false,
             function: 0,
             stage: Stage::Kernel,
             resources: vec![Resource {
@@ -1539,6 +1805,7 @@ fn a_local_variable_is_declared_in_the_entry_block() {
             ],
         }],
         entries: vec![EntryPoint {
+            early_fragment_tests: false,
             function: 0,
             stage: Stage::Kernel,
             resources: vec![Resource {
@@ -1609,6 +1876,7 @@ fn buffer_kernel(values: Vec<Type>, instructions: Vec<Instruction>) -> Module {
             }],
         }],
         entries: vec![EntryPoint {
+            early_fragment_tests: false,
             function: 0,
             stage: Stage::Kernel,
             resources: vec![Resource {
@@ -1654,6 +1922,7 @@ fn typed_buffer_kernel(element: Type, values: Vec<Type>, instructions: Vec<Instr
             }],
         }],
         entries: vec![EntryPoint {
+            early_fragment_tests: false,
             function: 0,
             stage: Stage::Kernel,
             resources: vec![Resource {
@@ -2031,6 +2300,7 @@ fn a_constant_address_space_pointer_phi_keeps_its_buffer_storage_class() {
             ],
         }],
         entries: vec![EntryPoint {
+            early_fragment_tests: false,
             function: 0,
             stage: Stage::Kernel,
             resources: vec![Resource {
@@ -2081,6 +2351,7 @@ fn fragment_demote_is_negotiated_and_fully_reflected() {
             }],
         }],
         entries: vec![EntryPoint {
+            early_fragment_tests: false,
             function: 0,
             stage: Stage::Fragment,
             resources: Vec::new(),
@@ -2208,6 +2479,7 @@ fn a_signed_texture_is_read_through_a_signed_image_type() {
             }],
         }],
         entries: vec![EntryPoint {
+            early_fragment_tests: false,
             function: 0,
             stage: Stage::Kernel,
             resources: vec![Resource {
@@ -2274,6 +2546,7 @@ fn a_signed_vertex_attribute_is_declared_signed() {
             }],
         }],
         entries: vec![EntryPoint {
+            early_fragment_tests: false,
             function: 0,
             stage: Stage::Vertex,
             resources: Vec::new(),
@@ -2424,6 +2697,7 @@ fn sample_with_offset(offset: Operand) -> (rspirv::dr::Module, Vec<rspirv::dr::O
             }],
         }],
         entries: vec![EntryPoint {
+            early_fragment_tests: false,
             function: 0,
             stage: Stage::Kernel,
             resources: vec![
