@@ -872,40 +872,37 @@ pub unsafe extern "C" fn symlinkat(
 
 /// `int mkstemp(char *template)`
 ///
-/// The template is rewritten in place with the name that was created, and the
-/// caller sized it. The host writes a *host* path there, so the guest spelling
-/// goes back instead - which is the same length by construction, the two names
-/// differing only in the six characters `mkstemp` replaced.
+/// # Safety
+///
+/// `template` is a NUL-terminated string ending in `X`s, writable for its own
+/// length.
+pub unsafe extern "C" fn mkstemp(template: *mut c_char) -> c_int {
+    // SAFETY: the caller's obligations, passed on.
+    unsafe { mkstemps(template, 0) }
+}
+
+/// `int mkstemps(char *template, int suffixlen)`: [`mkstemp`] with the last
+/// `suffixlen` characters kept after the `X`s.
 ///
 /// # Safety
 ///
-/// `template` is a NUL-terminated string ending in `XXXXXX`, writable for its
-/// own length.
-pub unsafe extern "C" fn mkstemp(template: *mut c_char) -> c_int {
-    let Some((mut host_template, room)) = (unsafe { host_template(template) }) else {
+/// `template` is a NUL-terminated string, writable for its own length.
+pub unsafe extern "C" fn mkstemps(template: *mut c_char, suffixlen: c_int) -> c_int {
+    let Some(mut made) = (unsafe { Template::new(template, suffixlen) }) else {
         return -1;
     };
-    // SAFETY: a writable NUL-terminated template.
-    let fd = unsafe { libc::mkstemp(host_template.as_mut_ptr().cast::<c_char>()) };
+    // SAFETY: a writable NUL-terminated template, with `suffix` bytes after
+    // its `X`s.
+    let fd = unsafe {
+        libc::mkstemps(
+            made.host.as_mut_ptr().cast::<c_char>(),
+            made.suffix as c_int,
+        )
+    };
     if fd < 0 {
         return fd;
     }
-    if crate::credentials::creates_as_another()
-        && let Ok(made) = CStr::from_bytes_until_nul(&host_template)
-    {
-        crate::credentials::created(libc::AT_FDCWD, made);
-    }
-    // SAFETY: `mkstemp` rewrote the template in place, NUL-terminated.
-    if !unsafe { write_back(template, &host_template, room) } {
-        // The file exists and the caller will never learn its name, so it is
-        // removed rather than left behind in the prefix.
-        // SAFETY: a descriptor this call just opened and the path that made it.
-        unsafe {
-            libc::close(fd);
-            libc::unlink(host_template.as_ptr().cast::<c_char>());
-        }
-        return -1;
-    }
+    made.finish();
     fd
 }
 
@@ -915,24 +912,14 @@ pub unsafe extern "C" fn mkstemp(template: *mut c_char) -> c_int {
 ///
 /// As [`mkstemp`].
 pub unsafe extern "C" fn mkdtemp(template: *mut c_char) -> *mut c_char {
-    let Some((mut host_template, room)) = (unsafe { host_template(template) }) else {
+    let Some(mut made) = (unsafe { Template::new(template, 0) }) else {
         return std::ptr::null_mut();
     };
     // SAFETY: a writable NUL-terminated template.
-    if unsafe { libc::mkdtemp(host_template.as_mut_ptr().cast::<c_char>()) }.is_null() {
+    if unsafe { libc::mkdtemp(made.host.as_mut_ptr().cast::<c_char>()) }.is_null() {
         return std::ptr::null_mut();
     }
-    if crate::credentials::creates_as_another()
-        && let Ok(made) = CStr::from_bytes_until_nul(&host_template)
-    {
-        crate::credentials::created(libc::AT_FDCWD, made);
-    }
-    // SAFETY: `mkdtemp` rewrote the template in place, NUL-terminated.
-    if !unsafe { write_back(template, &host_template, room) } {
-        // SAFETY: a directory this call just made and nothing has entered.
-        unsafe { libc::rmdir(host_template.as_ptr().cast::<c_char>()) };
-        return std::ptr::null_mut();
-    }
+    made.finish();
     // Darwin answers with the caller's own buffer.
     template
 }
@@ -1063,52 +1050,227 @@ pub unsafe extern "C" fn _mktemp(path: *mut c_char) -> *mut c_char {
     }
 }
 
-/// The host spelling of a `XXXXXX` template, and how many bytes the caller's
-/// buffer holds for the name.
+/// A `mkstemp`-family template, in the caller's buffer and as the host
+/// spells it.
 ///
-/// # Safety
-///
-/// `template` is null or NUL-terminated.
-unsafe fn host_template(template: *mut c_char) -> Option<(Vec<u8>, usize)> {
-    if template.is_null() {
-        crate::errno::set(libc::EFAULT);
-        return None;
-    }
-    let guest = unsafe { CStr::from_ptr(template) };
-    let room = guest.to_bytes().len();
-    Some((
-        prefix::ns::to_host(guest)
-            .into_owned()
-            .into_bytes_with_nul(),
-        room,
-    ))
+/// The host call rewrites only the `X`s before the suffix, and the suffix and
+/// those `X`s end both spellings alike, so they are what goes back: the rest of
+/// the host spelling may be longer or shorter than the guest's, as for
+/// `/tmp//x_XXXXXX`.
+struct Template {
+    guest: *mut c_char,
+    /// NUL-terminated.
+    host: Vec<u8>,
+    suffix: usize,
+    /// The `X`s the call replaces.
+    xs: usize,
 }
 
-/// Write the guest spelling of a rewritten template back into the caller's
-/// buffer, answering whether it fitted.
+impl Template {
+    /// # Safety
+    ///
+    /// `template` is null or NUL-terminated.
+    unsafe fn new(template: *mut c_char, suffixlen: c_int) -> Option<Template> {
+        if template.is_null() {
+            crate::errno::set(libc::EFAULT);
+            return None;
+        }
+        // SAFETY: the caller's NUL-terminated template.
+        let guest = unsafe { CStr::from_ptr(template) };
+        let bytes = guest.to_bytes();
+        let Some(suffix) = usize::try_from(suffixlen)
+            .ok()
+            .filter(|n| *n <= bytes.len())
+        else {
+            crate::errno::set(libc::EINVAL);
+            return None;
+        };
+        let stem = &bytes[..bytes.len() - suffix];
+        let xs = stem.iter().rev().take_while(|b| **b == b'X').count();
+        let host = prefix::ns::to_host(guest)
+            .into_owned()
+            .into_bytes_with_nul();
+        Some(Template {
+            guest: template,
+            host,
+            suffix,
+            xs,
+        })
+    }
+
+    /// The name the host call made, written back into the caller's buffer and
+    /// recorded as this process's file.
+    fn finish(&mut self) {
+        if crate::credentials::creates_as_another()
+            && let Ok(made) = CStr::from_bytes_until_nul(&self.host)
+        {
+            crate::credentials::created(libc::AT_FDCWD, made);
+        }
+        let host_end = self.host.len() - 1 - self.suffix;
+        let replaced = &self.host[host_end - self.xs..host_end];
+        // SAFETY: the caller's NUL-terminated template, unchanged in length.
+        let guest_end = unsafe { libc::strlen(self.guest) } - self.suffix;
+        // SAFETY: `xs` bytes before the suffix, within the caller's buffer.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                replaced.as_ptr().cast::<c_char>(),
+                self.guest.add(guest_end - self.xs),
+                self.xs,
+            )
+        };
+    }
+}
+
+/// `int mkpath_np(const char *path, mode_t omode)`
 ///
 /// # Safety
 ///
-/// `template` is writable for `room` bytes plus its NUL, and `made` is a
-/// NUL-terminated host path.
-unsafe fn write_back(template: *mut c_char, made: &[u8], room: usize) -> bool {
-    let made = unsafe { CStr::from_ptr(made.as_ptr().cast::<c_char>()) };
-    let Some(spelled) = guest_path(made) else {
-        crate::errno::set(libc::ENOENT);
-        return false;
-    };
-    let bytes = spelled.to_bytes();
-    // The two spellings are the same length by construction - the host call
-    // only replaced the six `X`s - so this is a guard, not a path anything is
-    // expected to take.
-    if bytes.len() != room {
-        crate::errno::set(libc::ENAMETOOLONG);
-        return false;
+/// `path` is a NUL-terminated string.
+pub unsafe extern "C" fn mkpath_np(path: *const c_char, omode: libc::mode_t) -> c_int {
+    // SAFETY: the caller's.
+    unsafe { mkpathat_np(crate::stat::DARWIN_AT_FDCWD, path, omode) }
+}
+
+/// `int mkpathat_np(int dfd, const char *path, mode_t omode)`
+///
+/// `mkdir -p`: the answer is a Darwin errno, not -1, and `errno` is left as
+/// it was.
+///
+/// # Safety
+///
+/// `path` is a NUL-terminated string and `dfd` a directory descriptor or
+/// Darwin's `AT_FDCWD`.
+pub unsafe extern "C" fn mkpathat_np(
+    dfd: c_int,
+    path: *const c_char,
+    omode: libc::mode_t,
+) -> c_int {
+    if path.is_null() {
+        return crate::errno::from_host(libc::EFAULT);
     }
-    // SAFETY: `template` is writable for `room` bytes and `bytes` is exactly
-    // that many; the NUL already there stays where it is.
-    unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr().cast::<c_char>(), template, room) };
-    true
+    let saved = crate::errno::get();
+    // SAFETY: non-null, and NUL-terminated by contract.
+    let path = unsafe { CStr::from_ptr(path) }.to_bytes();
+    let rc = match make_path(dfd, path, omode) {
+        Ok(()) => 0,
+        Err(host) => crate::errno::from_host(host),
+    };
+    crate::errno::set(saved);
+    rc
+}
+
+/// Apple's `_mkpath`: create the missing ancestors of `path` with `0777`
+/// (widened to `u+wx` when the umask denies them, as POSIX's `mkdir -p` does),
+/// then `path` itself with `omode`. Failures are host errnos.
+fn make_path(dfd: c_int, path: &[u8], omode: libc::mode_t) -> Result<(), c_int> {
+    const ANCESTOR_MODE: libc::mode_t = libc::S_IRWXU | libc::S_IRWXG | libc::S_IRWXO;
+    const USER_WX: libc::mode_t = libc::S_IWUSR | libc::S_IXUSR;
+
+    let mkdir = |path: &[u8], mode| {
+        let path = CString::new(path).expect("a prefix of a C string");
+        // SAFETY: a NUL-terminated path and the caller's descriptor.
+        match unsafe { mkdirat(dfd, path.as_ptr(), mode) } {
+            0 => Ok(()),
+            _ => Err(crate::errno::get()),
+        }
+    };
+    let mode_of = |path: &[u8]| {
+        let path = CString::new(path).expect("a prefix of a C string");
+        let mut st = crate::stat::Stat::default();
+        // SAFETY: a NUL-terminated path, the caller's descriptor, a local stat.
+        let rc = unsafe { crate::stat::fstatat(dfd, path.as_ptr(), &mut st, 0) };
+        (rc == 0).then_some(libc::mode_t::from(st.mode))
+    };
+    let is_dir = |path: &[u8]| mode_of(path).map(|m| m & libc::S_IFMT == libc::S_IFDIR);
+    let chmod = |path: &[u8], mode| {
+        let path = CString::new(path).expect("a prefix of a C string");
+        // SAFETY: a NUL-terminated path and the caller's descriptor.
+        unsafe { fchmodat(dfd, path.as_ptr(), mode, 0) == 0 }
+    };
+
+    match mkdir(path, omode) {
+        Ok(()) => return Ok(()),
+        Err(libc::ENOENT) => {}
+        Err(libc::EEXIST) => {
+            return Err(match is_dir(path) {
+                Some(true) => libc::EEXIST,
+                Some(false) => libc::ENOTDIR,
+                None => libc::EIO,
+            });
+        }
+        Err(libc::EISDIR) => return Err(libc::EEXIST),
+        Err(e) => return Err(e),
+    }
+
+    // Trailing "/." and "/" name the same directory but would make the walk
+    // below try to create it twice.
+    let mut end = path.len();
+    loop {
+        let before = end;
+        if end > 2 && path[end - 1] == b'.' && path[end - 2] == b'/' {
+            end -= 2;
+        }
+        if end > 1 && path[end - 1] == b'/' {
+            end -= 1;
+        }
+        if end == before {
+            break;
+        }
+    }
+    let path = &path[..end];
+    if mkdir(path, omode).is_ok() {
+        return Ok(());
+    }
+
+    // Walk up to the deepest ancestor that exists or can be made...
+    let mut cuts = Vec::new();
+    let mut chmod_mode = None;
+    loop {
+        let here = cuts.last().map_or(path, |&cut| &path[..cut]);
+        let Some(cut) = here.iter().rposition(|&b| b == b'/') else {
+            return Err(libc::ENOENT);
+        };
+        cuts.push(cut);
+        let here = &path[..cut];
+        match mkdir(here, ANCESTOR_MODE) {
+            Ok(()) => {
+                let mode = mode_of(here).ok_or(libc::ENOENT)?;
+                if mode & USER_WX != USER_WX {
+                    let widened = mode | USER_WX;
+                    if !chmod(here, widened) {
+                        return Err(libc::ENOENT);
+                    }
+                    chmod_mode = Some(widened);
+                }
+                break;
+            }
+            // Another process made it first.
+            Err(libc::EEXIST) if is_dir(here) == Some(true) => break,
+            Err(libc::EEXIST) => return Err(libc::ENOTDIR),
+            Err(libc::ENOENT) => {}
+            Err(e) => return Err(e),
+        }
+    }
+    // ...then back down, making each one below it.
+    cuts.pop();
+    for &cut in cuts.iter().rev() {
+        let here = &path[..cut];
+        match mkdir(here, ANCESTOR_MODE) {
+            Ok(()) => {}
+            // A "." or ".." component.
+            Err(libc::EEXIST) => continue,
+            Err(e) => return Err(e),
+        }
+        if let Some(mode) = chmod_mode
+            && !chmod(here, mode)
+        {
+            return Err(libc::ENOENT);
+        }
+    }
+    match mkdir(path, omode) {
+        Err(libc::EEXIST) if is_dir(path) == Some(false) => Err(libc::ENOTDIR),
+        result => result,
+    }
 }
 
 /// `FSIOC_SYNC_VOLUME`, `_IOW('A', 1, uint32_t)`.
@@ -1237,8 +1399,11 @@ exports::exports! {
         "symlink" => symlink,
         "symlinkat" => symlinkat,
         "mkstemp" => mkstemp,
+        "mkstemps" => mkstemps,
         "mkdtemp" => mkdtemp,
         "mkdtempat_np" => mkdtempat_np,
+        "mkpath_np" => mkpath_np,
+        "mkpathat_np" => mkpathat_np,
         "_mktemp" => _mktemp,
         "mktemp" => _mktemp,
     }
@@ -1337,6 +1502,42 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn mkpath_np_makes_every_missing_ancestor() {
+        let scratch = Scratch::new("mkpath-ancestors");
+        let path = scratch.c_path("a/b/c/./");
+        assert_eq!(unsafe { mkpath_np(path.as_ptr(), 0o700) }, 0);
+        let made = scratch.0.join("a/b/c");
+        assert!(made.is_dir());
+        assert_eq!(
+            std::fs::metadata(&made).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+    }
+
+    #[test]
+    fn mkpath_np_answers_errno_and_leaves_errno_alone() {
+        let scratch = Scratch::new("mkpath-errors");
+        std::fs::write(scratch.0.join("file"), b"").unwrap();
+        crate::errno::set(libc::EINTR);
+        let dir = scratch.c_path("");
+        assert_eq!(
+            unsafe { mkpath_np(dir.as_ptr(), 0o755) },
+            crate::errno::from_host(libc::EEXIST)
+        );
+        let file = scratch.c_path("file");
+        assert_eq!(
+            unsafe { mkpath_np(file.as_ptr(), 0o755) },
+            crate::errno::from_host(libc::ENOTDIR)
+        );
+        let under = scratch.c_path("file/x/y");
+        assert_eq!(
+            unsafe { mkpath_np(under.as_ptr(), 0o755) },
+            crate::errno::from_host(libc::ENOTDIR)
+        );
+        assert_eq!(crate::errno::get(), libc::EINTR);
     }
 
     #[test]
@@ -1480,7 +1681,11 @@ mod tests {
         // SAFETY: a NUL-terminated path and Darwin's AT_FDCWD.
         unsafe {
             assert_eq!(unlinkat(crate::stat::DARWIN_AT_FDCWD, path.as_ptr(), 0), -1);
-            assert_eq!(crate::errno::get(), libc::EPERM, "Darwin's answer for a directory");
+            assert_eq!(
+                crate::errno::get(),
+                libc::EPERM,
+                "Darwin's answer for a directory"
+            );
             let flag = DARWIN_AT_REMOVEDIR;
             assert_eq!(
                 unlinkat(crate::stat::DARWIN_AT_FDCWD, path.as_ptr(), flag),
@@ -1579,6 +1784,52 @@ mod tests {
         assert_eq!(name.len(), "name.XXXXXX".len());
         assert!(name[5..].bytes().all(|b| TEMP_PADCHAR.contains(&b)));
         assert!(!Path::new(made).exists());
+    }
+
+    #[test]
+    fn mkstemp_keeps_the_callers_spelling_of_the_directory() {
+        let scratch = Scratch::new("mkstemp-spelling");
+        // A doubled slash, which the host spelling does not keep.
+        let template = CString::new(format!("{}//name_XXXXXX", scratch.0.display())).unwrap();
+        let spelled = template.to_str().unwrap().to_owned();
+        let mut buffer = template.into_bytes_with_nul();
+        let path = buffer.as_mut_ptr().cast::<c_char>();
+        // SAFETY: a writable NUL-terminated template.
+        let fd = unsafe { mkstemp(path) };
+        assert!(fd >= 0, "errno {}", crate::errno::get());
+        // SAFETY: a descriptor just opened.
+        unsafe { libc::close(fd) };
+        // SAFETY: rewritten in place, still NUL-terminated.
+        let made = unsafe { CStr::from_ptr(path) }.to_str().unwrap();
+        assert_eq!(made.len(), spelled.len());
+        assert!(made.starts_with(&spelled[..spelled.len() - 6]));
+        assert!(!made.ends_with("XXXXXX"));
+        assert!(Path::new(made).exists());
+    }
+
+    #[test]
+    fn mkstemps_keeps_the_suffix() {
+        let scratch = Scratch::new("mkstemps-suffix");
+        let mut buffer = scratch.c_path("name_XXXXXX.tcl").into_bytes_with_nul();
+        let path = buffer.as_mut_ptr().cast::<c_char>();
+        // SAFETY: a writable NUL-terminated template.
+        let fd = unsafe { mkstemps(path, 4) };
+        assert!(fd >= 0, "errno {}", crate::errno::get());
+        // SAFETY: a descriptor just opened.
+        unsafe { libc::close(fd) };
+        // SAFETY: rewritten in place, still NUL-terminated.
+        let made = unsafe { CStr::from_ptr(path) }.to_str().unwrap();
+        let name = made.rsplit('/').next().unwrap();
+        assert!(
+            name.starts_with("name_") && name.ends_with(".tcl"),
+            "{name}"
+        );
+        assert!(!name.contains("XXXXXX"));
+        assert!(Path::new(made).exists());
+        // SAFETY: as above.
+        assert_eq!(unsafe { mkstemps(path, 100) }, -1);
+        assert_eq!(crate::errno::get(), libc::EINVAL);
+        crate::errno::set(0);
     }
 
     #[test]

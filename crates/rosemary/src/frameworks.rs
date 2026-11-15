@@ -62,6 +62,9 @@ macro_rules! framework {
 const LIBSYSTEM: &str = "/usr/lib/libSystem.B.dylib";
 const LIBOBJC: &str = "/usr/lib/libobjc.A.dylib";
 const LIBOBJC_NAMES: &[&str] = &[LIBOBJC, "/usr/lib/libobjc.dylib"];
+/// Foundation's Swift half, which Apple links into the framework itself and a
+/// Darwin base builds from swift-foundation as an image of its own.
+const SWIFT_FOUNDATION: &str = "/usr/lib/swift/libswiftFoundation.dylib";
 
 // FIXME (ACCURACY): each row's `links` is a recollection of that framework's
 // `otool -L` on macOS, cut to libraries this runtime provides, and not checked
@@ -89,7 +92,7 @@ static FRAMEWORKS: &[Framework] = &[
         data: Some(foundation::data_symbols),
         symbol: Some(foundation::symbol),
         links: Links {
-            reexports: &[],
+            reexports: &[SWIFT_FOUNDATION],
             dependencies: &[
                 framework!("CoreFoundation"),
                 LIBOBJC,
@@ -122,6 +125,18 @@ static FRAMEWORKS: &[Framework] = &[
         links: Links {
             reexports: &[],
             dependencies: &[framework!("IOKit"), framework!("CoreFoundation"), LIBSYSTEM],
+        },
+    },
+    Framework {
+        leaf: "CoreAnalytics",
+        version: 'A',
+        umbrellas: &[],
+        provide: Some(coreanalytics::provide),
+        data: None,
+        symbol: Some(coreanalytics::symbol),
+        links: Links {
+            reexports: &[],
+            dependencies: &[LIBSYSTEM],
         },
     },
     Framework {
@@ -476,6 +491,17 @@ static FRAMEWORKS: &[Framework] = &[
     },
 ];
 
+/// Frameworks that macOS keeps in `/System/Library/PrivateFrameworks`.
+const PRIVATE_FRAMEWORKS: &[&str] = &["CoreAnalytics"];
+
+/// The directory `leaf`'s framework is installed in.
+fn framework_dir(leaf: &str) -> &'static str {
+    match PRIVATE_FRAMEWORKS.contains(&leaf) {
+        true => "/System/Library/PrivateFrameworks",
+        false => "/System/Library/Frameworks",
+    }
+}
+
 fn paths_of(framework: &Framework) -> Vec<String> {
     let mut out = Vec::new();
     for leaf in std::iter::once(framework.leaf).chain(framework.umbrellas.iter().copied()) {
@@ -484,12 +510,9 @@ fn paths_of(framework: &Framework) -> Vec<String> {
         } else {
             'A'
         };
-        out.push(format!(
-            "/System/Library/Frameworks/{leaf}.framework/Versions/{version}/{leaf}"
-        ));
-        out.push(format!(
-            "/System/Library/Frameworks/{leaf}.framework/{leaf}"
-        ));
+        let dir = framework_dir(leaf);
+        out.push(format!("{dir}/{leaf}.framework/Versions/{version}/{leaf}"));
+        out.push(format!("{dir}/{leaf}.framework/{leaf}"));
         out.push(leaf.to_string());
     }
     out
@@ -546,7 +569,7 @@ fn register_opengl_framework() {
         opengl::INSTALL_PATHS,
         crate::gl::symbol,
         Links {
-            reexports: &[],
+            reexports: &[opengl::LIBGLU],
             dependencies: &[framework!("CoreFoundation"), framework!("IOKit"), LIBSYSTEM],
         },
     );
@@ -593,6 +616,56 @@ fn withheld(name: &str) -> bool {
         eprintln!("rosemary: {name}: withheld (ROSEMARY_WITHHOLD names it)");
     }
     out
+}
+
+/// Whether `install_name` is one of the frameworks [`FRAMEWORKS`] stands for.
+fn is_row(install_name: &str) -> bool {
+    FRAMEWORKS
+        .iter()
+        .any(|framework| paths_of(framework).iter().any(|p| p == install_name))
+}
+
+/// A stand-in for each framework that re-exports an image of the Darwin base,
+/// which the loader then fetches: an import of the framework that this tree
+/// does not define is looked for there.
+pub fn base_reexports() -> Vec<SyntheticDylib> {
+    install();
+    if !using_builtin() {
+        return Vec::new();
+    }
+    let opengl = crate::gl::interposed().then(|| {
+        let mut lib = SyntheticDylib::new(opengl::INSTALL_PATHS[0]);
+        for path in &opengl::INSTALL_PATHS[1..] {
+            lib.alias(path);
+        }
+        lib.reexport(opengl::LIBGLU);
+        lib
+    });
+    FRAMEWORKS
+        .iter()
+        .filter_map(|framework| {
+            let images: Vec<&str> = framework
+                .links
+                .reexports
+                .iter()
+                .copied()
+                .filter(|image| !is_row(image))
+                .collect();
+            if images.is_empty() {
+                return None;
+            }
+            let paths = paths_of(framework);
+            let mut lib = SyntheticDylib::new(&paths[0]);
+            for path in &paths[1..] {
+                lib.alias(path);
+            }
+            for image in images {
+                lib.reexport(image);
+            }
+            Some(lib)
+        })
+        .chain(opengl)
+        .collect()
 }
 
 pub fn provider() -> SyntheticDylib {
@@ -1047,6 +1120,34 @@ mod tests {
         assert!(twice.is_empty(), "defined more than once: {twice:?}");
     }
 
+    /// Foundation's Swift half is an image of the base; AppKit's re-exports
+    /// are frameworks of this table, which need no stand-in to be fetched.
+    #[test]
+    fn foundation_stands_in_for_its_swift_half_alone() {
+        use machish::resolve::SymbolProvider;
+        if !using_builtin() {
+            return;
+        }
+        let stand_ins = base_reexports();
+        let foundation = framework!("Foundation");
+        let found: Vec<_> = stand_ins
+            .iter()
+            .filter(|s| s.stands_for(foundation))
+            .collect();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].reexports(foundation), [SWIFT_FOUNDATION]);
+        assert!(
+            found[0].stands_for(
+                "/System/Library/Frameworks/Foundation.framework/Versions/C/Foundation"
+            )
+        );
+        assert!(
+            !stand_ins
+                .iter()
+                .any(|s| s.stands_for(framework!("ApplicationServices")))
+        );
+    }
+
     #[test]
     fn every_framework_answers_a_dlopen_by_its_leaf() {
         for framework in FRAMEWORKS {
@@ -1054,9 +1155,9 @@ mod tests {
             for leaf in std::iter::once(framework.leaf).chain(framework.umbrellas.iter().copied()) {
                 assert!(paths.iter().any(|p| p == leaf), "{leaf}");
                 assert!(
-                    paths.iter().any(
-                        |p| p == &format!("/System/Library/Frameworks/{leaf}.framework/{leaf}")
-                    ),
+                    paths
+                        .iter()
+                        .any(|p| p == &format!("{}/{leaf}.framework/{leaf}", framework_dir(leaf))),
                     "{leaf}: the install name"
                 );
             }

@@ -123,6 +123,14 @@ fn index() -> &'static std::collections::HashMap<&'static str, Described> {
     &INDEX
 }
 
+/// Every C-variadic function the table describes.
+pub fn variadic_names() -> impl Iterator<Item = &'static str> {
+    SIGNATURES
+        .iter()
+        .filter(|abi| abi.variadic)
+        .map(|abi| abi.name)
+}
+
 /// Signatures reachable by a provider-assigned tag. Empty today.
 fn by_tag(_tag: u64) -> Option<&'static FunctionAbi> {
     None
@@ -220,6 +228,8 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("getsectiondata", P, P, P, P, P),
     sig!("get_etext", U64),
     sig!("get_end", U64),
+    sig!("swap_fat_header", V, P, U32),
+    sig!("swap_fat_arch", V, P, U32, U32),
     // OpenAL 1.1. Its scalar typedefs are fixed-width even on Darwin.
     sig!("alBufferData", V, U32, I32, P, I32, I32),
     sig!("alDeleteBuffers", V, I32, P),
@@ -1401,6 +1411,23 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("GetIconRef", I16, I16, U32, U32, P),
     sig!("ReleaseIconRef", I16, P),
     sig!("LocaleRefFromLocaleString", I32, P, P),
+    // `TextEncoding CreateTextEncoding(TextEncodingBase, TextEncodingVariant,
+    // TextEncodingFormat)` and `Fixed Long2Fix(long)`, both plain integer
+    // arithmetic with no guest memory involved.
+    sig!("CreateTextEncoding", U32, U32, U32, U32),
+    sig!("Long2Fix", I32, I32),
+    // `OSStatus UpgradeScriptInfoToTextEncoding(ScriptCode, LangCode,
+    // RegionCode, ConstStr255Param, TextEncoding *)`.
+    sig!("UpgradeScriptInfoToTextEncoding", I32, I16, I16, I16, P, P),
+    // `OSStatus TECGetTextEncodingFromInternetName(TextEncoding *,
+    // ConstStr255Param)`.
+    sig!("TECGetTextEncodingFromInternetName", I32, P, P),
+    sig!("TECCreateConverter", I32, P, U32, U32),
+    sig!("TECDisposeConverter", I32, P),
+    sig!("TECClearConverterContextInfo", I32, P),
+    // `OSStatus TECConvertText(TECObjectRef, const UInt8 *, ByteCount,
+    // ByteCount *, UInt8 *, ByteCount, ByteCount *)`.
+    sig!("TECConvertText", I32, P, P, U64, P, P, U64, P),
     sig!("UCCreateCollator", I32, P, U32, U32, P),
     sig!("UCDisposeCollator", I32, P),
     sig!("UCCompareText", I32, P, P, U64, P, U64, P, P),
@@ -1454,6 +1481,49 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("HLock", V, P),
     sig!("HUnlock", V, P),
     sig!("TickCount", U32),
+    // The Text Utilities' remaining legacy calls, and the Unicode Converter's
+    // high-level `TextToUnicodeInfo`/`UnicodeToTextInfo` objects, both beside
+    // the `TEC*` converter in `coreservices::textencoding`.
+    sig!("GetTextEncodingBase", U32, U32),
+    sig!("CharacterByteType", I16, P, I16, I16),
+    sig!("NumToString", V, I64, P),
+    sig!("GetScriptManagerVariable", I64, I16),
+    sig!("CreateTextToUnicodeInfo", I32, P, P),
+    sig!("CreateUnicodeToTextInfo", I32, P, P),
+    sig!("DisposeTextToUnicodeInfo", I32, P),
+    sig!("DisposeUnicodeToTextInfo", I32, P),
+    sig!(
+        "ConvertFromTextToUnicode",
+        I32,
+        P,
+        U64,
+        P,
+        U32,
+        U64,
+        P,
+        P,
+        P,
+        U64,
+        P,
+        P,
+        P
+    ),
+    sig!(
+        "ConvertFromUnicodeToText",
+        I32,
+        P,
+        U64,
+        P,
+        U32,
+        U64,
+        P,
+        P,
+        P,
+        U64,
+        P,
+        P,
+        P
+    ),
     // The two keyboard low-memory globals, both `UInt8 (*)(void)` and both an
     // ordinary function on a 64-bit system: `LMGetKbdType` is what still backs
     // `UCKeyTranslate`'s keyboard-type argument, and `LMGetKbdLast` is the ADB
@@ -1628,7 +1698,8 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("UTTypeCopyPreferredTagWithClass", P, P, P),
     sig!("UTTypeCreatePreferredIdentifierForTag", P, P, P, P),
     //
-    // `_Block_copy` is **shimmed** - see [`crate::shims::block::block_copy`].
+    // `_Block_copy` and `_Block_object_assign` are **shimmed** - see
+    // [`crate::shims::block`].
     // The signature stays for [`longjmp`]'s reason: it is what stops the site
     // being promoted to an inlined fast import and what names it at an exit.
     sig!("_Block_copy", P, P),
@@ -1744,6 +1815,9 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("_dyld_get_image_vmaddr_slide", U64, U32),
     sig!("_dyld_image_containing_address", P, P),
     sig!("dyld_image_path_containing_address", P, P),
+    sig!("dyld_image_header_containing_address", P, P),
+    // The block is thunked by `crate::shims::block` before this is reached.
+    sig!("dyld_get_image_versions", V, P, P),
     sig!("dyld_shared_cache_some_image_overridden", BOOL),
     sig!("_dyld_get_shared_cache_range", P, P),
     sig!("_dyld_is_preoptimized_objc_image_loaded", BOOL, U16),
@@ -2061,6 +2135,7 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("fgetpos", I32, P, P),
     sig!("fgets", P, P, I32, P),
     sig!("fgetln", P, P, P),
+    sig!("fparseln", P, P, P, P, P, I32),
     sig!("fileno", I32, P),
     //
     // Each entry stopped an initializer by name and was added for it.
@@ -2356,6 +2431,35 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("glDeleteSync", V, P),
     sig!("glFenceSync", P, U32, U32),
     sig!("glGetTexLevelParameteriv", V, U32, I32, U32, P),
+    //
+    // The legacy calls the Darwin base's libGLU makes, which an emulated
+    // libGLU reaches here.
+    sig!("glColor3f", V, F32, F32, F32),
+    sig!("glEvalCoord1f", V, F32),
+    sig!("glEvalCoord2f", V, F32, F32),
+    sig!("glEvalMesh1", V, U32, I32, I32),
+    sig!("glEvalMesh2", V, U32, I32, I32, I32, I32),
+    sig!("glEvalPoint1", V, I32),
+    sig!("glEvalPoint2", V, I32, I32),
+    sig!("glMap1f", V, U32, F32, F32, I32, I32, P),
+    sig!("glMap2f", V, U32, F32, F32, I32, I32, F32, F32, I32, I32, P),
+    sig!("glMapGrid1f", V, I32, F32, F32),
+    sig!("glMapGrid2d", V, I32, F64, F64, I32, F64, F64),
+    sig!("glMapGrid2f", V, I32, F32, F32, I32, F32, F32),
+    sig!("glMultMatrixd", V, P),
+    sig!("glMultMatrixf", V, P),
+    sig!("glNormal3f", V, F32, F32, F32),
+    sig!("glNormal3fv", V, P),
+    sig!("glOrtho", V, F64, F64, F64, F64, F64, F64),
+    sig!("glPopAttrib", V),
+    sig!("glPushAttrib", V, U32),
+    sig!("glScalef", V, F32, F32, F32),
+    sig!("glTexImage1D", V, U32, I32, I32, I32, I32, U32, U32, P),
+    sig!("glTranslated", V, F64, F64, F64),
+    sig!("glTranslatef", V, F32, F32, F32),
+    sig!("glVertex2fv", V, P),
+    sig!("glVertex3f", V, F32, F32, F32),
+    sig!("glVertex3fv", V, P),
     //
     // Almost nothing below is a static import.
     sig!("glBeginQuery", V, U32, U32),
@@ -2803,7 +2907,6 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     // Frees what `glob` allocated, and must be the shim's own: the host's would
     // read `gl_pathv` out of a Darwin `glob_t` at the wrong offset.
     sig!("globfree", V, P),
-    sig!("gluOrtho2D", V, F64, F64, F64, F64),
     sig!("gmtime", P, P),
     sig!("gmtime_r", P, P, P),
     sig!("group_from_gid", P, U32, I32),
@@ -3052,8 +3155,11 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("mkdir", I32, P, U32),
     sig!("mkdirat", I32, I32, P, U16),
     sig!("mkdtemp", P, P),
+    sig!("mkpath_np", I32, P, U16),
+    sig!("mkpathat_np", I32, I32, P, U16),
     sig!("mknod", I32, P, U32, I32),
     sig!("mkstemp", I32, P),
+    sig!("mkstemps", I32, P, I32),
     sig!("mktemp", P, P),
     sig!("_mktemp", P, P),
     sig!("mktime", I64, P),

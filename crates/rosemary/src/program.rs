@@ -584,6 +584,9 @@ pub(crate) struct HostProviders {
     /// CoreFoundation and the frameworks above it, when this tree's own are the
     /// ones in use. Empty otherwise. See [`crate::frameworks`].
     frameworks: machish::resolve::SyntheticDylib,
+    /// The frameworks above whose imports are partly answered by an image of
+    /// the Darwin base. See [`crate::frameworks::base_reexports`].
+    base_reexports: Vec<machish::resolve::SyntheticDylib>,
     /// The `dl` family, which the host exports and cannot usefully answer for an
     /// x86-64 file. See [`crate::dyld`].
     dyld: machish::resolve::SyntheticDylib,
@@ -636,6 +639,7 @@ impl HostProviders {
             darwin: darwin::provider(),
             objc: crate::objc::dispatch::provider(),
             frameworks: crate::frameworks::provider(),
+            base_reexports: crate::frameworks::base_reexports(),
             dyld: crate::dyld::provider(),
             steam: crate::steam::provider(),
             openal: crate::openal::provider(),
@@ -656,6 +660,11 @@ impl HostProviders {
         providers.push(&self.darwin);
         providers.push(&self.objc);
         providers.push(&self.frameworks);
+        providers.extend(
+            self.base_reexports
+                .iter()
+                .map(|lib| lib as &dyn SymbolProvider),
+        );
         providers.push(&self.dyld);
         providers.push(&self.steam);
         providers.push(&self.opengl);
@@ -782,7 +791,7 @@ impl<M: Regions> Program<M> {
         // Mac, and a guest reading `arm64` there goes looking for code paths it does
         // not have. See [`darwin::sysctl`].
         darwin::sysctl::set_guest_arch(darwin::sysctl::GuestArch::X86_64);
-        darwin::sysctl::set_is_translated(true);
+        darwin::sysctl::set_is_translated(darwin::sysctl::translation_reported());
 
         let mut loader = Loader::new(X86_64);
         loader.insert_libraries(crate::dyld::inserted_libraries(bytes, X86_64));

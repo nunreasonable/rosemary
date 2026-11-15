@@ -48,6 +48,7 @@ pub mod dirent;
 pub mod dispatch;
 pub mod distnote;
 pub mod divergent;
+pub mod dslocal;
 pub mod env;
 pub mod err;
 pub mod errno;
@@ -75,6 +76,7 @@ pub mod kqueue;
 pub mod langinfo;
 pub mod libc_backend;
 pub mod libgen;
+pub mod libmacho;
 pub mod libproc;
 pub mod locale;
 pub mod mach;
@@ -93,7 +95,6 @@ pub mod progname;
 pub mod pthread;
 pub mod random;
 pub mod regex;
-mod resolv;
 pub mod rlimit;
 pub mod rosemary;
 pub mod sched;
@@ -108,6 +109,7 @@ pub mod stackprobe;
 pub mod stat;
 pub mod stdio;
 pub mod stdlib;
+pub mod strfmt;
 pub mod strict;
 pub mod string;
 pub mod strtofp;
@@ -115,6 +117,8 @@ pub mod syscall;
 pub mod sysctl;
 pub mod sysdir;
 pub mod sysinfo;
+#[cfg(not(target_os = "macos"))]
+mod syslog;
 #[cfg(not(target_os = "macos"))]
 pub mod termios;
 pub mod tls;
@@ -124,6 +128,7 @@ mod unfair_lock;
 #[cfg(not(target_os = "macos"))]
 pub mod utmpx;
 pub mod uuid;
+pub mod vararg;
 #[cfg(not(target_os = "macos"))]
 pub mod vis;
 pub mod vmmap;
@@ -358,7 +363,6 @@ static SHARED_MODULES: &[exports::Module] = &[
     clock::MODULE,
     glob::MODULE,
     regex::MODULE,
-    resolv::MODULE,
     string::MODULE,
     strtofp::MODULE,
     stdlib::MODULE,
@@ -375,6 +379,7 @@ static SHARED_MODULES: &[exports::Module] = &[
     mach::MODULE,
     fs::MODULE,
     libgen::MODULE,
+    libmacho::MODULE,
     xattr::MODULE,
     passwd::MODULE,
     audit::MODULE,
@@ -415,10 +420,10 @@ static NONPORTABLE_MODULES: &[exports::Module] = &[
     shm::MODULE,
     oslog::MODULE,
     backtrace::MODULE,
-    #[cfg(target_arch = "x86_64")]
     printf_l::MODULE,
     sprintf::MODULE,
-    #[cfg(target_arch = "x86_64")]
+    strfmt::MODULE,
+    syslog::MODULE,
     asl::MODULE,
     #[cfg(target_arch = "x86_64")]
     fenv::MODULE,

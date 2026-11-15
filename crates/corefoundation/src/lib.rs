@@ -26,12 +26,14 @@ pub mod propertylist;
 pub mod runloop;
 mod send;
 mod socket;
+pub mod stream;
 pub mod string;
 pub mod sysconfig;
 pub mod timezone;
 pub mod tzif;
 pub mod url;
 pub mod urlresource;
+pub mod uti;
 pub mod uuid;
 
 /// Install the classes this crate owns. Idempotent.
@@ -47,6 +49,7 @@ pub fn bootstrap() {
     collections::data_class();
     url::class();
     uuid::class();
+    stream::class();
 }
 
 exports::exports! {
@@ -229,6 +232,7 @@ exports::exports! {
         fsevents,
         urlresource,
         sysconfig,
+        stream,
     }
 }
 

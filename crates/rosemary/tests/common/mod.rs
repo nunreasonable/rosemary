@@ -736,6 +736,12 @@ int main(void) {
        standing in for its format - including `%@`, which is a message. */
     printf("format %s\n",
            [[NSString stringWithFormat:@"%d/%@/%.2f/%%", 42, @"x", 1.5] UTF8String]);
+    /* Nil-terminated lists, which need not exist as methods on the host. */
+    NSArray *list = [NSArray arrayWithObjects:@"a", @"b", @"c", nil];
+    printf("list %lu %s\n", (unsigned long)[list count], [[list objectAtIndex:2] UTF8String]);
+    NSDictionary *pairs =
+        [NSDictionary dictionaryWithObjectsAndKeys:@"one", @"1", @"two", @"2", nil];
+    printf("pairs %lu %s\n", (unsigned long)[pairs count], [[pairs objectForKey:@"2"] UTF8String]);
     @synchronized (d) { printf("synchronized\n"); }
     @autoreleasepool { printf("pool\n"); }
     return 0;
@@ -1349,6 +1355,25 @@ int main(void) {
     printf("global same %d\n", copied == global);
     copied();
     Block_release(copied);
+
+    /* Copying a block that captured a block copies the inner one through the
+       outer one's copy helper, and a __block block variable has keep and
+       destroy helpers of its own. */
+    int nested = 0;
+    int *nested_at = &nested;
+    void (^inner)(int) = ^(int x) { *nested_at = x; };
+    void (^outer)(void) = ^{ inner(7); };
+    void (^outer_kept)(void) = Block_copy(outer);
+    outer_kept();
+    Block_release(outer_kept);
+    printf("nested %d\n", nested);
+
+    __block void (^held)(int) = inner;
+    void (^through_byref)(void) = ^{ held(9); };
+    void (^byref_kept)(void) = Block_copy(through_byref);
+    byref_kept();
+    Block_release(byref_kept);
+    printf("held %d\n", nested);
     return 0;
 }
 "#;

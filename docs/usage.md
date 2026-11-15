@@ -21,8 +21,11 @@ Binaries and apps installed in the prefix take priority over host filesystem pat
 ## Compiling ahead of time
 
 The `emulated` backend keeps an on-disk cache of x86-64 code compiled ahead of time
-(see `docs/aot.md`). A run that finds an image of its program uncached starts a
-build of it in the background, at the lowest priority, and does not wait for it.
+(see `docs/aot.md`). Cached code runs straight from the cache files' own pages, so it
+takes no memory of the process's own, and a region is published only when the run
+first reaches it. A run that finds an image of its program uncached, or that earlier
+runs have since compiled much uncached code for, starts a build in the background, at
+the lowest priority (in the background band on macOS), and does not wait for it.
 To build or rebuild the cache yourself, which also takes in the code earlier runs
 had to compile on the fly:
 
@@ -31,9 +34,14 @@ rosemary aot /some/app.app
 rosemary aot --deadline 300 --threads 4 /some/app.app/Contents/MacOS/App
 ```
 
-`--deadline` stops starting work after that many seconds and writes what finished,
-most important code first; `--only-missing` leaves images that already have a cache
-file alone.
+What earlier runs executed and what start-up needs is compiled first, into a file of
+its own that is usable as soon as it is written; everything else follows, compiled
+cheaply (a run recompiles what it actually uses, as it does its own code).
+`--deadline` stops starting work after that many seconds and writes what finished;
+`--hot-only` compiles only that first part; `--only-missing` leaves images that
+already have a cache file alone; `--refresh` builds images with no cache file and
+rebuilds the first part of those whose runs have outgrown it, which is what a
+background build does.
 
 ## Entering a shell
 
@@ -75,7 +83,10 @@ rosemary server --stop         # ask this prefix's server to exit
 | `ROSEMARY_LIBC` | `native` (macOS), `builtin` (other) | Select the libc shim implementation for guest imports. Guest-aware default modules remain active in both modes. |
 | `ROSEMARY_DEAD_FLAGS` | `0` | Enable Microlift's dead flag elimination pass. Improves performance in some applications, but not by a wide enough margin. **May have semantic accuracy bugs, use with extreme caution**. |
 | `ROSEMARY_TSO` | `1` (non-x86 hosts), `0` (x86 hosts) | Fence guest memory accesses so an AArch64 host keeps x86's total store order. Without it, lock-free guest code that publishes data with plain stores (Mono's class setup, for one) can see another thread's writes out of order; Subnautica aborts in Mono on `ac->rank` while loading the world. Costs a `dmb` on most guest memory accesses. |
+| `ROSEMARY_PROC_TRANSLATED` | `1` | (emulated) Tell an x86-64 guest it runs under Rosetta 2, as on an Apple silicon Mac: `sysctl.proc_translated` reads 1, and the commpage and the process's `P_TRANSLATED` flag say so too. Set to `0` to hide all three, as on an Intel Mac. A program that chooses what to download by architecture, such as Roblox's installer, otherwise fetches an arm64-only build, which an x86-64 host cannot run. |
 | `ROSEMARY_CALL_RETURN` | `0` | Enable Microlift native call return support. Can improve performance in some applications - disabled by default as measurements were inconclusive and it is additional, complex code surface. |
+| `ROSEMARY_NO_JIT_TIERS` | `0` | (emulated) Compile every region at its final optimisation level from the start. By default a region is first compiled cheaply (Cranelift's `opt_level=none` and single-pass register allocation, about twice as fast to compile and half as fast to run), and worker threads recompile it at the final level and swap the new code in. Start-up is mostly compiling code that runs a handful of times, so tiering roughly halves it, and the code still running after start-up ends up as fast as before. A loop that never leaves the region it entered keeps the cheap code until it does. |
+| `ROSEMARY_LIFT_AHEAD` | `4` | (emulated) How many static hops ahead of the code a guest is running worker threads compile regions: the constant branch and call targets of each region translated, then theirs, and so on. Lets a thread running cold code find its next region compiled instead of compiling one region after another itself. In code the guest wrote, such as a .NET JIT's, only targets one hop from code that ran are compiled ahead, together with the return addresses of the calls each such region ends at. `0` turns it off. Initializers are compiled ahead in the order they run, whatever this says. |
 | `ROSEMARY_LINK_ROWS` | `65536` | Rows in each guest thread's block-link table, rounded up to a power of two (at least 256). A row lets translated code continue straight into the next region instead of exiting to the run loop, so a working set larger than the table shows up as `window miss(es)` and `indirect call` / `ret out of region` exits under `ROSEMARY_STATS`. 32 bytes a row, committed only where rows are written. |
 | `ROSEMARY_LINK_WAYS` | `4` | How many rows of the block-link table one guest address may occupy: `1`, `2` or `4`. Fewer ways let hot addresses that share a row evict each other on every transfer, which Mono's densely packed JIT code does as soon as ASLR overlaps it with another image modulo the table's span. Measure with `tools/unitybench`. |
 | `ROSEMARY_STRICT_IMPORTS` | `0` | Refuse to run a program that has unbound imports, rather than announcing them on stderr and running anyway. Unbound imports are always announced; this only decides whether they are fatal. |
@@ -93,9 +104,11 @@ rosemary server --stop         # ask this prefix's server to exit
 | `ROSEMARY_GL_HOST_FEATURES` | `0` | (built-in OpenGL) Offer the GL driver's own version, extensions and entry points instead of a Mac's (GL 4.1 core, 2.1 legacy, Apple's export list). Some programs have newer GL paths that a Mac never takes; the price is that the program runs code no Mac tested, which is what the default exists to prevent. |
 | `ROSEMARY_PREFIX` | the default prefix (`off` on macOS) | The prefix a guest runs in: a directory holding a Darwin filesystem, whose `root/` subdirectory is the guest's `/`. Unset, `rosemary run` uses `$XDG_DATA_HOME/rosemary/prefixes/default` (or `$HOME/.local/share/rosemary/prefixes/default`), creating it on first use. Set it to another path to keep a guest's files separate, or to `off` to leave guest paths alone entirely. |
 | `ROSEMARY_PREFIX_HOME` | `prefix` | Where the guest's home directory is. `prefix` keeps it inside the prefix, so a prefix is one directory to copy, archive or delete. `host` mounts the guest's `/Users/<name>` onto the real `$HOME` instead, for a user who would rather keep one set of documents than two. |
+| `ROSEMARY_DARWIN_RELEASE` | `24.0.0` | The Darwin release the guest is told it runs on (`kern.osrelease`). Every other version answer follows from it - `kern.osproductversion`, `Gestalt`, `NSProcessInfo` and the prefix's `SystemVersion.plist` - so they never disagree: Darwin 20 to 24 are macOS 11 to 15, and Darwin 25 is macOS 26. Set `25.0.0` for a program or package that requires macOS 26, such as MacPorts' Tahoe installer. |
+| `ROSEMARY_DARWIN_BUILD` | `24A335` | The build that goes with `ROSEMARY_DARWIN_RELEASE`: `kern.osversion` and `SystemVersion.plist`'s `ProductBuildVersion`. |
 | `ROSEMARY_PREFIX_SETUP` | `ask` | What to do when a prefix needs its Darwin base and it is not cached. `ask` asks - a dialog under `rosemary run` when there is a display, then the terminal - and declines when there is nobody to ask. `download` fetches it without asking. `fail` never downloads. The base is verified against hashes compiled into Rosemary whichever route it takes. |
 | `ROSEMARY_AOT_CACHE` | `$XDG_CACHE_HOME/rosemary/aot` | Where code compiled ahead of time is cached, and where each run logs the image code it had to JIT (`profile/`). Falls back to `$HOME/.cache/rosemary/aot`; `0`, `off` or empty disables both. See `docs/aot.md`. |
-| `ROSEMARY_AOT_BACKGROUND` | on | `0` or `off` stops a run from starting `rosemary aot` in the background when an image of its program has no cache file. |
+| `ROSEMARY_AOT_BACKGROUND` | on | `0` or `off` stops a run from starting `rosemary aot` in the background when an image of its program has no cache file, or one built before runs compiled much uncached code. |
 | `ROSEMARY_AOT_CACHE_KEEP` | unset | Keep the AOT caches of other Rosemary builds instead of removing them when this build stores one, for bisecting between two builds. |
 | `ROSEMARY_ROOTFS_CACHE` | `$XDG_CACHE_HOME/rosemary/rootfs` | Where verified Darwin bases are cached, shared by every prefix. Falls back to `$HOME/.cache/rosemary/rootfs`. |
 | `ROSEMARY_ENVIRON` | unset | (builtin libc) Variables the guest starts with, one `NAME=VALUE` per line. A line that is a bare `NAME` copies the host's value, if it has one. Nothing else of the host's environment reaches the guest: it gets only `HOME`, `USER`, `LOGNAME`, `SHELL`, `PATH`, `TMPDIR` and `PWD` with its own values, plus the host's `TERM` and `COLORTERM`, and `LANG` and `LC_*` unless the guest is an application bundle (an app launched from the Finder has no locale variables; a bare `LANG` line still copies it). This keeps a Darwin program from following host settings such as `DISPLAY` or `QT_PLUGIN_PATH`. Example: `ROSEMARY_ENVIRON=$'FOO=bar\nDISPLAY'`. |
@@ -114,6 +127,7 @@ rosemary server --stop         # ask this prefix's server to exit
 | `ROSEMARY_CONFINE_POINTER` | unset | Keep the pointer inside the focused window's content, off the titlebar Rosemary draws; pushed against the edge it holds still and keeps reporting deltas. A workaround, not Mac behavior: some ports (Feral's, e.g. Life Is Strange) confine the cursor with a Win32 `ClipCursor` emulation that clamps only once and counts on warping the pointer back when it strays, which cannot reach a pointer that has left the window on Wayland. Their drag interactions stop short without it. |
 | `ROSEMARY_GLIBC` | `auto` | (packaged builds) Which glibc the launcher runs Rosemary on: `host`, `bundled`, or `auto`, which uses the host's when it defines every symbol version the bundle's libraries need and the bundled one otherwise. |
 | `ROSEMARY_EXE` | (set by the launcher) | The path that starts another copy of Rosemary. Under the bundled glibc the kernel reports the bundled dynamic loader as this process's executable, so the runtime re-launches itself (`rosemary server`, a guest spawning a Mach-O) through this instead. |
+| `ROSEMARY_METAL_BACKEND` | `vulkan` | Experimental: set to `native` on macOS to return guest-wrapped devices and basic resources backed by the host Metal framework, while retaining `ROSEMARY_OBJC=builtin`. The experimental backend supports native device discovery, queues, buffers, textures, samplers, texture copies and mipmap generation, source-MSL shaders, precompiled `.metallib` dispatch-data loading, compute and render pipelines, vertex descriptors, color blending, depth/stencil state, texture/sampler bindings, indexed drawing, rasterization state, asynchronous command-buffer completion handlers, and guest `CAMetalLayer` drawables. A full-window SDL Metal view is attached by AppKit's video-thread pump when available. This is **not** a complete Metal implementation: shader specialization, all texture formats and advanced rendering operations, complete window/layer composition, and other API surfaces remain incomplete. Roblox 0.747 has successfully joined Crossroads and DOORS, and GPU readbacks verified actual world and UI rendering; a DOORS-lobby Metal HUD comparison measured roughly native performance on Apple M2. Extended interactive gameplay, long-running stability, and broad application compatibility are **not yet verified**; use this mode for research, not production. The existing Metal-to-Vulkan translator remains the default even on macOS. |
 | `ROSEMARY_METAL_PRESENTATION_MODE` | unset | Set the presentation mode used by Vulkan in Rosemary's Metal translation. Valid values are `immediate`, `fifo`, `fifo_relaxed`, and `mailbox`. |
 | `ROSEMARY_SHADER_CACHE` | `$XDG_CACHE_HOME/rosemary/metal-shaders` | Where Metal shaders translated to SPIR-V are cached, together with each GPU's Vulkan pipeline cache (`pipelines-<vendor>-<device>-<uuid>.bin`), so a second run neither retranslates shaders nor recompiles pipelines. Falls back to `$HOME/.cache/rosemary/metal-shaders`. Each build of the translator keeps its own subdirectory and removes the others; `ROSEMARY_SHADER_CACHE_KEEP` keeps them. Set to `off`, `0` or the empty string to disable both caches. |
 | `ROSEMARY_SCREEN_REFRESH_RATE` | unset | Hertz that guests are told the display refreshes at, in place of the host's mode: `NSScreen`/`UIScreen` `maximumFramesPerSecond` and the refresh-interval properties. |
@@ -155,6 +169,12 @@ terminfo database. The system libraries a guest *links against* are still this
 runtime's own reimplementations; the base is there for a guest that stats,
 reads or `dlopen`s a system file, and so that a prefix has a real Darwin
 filesystem shape. A prefix without one still runs guests.
+
+The exception is Swift. A Swift guest loads the base's `/usr/lib/swift`
+libraries as it would on a Mac, and the Swift half of Foundation (`Data`, `URL`,
+`JSONEncoder`, ...) is the base's `libswiftFoundation.dylib`, which this
+runtime's Foundation re-exports when the built-in Objective-C runtime is in use.
+In a prefix whose base predates it, those imports are unbound.
 
 A new prefix gets its base when it is created, and nothing is downloaded
 without consent: `rosemary run` asks with a dialog or on the terminal, and
@@ -220,6 +240,15 @@ Rosemary has two execution modes currently:
 
 If not specified at the CLI, Rosemary will automatically try to see if there is a slice available in the app for your native architecture and run it without getting Microlift involved. Otherwise, it will check if it has an emulated implementation for the architecture.
 
+`--emulated` takes an optional mode, which the Mach-Os the guest executes inherit:
+
+* `--emulated=x86-64` (the default for a bare `--emulated`) - as under Rosetta 2, a child
+  with an x86-64 slice runs it emulated, and one without any (such as `/usr/bin/unzip` in an
+  arm64 prefix) runs natively. That native child's own children choose their backend
+  automatically again.
+* `--emulated=x86-64-strict` - every executed Mach-O must have an x86-64 slice; one without
+  fails to launch.
+
 ARM emulation is not supported yet, but the groundwork is laid for it.
 
 ## Built-in OpenGL
@@ -245,5 +274,7 @@ contexts GL 2.1 with GLSL 1.20, and both list only the extensions a Mac lists
 for that profile and the driver also has. `ROSEMARY_GL_HOST_FEATURES=1` offers
 the driver's own version, extensions and functions instead.
 
-The built-in GLU surface provides `gluOrtho2D` through the driver's `glOrtho`;
-other GLU functions are unbound. No host GLU library is required.
+GLU is the Darwin base's `/usr/lib/libGLU.1.dylib`, which the framework
+re-exports and which draws through the GL above; no host GLU library is used. A
+prefix whose base is not the guest's architecture leaves GLU unbound. Apple's
+private `CTX` and `CFM` GLU variants are not provided.

@@ -13,7 +13,11 @@ use static_init::dynamic;
 /// 1024          33.7s     1.1s        6769
 ///  512          15.2s     0.3s        6839
 /// ```
-const MAX_REGION_INSTRUCTIONS: usize = 1024;
+///
+/// Roblox reaches its first frame 8% sooner at 256 than at 1024, and the steady-state
+/// loops measured (`tools/unitybench` among them) run no slower: a region boundary is
+/// a link cell, and a smaller region is a smaller compile for a worker to finish.
+const MAX_REGION_INSTRUCTIONS: usize = 256;
 
 /// How far forward a branch may point and still be followed.
 const MAX_FORWARD_BRANCH_DIST: u64 = 4 * 4096;
@@ -128,6 +132,9 @@ pub struct Region {
     /// Where control can arrive from outside: the address the region was made for, and
     /// the resume point after every call that leaves it.
     pub entries: Vec<u64>,
+    /// Where calls the Mono rule ends a block at would return to, ascending. Not part
+    /// of the region; whatever comes back there is a region of its own.
+    pub returns: Vec<u64>,
 }
 
 impl Region {
@@ -175,6 +182,8 @@ struct Walk<'a> {
     current_targets: BTreeSet<u64>,
     /// Where control can arrive from outside. See [`Region::entries`].
     entries: BTreeSet<u64>,
+    /// See [`Region::returns`].
+    returns: BTreeSet<u64>,
     /// The lowest address the current block must stop before: the next entry on
     /// the worklist, or the next block already decoded, whichever is nearer.
     next_block_start: u64,
@@ -204,6 +213,7 @@ impl<'a> Walk<'a> {
             visited: BTreeSet::new(),
             current_targets: BTreeSet::new(),
             entries: BTreeSet::from([pc]),
+            returns: BTreeSet::new(),
             next_block_start: u64::MAX,
             total: 0,
             max: max_instructions(),
@@ -349,7 +359,9 @@ impl<'a> Walk<'a> {
             FlowControl::Call | FlowControl::IndirectCall => {
                 // The callee is a region of its own - following it would inline
                 // the program into one translation unit.
-                if !(self.writable && mono_rule()) {
+                if self.writable && mono_rule() {
+                    self.returns.insert(next);
+                } else {
                     self.add_branch_target(next, next);
                     self.entries.insert(next);
                 }
@@ -455,11 +467,20 @@ impl<'a> Walk<'a> {
         let mut entries: Vec<u64> = self.entries.into_iter().collect();
         entries.retain(|e| starts.binary_search(e).is_ok());
 
+        // A call cut off by the instruction cap, or one whose return lands in a block
+        // of this region, needs nothing of its own.
+        let returns: Vec<u64> = self
+            .returns
+            .into_iter()
+            .filter(|r| starts.binary_search(r).is_err())
+            .collect();
+
         Some(Region {
             range: first..last,
             blocks: self.blocks.into_iter().map(|b| b.range).collect(),
             starts,
             entries,
+            returns,
         })
     }
 }
@@ -555,6 +576,11 @@ mod tests {
         let r = region_for(&code, BASE, BASE, true).unwrap();
         assert_eq!(r.blocks, vec![BASE..BASE + 5]);
         assert!(!r.entries.contains(&(BASE + 5)));
+        assert_eq!(
+            r.returns,
+            vec![BASE + 5],
+            "where the call would come back to"
+        );
 
         // The same bytes in an image: the resume point is followed, because
         // almost every call does return to it.

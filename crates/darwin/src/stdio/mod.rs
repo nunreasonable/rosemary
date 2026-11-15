@@ -7,12 +7,14 @@ mod backend;
 mod engine;
 mod format;
 mod open;
+mod parseln;
 mod wide;
 
 pub use api::*;
 pub use backend::{fmemopen, funopen, open_memstream, open_wmemstream};
 pub use format::*;
 pub use open::{fclose, fdopen, fopen, freopen, pclose, popen, tmpfile};
+pub use parseln::fparseln;
 pub use wide::*;
 
 pub type ReadFn = unsafe extern "C" fn(*mut c_void, *mut c_char, c_int) -> c_int;
@@ -522,6 +524,7 @@ exports::exports! {
         "getline" => getline,
         "getdelim" => getdelim,
         "fgetln" => fgetln,
+        "fparseln" => fparseln,
         "perror" => perror,
 
         "fflush" => fflush,
@@ -569,24 +572,24 @@ exports::exports! {
 
         "printf" => printf,
         "fprintf" => fprintf,
-        "vprintf" => vprintf,
-        "vfprintf" => vfprintf,
+        "vprintf" => format::darwin_vprintf,
+        "vfprintf" => format::darwin_vfprintf,
         "printf_l" => printf_l,
         "fprintf_l" => fprintf_l,
-        "vprintf_l" => vprintf_l,
-        "vfprintf_l" => vfprintf_l,
+        "vprintf_l" => format::darwin_vprintf_l,
+        "vfprintf_l" => format::darwin_vfprintf_l,
         "scanf" => scanf,
         "fscanf" => fscanf,
-        "vscanf" => vscanf,
-        "vfscanf" => vfscanf,
+        "vscanf" => format::darwin_vscanf,
+        "vfscanf" => format::darwin_vfscanf,
         "scanf_l" => scanf_l,
         "fscanf_l" => fscanf_l,
-        "vscanf_l" => vscanf_l,
-        "vfscanf_l" => vfscanf_l,
+        "vscanf_l" => format::darwin_vscanf_l,
+        "vfscanf_l" => format::darwin_vfscanf_l,
         "wprintf" => wprintf,
         "fwprintf" => fwprintf,
-        "vwprintf" => vwprintf,
-        "vfwprintf" => vfwprintf,
+        "vwprintf" => format::darwin_vwprintf,
+        "vfwprintf" => format::darwin_vfwprintf,
     }
     // The Mach-O underscore is added here; the C identifiers carry one of their
     // own, so the guest imports `___stdoutp`.
