@@ -9,14 +9,24 @@ pub(super) unsafe extern "C" fn set_compute_pipeline(receiver: Id, _sel: Sel, pi
 
 pub(super) unsafe extern "C" fn set_render_pipeline(receiver: Id, _sel: Sel, pipeline: Id) {
     let encoder = unsafe { object::body::<Encoder>(receiver) };
+    // Retained when it was set before.
+    if encoder.render_pipeline == pipeline {
+        return;
+    }
     encoder.command().retain(pipeline);
     encoder.render_pipeline = pipeline;
+    encoder.variant_stale = true;
 }
 
 pub(super) unsafe extern "C" fn set_depth_stencil_state(receiver: Id, _sel: Sel, state: Id) {
     let encoder = unsafe { object::body::<Encoder>(receiver) };
+    // Retained when it was set before.
+    if encoder.depth_state == state {
+        return;
+    }
     encoder.command().retain(state);
     encoder.depth_state = state;
+    encoder.variant_stale = true;
 }
 
 pub(super) const COMPUTE: usize = 0;
@@ -34,6 +44,7 @@ pub(super) unsafe extern "C" fn set_buffer<const STAGE: usize>(
 ) {
     // SAFETY: an encoder of this crate's.
     let encoder = unsafe { object::body::<Encoder>(receiver) };
+    encoder.dirty.insert(Table::Buffers, STAGE, index as usize);
     let Some(slot) = encoder.buffers[STAGE].get_mut(index as usize) else {
         // Metal retains what an encoder binds, and a guest is entitled to
         // release its own reference the moment the call returns. The command
@@ -97,6 +108,7 @@ pub(super) unsafe extern "C" fn set_bytes<const STAGE: usize>(
     let Some((buffer, offset)) = encoder.command().upload(source) else {
         return;
     };
+    encoder.dirty.insert(Table::Buffers, STAGE, index as usize);
     if let Some(slot) = encoder.buffers[STAGE].get_mut(index as usize) {
         *slot = BufferBinding {
             buffer,
@@ -117,6 +129,7 @@ pub(super) unsafe extern "C" fn set_buffer_offset<const STAGE: usize>(
 ) {
     // SAFETY: an encoder of this crate's.
     let encoder = unsafe { object::body::<Encoder>(receiver) };
+    encoder.dirty.insert(Table::Buffers, STAGE, index as usize);
     if let Some(slot) = encoder.buffers[STAGE].get_mut(index as usize) {
         slot.offset = offset;
         // Metal allows this only on a buffer set with `-setBuffer:`. On a
@@ -140,19 +153,24 @@ pub(super) unsafe extern "C" fn set_texture<const STAGE: usize>(
             return;
         }
         *slot = texture;
+        encoder.dirty.insert(Table::Textures, STAGE, index as usize);
     }
     encoder.command().retain(texture);
     encoder.note_read(texture);
 }
 
 /// `-waitForFence:`, `-useResource:` and `-useHeap:` and their forms with
-/// stages: a render pass reads what an earlier pass wrote through a resource
-/// it does not bind, so it waits for every pass before it. A compute or blit
-/// encoder already does.
+/// stages: an encoder reads what earlier work wrote through a resource it
+/// does not name, so it waits for all the work before it. A compute encoder
+/// already does.
 pub(super) unsafe extern "C" fn order_after_earlier_passes(receiver: Id, _sel: Sel) {
     // SAFETY: an encoder of this crate's.
     let encoder = unsafe { object::body::<Encoder>(receiver) };
-    encoder.writes_elsewhere = true;
+    match encoder.kind {
+        // A blit's copies wait as they are recorded, so this one waits now.
+        Kind::Blit => encoder.command().flush_hazards(),
+        Kind::Compute | Kind::Render => encoder.writes_elsewhere = true,
+    }
 }
 
 pub(super) unsafe extern "C" fn set_sampler<const STAGE: usize>(
@@ -169,6 +187,7 @@ pub(super) unsafe extern "C" fn set_sampler<const STAGE: usize>(
             return;
         }
         *slot = sampler;
+        encoder.dirty.insert(Table::Samplers, STAGE, index as usize);
     }
     encoder.command().retain(sampler);
 }
@@ -195,7 +214,11 @@ macro_rules! raster_setter {
     ($name:ident, $field:ident) => {
         pub(super) unsafe extern "C" fn $name(receiver: Id, _sel: Sel, value: u64) {
             // SAFETY: an encoder of this crate's.
-            unsafe { object::body::<Encoder>(receiver) }.$field = value;
+            let encoder = unsafe { object::body::<Encoder>(receiver) };
+            if encoder.$field != value {
+                encoder.$field = value;
+                encoder.variant_stale = true;
+            }
         }
     };
 }
@@ -204,51 +227,6 @@ raster_setter!(set_cull_mode, cull_mode);
 raster_setter!(set_front_facing_winding, winding);
 raster_setter!(set_triangle_fill_mode, fill_mode);
 raster_setter!(set_depth_clip_mode, depth_clip);
-
-pub(super) unsafe extern "C" fn set_viewport(receiver: Id, _sel: Sel, viewport: Viewport) {
-    // SAFETY: an encoder of this crate's.
-    let command = unsafe { object::body::<Encoder>(receiver) }.command();
-    // Metal's clip space has Y up and its framebuffer origin is top left;
-    // Vulkan's clip space has Y down. A negative viewport height, core since
-    // Vulkan 1.1, is the exact correction.
-    let flipped = vk::Viewport {
-        x: viewport.origin_x as f32,
-        y: (viewport.origin_y + viewport.height) as f32,
-        width: viewport.width as f32,
-        height: -(viewport.height as f32),
-        min_depth: viewport.znear as f32,
-        max_depth: viewport.zfar as f32,
-    };
-    // SAFETY: recording into this command buffer.
-    unsafe {
-        command
-            .gpu
-            .device
-            .cmd_set_viewport(command.command_buffer, 0, &[flipped])
-    };
-}
-
-pub(super) unsafe extern "C" fn set_scissor(receiver: Id, _sel: Sel, rect: ScissorRect) {
-    // SAFETY: an encoder of this crate's.
-    let command = unsafe { object::body::<Encoder>(receiver) }.command();
-    let scissor = vk::Rect2D {
-        offset: vk::Offset2D {
-            x: rect.x as i32,
-            y: rect.y as i32,
-        },
-        extent: vk::Extent2D {
-            width: rect.width as u32,
-            height: rect.height as u32,
-        },
-    };
-    // SAFETY: recording into this command buffer.
-    unsafe {
-        command
-            .gpu
-            .device
-            .cmd_set_scissor(command.command_buffer, 0, &[scissor])
-    };
-}
 
 pub(super) unsafe extern "C" fn set_depth_bias(
     receiver: Id,

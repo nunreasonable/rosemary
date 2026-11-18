@@ -21,7 +21,17 @@ macro_rules! isolate_metal_fixture {
     };
 }
 
+mod control_flow;
+mod depth_stencil;
+mod geometry;
+mod half_fallback;
+mod nonshared_events;
+mod pipeline_buffers;
+mod queue_order;
+mod short_fallback;
 mod source_constants;
+mod texture_threads;
+mod viewports;
 
 fn device_for_tests() -> Id {
     bootstrap();
@@ -280,6 +290,77 @@ fn texture_descriptor_copies_preserve_settings_and_are_independent() {
             assert_eq!(send_number_result(copy, "width"), 64);
             objc::arc::release(copy);
         }
+    }
+}
+
+static TEXTURE_COPY_INIT_CALLS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[repr(C)]
+struct TextureCopySuper {
+    receiver: Id,
+    class: *const objc::class::Class,
+}
+
+unsafe extern "C" fn texture_copy_probe_init(receiver: Id, sel: objc::sel::Sel) -> Id {
+    TEXTURE_COPY_INIT_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let class = unsafe { objc::object::class_of(receiver) }.expect("probe class");
+    let sup = TextureCopySuper {
+        receiver,
+        class: objc::class::ptr(class),
+    };
+    let send: unsafe extern "C" fn(*const TextureCopySuper, objc::sel::Sel) -> Id =
+        unsafe { std::mem::transmute(objc::msg::entry_super2()) };
+    unsafe { darwin::call_as_darwin!(send(&sup, sel)) }
+}
+
+#[test]
+fn texture_descriptor_copy_uses_the_dynamic_class_and_initializer() {
+    isolate_metal_fixture!();
+    bootstrap();
+    // SAFETY: a fresh subclass and objects this test owns.
+    unsafe {
+        let base = objc::class::ptr(objc::class::lookup(c"MTLTextureDescriptor").unwrap());
+        let subclass = objc::api::objc_allocateClassPair(
+            base.cast(),
+            c"RosemaryTextureDescriptorCopyProbe".as_ptr(),
+            0,
+        );
+        assert!(!subclass.is_null());
+        let class = objc::class::from_ptr(subclass.cast()).expect("allocated class");
+        class.replace_method(
+            objc::sel::get("init"),
+            texture_copy_probe_init as *const std::ffi::c_void,
+            c"@16@0:8",
+        );
+        objc::api::objc_registerClassPair(subclass);
+
+        TEXTURE_COPY_INIT_CALLS.store(0, std::sync::atomic::Ordering::SeqCst);
+        let original = send(subclass as Id, "new");
+        assert_eq!(
+            TEXTURE_COPY_INIT_CALLS.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        send_number(original, "setWidth:", 73);
+        let (copy, sel) = method::<
+            unsafe extern "C" fn(Id, objc::sel::Sel, *mut std::ffi::c_void) -> Id,
+        >(original, "copyWithZone:");
+        let copied = copy(
+            original,
+            sel,
+            std::ptr::NonNull::<std::ffi::c_void>::dangling().as_ptr(),
+        );
+        assert!(!copied.is_null());
+        assert_eq!(objc::api::object_getClass(copied), subclass);
+        assert_eq!(
+            TEXTURE_COPY_INIT_CALLS.load(std::sync::atomic::Ordering::SeqCst),
+            2
+        );
+        assert_eq!(send_number_result(copied, "width"), 73);
+        send_number(original, "setWidth:", 91);
+        assert_eq!(send_number_result(copied, "width"), 73);
+        objc::arc::release(original);
+        objc::arc::release(copied);
     }
 }
 
@@ -1330,6 +1411,143 @@ unsafe fn element_at(receiver: Id, index: u64) -> Id {
     unsafe { call(receiver, sel, index) }
 }
 
+const MRT_GAP_SOURCE: &str = "#include <metal_stdlib>
+    using namespace metal;
+    struct VOut { float4 position [[position]]; };
+    struct FOut { float4 zero [[color(0)]]; float4 two [[color(2)]]; };
+    vertex VOut mrt_vertex(uint id [[vertex_id]]) {
+        VOut out = {};
+        float2 position = id == 0u ? float2(-1.0, -1.0) :
+            (id == 1u ? float2(3.0, -1.0) : float2(-1.0, 3.0));
+        out.position = float4(position, 0.0, 1.0);
+        return out;
+    }
+    fragment FOut mrt_fragment() {
+        FOut out = { float4(1.0, 0.0, 0.0, 1.0), float4(0.0, 1.0, 0.0, 1.0) };
+        return out;
+    }";
+
+#[test]
+fn a_render_target_gap_preserves_fragment_output_locations() {
+    isolate_metal_fixture!();
+    if let Some(device) = gpu_device() {
+        check_render_target_gap(device);
+    }
+}
+
+#[test]
+fn a_render_target_gap_is_preserved_without_dynamic_rendering() {
+    isolate_metal_fixture!();
+    if let Some(device) = gpu_device_without_dynamic_rendering() {
+        check_render_target_gap(device);
+    }
+}
+
+fn check_render_target_gap(device: Id) {
+    const SIZE: u64 = 8;
+    const RGBA8: u64 = 70;
+    let gpu = gpu_of(device).expect("a Vulkan device");
+    let library = source_library(device, MRT_GAP_SOURCE);
+    assert!(!library.is_null());
+    // SAFETY: live source-library functions.
+    let (vertex, fragment) = unsafe {
+        (
+            new_function_with_name(
+                library,
+                std::ptr::null(),
+                foundation::string::from_str("mrt_vertex"),
+            ),
+            new_function_with_name(
+                library,
+                std::ptr::null(),
+                foundation::string::from_str("mrt_fragment"),
+            ),
+        )
+    };
+    assert!(!vertex.is_null() && !fragment.is_null());
+    let descriptor = object::make(
+        c"MTLRenderPipelineDescriptor",
+        pipeline::RenderPipelineDescriptor {
+            vertex_buffers: std::ptr::null_mut(),
+            fragment_buffers: std::ptr::null_mut(),
+            vertex_function: vertex,
+            fragment_function: fragment,
+            vertex_descriptor: std::ptr::null_mut(),
+            colors: [pipeline::ColorAttachment::fresh(); pipeline::COLOR_ATTACHMENTS],
+            depth_format: 0,
+            stencil_format: 0,
+            sample_count: 1,
+            alpha_to_coverage: false,
+            alpha_to_one: false,
+            rasterization: true,
+            input_topology: 0,
+            color_objects: std::ptr::null_mut(),
+        },
+    );
+    // SAFETY: a live pipeline descriptor and attachment collection.
+    unsafe {
+        let colors = send(descriptor, "colorAttachments");
+        send_number(element_at(colors, 0), "setPixelFormat:", RGBA8);
+        send_number(element_at(colors, 2), "setPixelFormat:", RGBA8);
+    }
+    let mut error = std::ptr::null_mut();
+    // SAFETY: live device and descriptor.
+    let state = unsafe { new_render_pipeline(device, std::ptr::null(), descriptor, &mut error) };
+    assert!(!state.is_null() && error.is_null());
+    let texture = || {
+        resource::new_texture(
+            gpu,
+            resource::TextureDescriptor {
+                texture_type: 2,
+                pixel_format: RGBA8,
+                width: SIZE,
+                height: SIZE,
+                depth: 1,
+                mipmap_level_count: 1,
+                sample_count: 1,
+                array_length: 1,
+                storage_mode: 2,
+                usage: gpu::USAGE_RENDER_TARGET,
+            },
+        )
+    };
+    let (zero, two) = (texture(), texture());
+    assert!(!zero.is_null() && !two.is_null());
+    let pass = object::make(
+        c"MTLRenderPassDescriptor",
+        encoder::RenderPassDescriptor::default(),
+    );
+    // SAFETY: live pass attachment descriptors and textures.
+    unsafe {
+        let colors = send(pass, "colorAttachments");
+        for (index, texture) in [(0, zero), (2, two)] {
+            let attachment = element_at(colors, index);
+            send_with_object(attachment, "setTexture:", texture);
+            send_number(attachment, "setLoadAction:", 2);
+            send_number(attachment, "setStoreAction:", 1);
+        }
+        let queue = new_command_queue(device, std::ptr::null());
+        let command = send(queue, "commandBuffer");
+        let render = render_encoder(command, pass);
+        assert!(!render.is_null());
+        send_with_object(render, "setRenderPipelineState:", state);
+        draw(render, 3);
+        send_void(render, "endEncoding");
+        send_void(command, "commit");
+        send_void(command, "waitUntilCompleted");
+    }
+    let mut zero_bytes = [0u8; (SIZE * SIZE * 4) as usize];
+    let mut two_bytes = [0u8; (SIZE * SIZE * 4) as usize];
+    // SAFETY: each output buffer covers the complete texture region.
+    unsafe {
+        get_bytes(zero, [0, 0, SIZE, SIZE], &mut zero_bytes, SIZE * 4);
+        get_bytes(two, [0, 0, SIZE, SIZE], &mut two_bytes, SIZE * 4);
+    }
+    let middle = ((SIZE / 2 * SIZE + SIZE / 2) * 4) as usize;
+    assert_eq!(&zero_bytes[middle..middle + 4], &[255, 0, 0, 255]);
+    assert_eq!(&two_bytes[middle..middle + 4], &[0, 255, 0, 255]);
+}
+
 /// A multisampled depth attachment resolved into a one-sample texture, which
 /// is what `VK_KHR_depth_stencil_resolve` adds. The pass clears depth to one,
 /// draws a triangle covering every sample at a depth of a half, and the
@@ -1419,6 +1637,8 @@ fn check_depth_resolve(device: Id) {
     let descriptor = object::make(
         c"MTLRenderPipelineDescriptor",
         pipeline::RenderPipelineDescriptor {
+            vertex_buffers: std::ptr::null_mut(),
+            fragment_buffers: std::ptr::null_mut(),
             vertex_function: vertex,
             fragment_function: fragment,
             vertex_descriptor,
@@ -1591,6 +1811,8 @@ fn triangle_pipeline_descriptor(device: Id) -> Id {
     let descriptor = object::make(
         c"MTLRenderPipelineDescriptor",
         pipeline::RenderPipelineDescriptor {
+            vertex_buffers: std::ptr::null_mut(),
+            fragment_buffers: std::ptr::null_mut(),
             vertex_function: vertex,
             fragment_function: fragment,
             vertex_descriptor,
@@ -1661,6 +1883,127 @@ unsafe extern "C" fn record_creation(_block: Id, object: Id, error: Id) {
         std::thread::current().id(),
     ));
     CREATED_READY.notify_all();
+}
+
+static EVENT_NOTIFICATION: Mutex<Option<(usize, u64)>> = Mutex::new(None);
+static EVENT_NOTIFICATION_READY: std::sync::Condvar = std::sync::Condvar::new();
+static MULTI_EVENT_NOTIFICATIONS: Mutex<Vec<(usize, u64)>> = Mutex::new(Vec::new());
+static MULTI_EVENT_NOTIFICATIONS_READY: std::sync::Condvar = std::sync::Condvar::new();
+
+unsafe extern "C" fn record_event_notification(_block: Id, event: Id, value: u64) {
+    *EVENT_NOTIFICATION.lock().expect("event notification") = Some((event as usize, value));
+    EVENT_NOTIFICATION_READY.notify_all();
+}
+
+unsafe extern "C" fn record_multi_event_notification(_block: Id, event: Id, value: u64) {
+    MULTI_EVENT_NOTIFICATIONS
+        .lock()
+        .expect("event notifications")
+        .push((event as usize, value));
+    MULTI_EVENT_NOTIFICATIONS_READY.notify_all();
+}
+
+#[test]
+fn a_shared_event_notification_runs_on_its_listener() {
+    isolate_metal_fixture!();
+    let Some(device) = gpu_device() else {
+        return;
+    };
+    *EVENT_NOTIFICATION.lock().expect("event notification") = None;
+    let block = GlobalBlock::new(record_event_notification as *const std::ffi::c_void);
+    // SAFETY: live Metal objects and a global notification block.
+    unsafe {
+        let event = send(device, "newSharedEvent");
+        let listener = send(
+            objc::class::ptr(objc::class::lookup(c"MTLSharedEventListener").unwrap()) as Id,
+            "new",
+        );
+        let (notify, sel) = method::<unsafe extern "C" fn(Id, Sel, Id, u64, Id)>(
+            event,
+            "notifyListener:atValue:block:",
+        );
+        notify(event, sel, listener, 7, block.id());
+        let (signal, sel) =
+            method::<unsafe extern "C" fn(Id, Sel, u64)>(event, "setSignaledValue:");
+        signal(event, sel, 7);
+        let (notified, timeout) = EVENT_NOTIFICATION_READY
+            .wait_timeout_while(
+                EVENT_NOTIFICATION.lock().expect("event notification"),
+                std::time::Duration::from_secs(5),
+                |notification| notification.is_none(),
+            )
+            .expect("event notification");
+        assert!(!timeout.timed_out(), "the notification did not run");
+        assert_eq!(*notified, Some((event as usize, 7)));
+        objc::arc::release(listener);
+        objc::arc::release(event);
+    }
+}
+
+#[test]
+fn shared_event_notifications_are_watched_per_device() {
+    isolate_metal_fixture!();
+    let Some(first_device) = gpu_device() else {
+        return;
+    };
+    let Some(second_gpu) = vulkan::duplicate_first_gpu() else {
+        return;
+    };
+    let first = unsafe { object::body_ref::<Device>(first_device) };
+    let second_device = object::make(
+        c"RosemaryMTLDevice",
+        Device {
+            ordinal: first.ordinal + 1,
+            name: foundation::string::from_str("Second Test Device"),
+            recommended_working_set: first.recommended_working_set,
+            target: first.target,
+            gpu: Some(second_gpu),
+        },
+    );
+    MULTI_EVENT_NOTIFICATIONS
+        .lock()
+        .expect("event notifications")
+        .clear();
+    let block = GlobalBlock::new(record_multi_event_notification as *const std::ffi::c_void);
+    // SAFETY: two live Metal devices, events, a listener and global block.
+    unsafe {
+        let events = [
+            send(first_device, "newSharedEvent"),
+            send(second_device, "newSharedEvent"),
+        ];
+        assert!(events.iter().all(|event| !event.is_null()));
+        let listener = send(
+            objc::class::ptr(objc::class::lookup(c"MTLSharedEventListener").unwrap()) as Id,
+            "new",
+        );
+        for (index, event) in events.into_iter().enumerate() {
+            let value = index as u64 + 3;
+            let (notify, sel) = method::<unsafe extern "C" fn(Id, Sel, Id, u64, Id)>(
+                event,
+                "notifyListener:atValue:block:",
+            );
+            notify(event, sel, listener, value, block.id());
+            let (signal, sel) =
+                method::<unsafe extern "C" fn(Id, Sel, u64)>(event, "setSignaledValue:");
+            signal(event, sel, value);
+        }
+        let (notifications, timeout) = MULTI_EVENT_NOTIFICATIONS_READY
+            .wait_timeout_while(
+                MULTI_EVENT_NOTIFICATIONS
+                    .lock()
+                    .expect("event notifications"),
+                std::time::Duration::from_secs(5),
+                |notifications| notifications.len() != 2,
+            )
+            .expect("event notifications");
+        assert!(!timeout.timed_out(), "both devices did not notify");
+        for (index, event) in events.into_iter().enumerate() {
+            assert!(notifications.contains(&(event as usize, index as u64 + 3)));
+            objc::arc::release(event);
+        }
+        objc::arc::release(listener);
+        objc::arc::release(second_device);
+    }
 }
 
 /// `newRenderPipelineStateWithDescriptor:completionHandler:` compiles on
@@ -1756,6 +2099,8 @@ fn a_translated_triangle_draws_on_the_gpu() {
     let descriptor = object::make(
         c"MTLRenderPipelineDescriptor",
         pipeline::RenderPipelineDescriptor {
+            vertex_buffers: std::ptr::null_mut(),
+            fragment_buffers: std::ptr::null_mut(),
             vertex_function: vertex,
             fragment_function: fragment,
             vertex_descriptor,
@@ -2288,6 +2633,53 @@ unsafe fn draw(encoder: Id, vertices: u64) {
 /// # Safety
 ///
 /// `encoder` must be an `RosemaryMTLCommandEncoder`.
+unsafe fn copy_buffer_to_texture(encoder: Id, buffer: Id, texture: Id, size: u64) {
+    let sel = objc::sel::get(
+        "copyFromBuffer:sourceOffset:sourceBytesPerRow:sourceBytesPerImage:sourceSize:toTexture:destinationSlice:destinationLevel:destinationOrigin:",
+    );
+    // SAFETY: an object the runtime allocated.
+    let method = unsafe { objc::object::class_of(encoder) }
+        .and_then(|class| class.method(sel))
+        .expect("the selector is registered");
+    // SAFETY: the registered signature.
+    #[allow(clippy::type_complexity)]
+    let call: unsafe extern "C" fn(
+        Id,
+        Sel,
+        Id,
+        u64,
+        u64,
+        u64,
+        encoder::MtlSize,
+        Id,
+        u64,
+        u64,
+        encoder::MtlOrigin,
+    ) = unsafe { std::mem::transmute(method.implementation()) };
+    unsafe {
+        call(
+            encoder,
+            sel,
+            buffer,
+            0,
+            size * 4,
+            size * size * 4,
+            encoder::MtlSize {
+                width: size,
+                height: size,
+                depth: 1,
+            },
+            texture,
+            0,
+            0,
+            encoder::MtlOrigin { x: 0, y: 0, z: 0 },
+        )
+    };
+}
+
+/// # Safety
+///
+/// `encoder` must be an `RosemaryMTLCommandEncoder`.
 unsafe fn copy_texture_to_buffer(encoder: Id, texture: Id, buffer: Id, size: u64) {
     let sel = objc::sel::get(
         "copyFromTexture:sourceSlice:sourceLevel:sourceOrigin:sourceSize:toBuffer:destinationOffset:destinationBytesPerRow:destinationBytesPerImage:",
@@ -2433,6 +2825,8 @@ fn recording_cost() {
         let descriptor = object::make(
             c"MTLRenderPipelineDescriptor",
             pipeline::RenderPipelineDescriptor {
+                vertex_buffers: std::ptr::null_mut(),
+                fragment_buffers: std::ptr::null_mut(),
                 vertex_function: vertex,
                 fragment_function: fragment,
                 vertex_descriptor,
@@ -2568,6 +2962,8 @@ fn resource_draw_pipeline(device: Id) -> Id {
         let descriptor = object::make(
             c"MTLRenderPipelineDescriptor",
             pipeline::RenderPipelineDescriptor {
+                vertex_buffers: std::ptr::null_mut(),
+                fragment_buffers: std::ptr::null_mut(),
                 vertex_function: vertex,
                 fragment_function: fragment,
                 vertex_descriptor,
@@ -3073,6 +3469,8 @@ fragment float4 mark(float4 position [[position]], device uint* out [[buffer(0)]
         let descriptor = object::make(
             c"MTLRenderPipelineDescriptor",
             pipeline::RenderPipelineDescriptor {
+                vertex_buffers: std::ptr::null_mut(),
+                fragment_buffers: std::ptr::null_mut(),
                 vertex_function: vertex,
                 fragment_function: fragment,
                 vertex_descriptor,
@@ -3434,6 +3832,94 @@ fn a_pass_overwriting_a_texture_waits_for_the_pass_which_sampled_it() {
     }
 }
 
+/// A buffer of [`HAZARD_SIZE`] square `pixel`s.
+fn pixel_buffer(device: Id, pixel: [u8; 4]) -> Id {
+    let pixels = pixel.repeat((HAZARD_SIZE * HAZARD_SIZE) as usize);
+    // SAFETY: a device of this crate's, and bytes which outlive the call.
+    unsafe {
+        new_buffer_with_bytes(
+            device,
+            std::ptr::null(),
+            pixels.as_ptr().cast(),
+            pixels.len(),
+            0,
+        )
+    }
+}
+
+/// A copy to a texture no earlier work touched waits for nothing and ends
+/// its encoder with no barrier. The next pass waits for it as it begins, so
+/// a texture bound after drawing began does not split the pass.
+#[test]
+fn a_copy_nothing_earlier_touched_waits_until_the_next_pass() {
+    isolate_metal_fixture!();
+    let Some(device) = gpu_device() else {
+        return;
+    };
+    let fixture = SamplingDraw::new(device);
+    let blue = fixture.filled(BLUE);
+    let (drawn, uploaded, target) = (fixture.target(), fixture.target(), fixture.target());
+    let red = pixel_buffer(device, RED_PIXEL);
+    // SAFETY: objects this test made, sent the selectors they implement.
+    unsafe {
+        let command = send(fixture.queue, "commandBuffer");
+        let pass = render_encoder(command, single_target_pass(drawn, LOAD_DONT_CARE, BLUE));
+        fixture.prepare(pass, blue);
+        draw(pass, 3);
+        send_void(pass, "endEncoding");
+        let before = recorded_barriers();
+        let blit = send(command, "blitCommandEncoder");
+        copy_buffer_to_texture(blit, red, uploaded, HAZARD_SIZE);
+        send_void(blit, "endEncoding");
+        assert_eq!(recorded_barriers() - before, 0, "the copy");
+        let pass = render_encoder(command, single_target_pass(target, LOAD_DONT_CARE, BLUE));
+        fixture.prepare(pass, blue);
+        draw(pass, 3);
+        assert_eq!(recorded_barriers() - before, 1, "the pass beginning");
+        fixture.bind(pass, uploaded);
+        draw(pass, 3);
+        send_void(pass, "endEncoding");
+        assert_eq!(
+            recorded_barriers() - before,
+            1,
+            "the pass sampling the copy"
+        );
+        let pixels = fixture.read(command, &[drawn, target]);
+        assert_all(&pixels[0], BLUE_PIXEL, "the pass before the copy");
+        assert_all(&pixels[1], RED_PIXEL, "the pass after the copy");
+    }
+}
+
+/// A copy to a texture an earlier pass sampled waits for that pass, which
+/// sees what the texture held before.
+#[test]
+fn a_copy_over_a_texture_waits_for_the_pass_which_sampled_it() {
+    isolate_metal_fixture!();
+    let Some(device) = gpu_device() else {
+        return;
+    };
+    let fixture = SamplingDraw::new(device);
+    let sampled = fixture.filled(BLUE);
+    let target = fixture.target();
+    let red = pixel_buffer(device, RED_PIXEL);
+    // SAFETY: objects this test made, sent the selectors they implement.
+    unsafe {
+        let command = send(fixture.queue, "commandBuffer");
+        let pass = render_encoder(command, single_target_pass(target, LOAD_DONT_CARE, RED));
+        fixture.prepare(pass, sampled);
+        draw(pass, 3);
+        send_void(pass, "endEncoding");
+        let before = recorded_barriers();
+        let blit = send(command, "blitCommandEncoder");
+        copy_buffer_to_texture(blit, red, sampled, HAZARD_SIZE);
+        send_void(blit, "endEncoding");
+        assert_eq!(recorded_barriers() - before, 1);
+        let pixels = fixture.read(command, &[target, sampled]);
+        assert_all(&pixels[0], BLUE_PIXEL, "what the pass sampled");
+        assert_all(&pixels[1], RED_PIXEL, "the copied texture");
+    }
+}
+
 /// A pass which draws over an attachment an earlier pass wrote lands after
 /// it, behind a barrier over the attachment alone.
 #[test]
@@ -3592,6 +4078,7 @@ fn check_fill_and_depth_clip_modes(device: Id) {
 }
 
 const MTL_PIXEL_FORMAT_DEPTH32_FLOAT: u64 = 252;
+const MTL_PIXEL_FORMAT_STENCIL8: u64 = 253;
 const MTL_STORAGE_MODE_PRIVATE: u64 = 2;
 const MTL_COMPARE_FUNCTION_LESS_EQUAL: u64 = 3;
 const MTL_LOAD_ACTION_CLEAR: u64 = 2;
@@ -3623,6 +4110,17 @@ fn covering_draw(device: Id) -> Option<CoveringDraw> {
 /// A covering draw whose pipeline has `depth_format`, with its triangle at
 /// depth `z`.
 fn covering_draw_with_depth(device: Id, depth_format: u64, z: f32) -> Option<CoveringDraw> {
+    covering_draw_with_formats(device, depth_format, MTL_PIXEL_FORMAT_INVALID, z)
+}
+
+/// A covering draw whose pipeline declares independent depth and stencil
+/// formats, with its triangle at depth `z`.
+fn covering_draw_with_formats(
+    device: Id,
+    depth_format: u64,
+    stencil_format: u64,
+    z: f32,
+) -> Option<CoveringDraw> {
     let gpu = gpu_of(device).expect("a Vulkan device");
     if !gpu.occlusion_precise {
         return None;
@@ -3655,12 +4153,14 @@ fn covering_draw_with_depth(device: Id, depth_format: u64, z: f32) -> Option<Cov
     let descriptor = object::make(
         c"MTLRenderPipelineDescriptor",
         pipeline::RenderPipelineDescriptor {
+            vertex_buffers: std::ptr::null_mut(),
+            fragment_buffers: std::ptr::null_mut(),
             vertex_function: vertex,
             fragment_function: fragment,
             vertex_descriptor,
             colors: [pipeline::ColorAttachment::fresh(); pipeline::COLOR_ATTACHMENTS],
             depth_format,
-            stencil_format: 0,
+            stencil_format,
             sample_count: 1,
             alpha_to_coverage: false,
             alpha_to_one: false,
@@ -3759,6 +4259,210 @@ impl CoveringDraw {
                 0,
             );
         }
+    }
+}
+
+/// Metal's depth and stencil attachment descriptors are independent. A draw
+/// must update both when they name a D32 texture and a separate S8 texture.
+#[test]
+fn separate_depth_and_stencil_attachments_are_both_written() {
+    isolate_metal_fixture!();
+    if let Some(device) = gpu_device() {
+        check_separate_depth_and_stencil_attachments(device);
+    }
+}
+
+#[test]
+fn separate_depth_and_stencil_attachments_work_without_dynamic_rendering() {
+    isolate_metal_fixture!();
+    if let Some(device) = gpu_device_without_dynamic_rendering() {
+        check_separate_depth_and_stencil_attachments(device);
+    }
+}
+
+fn check_separate_depth_and_stencil_attachments(device: Id) {
+    let gpu = gpu_of(device).expect("a Vulkan device");
+    let Some(fixture) = covering_draw_with_formats(
+        device,
+        MTL_PIXEL_FORMAT_DEPTH32_FLOAT,
+        MTL_PIXEL_FORMAT_STENCIL8,
+        0.5,
+    ) else {
+        return;
+    };
+    let texture = |pixel_format| {
+        resource::new_texture(
+            gpu,
+            resource::TextureDescriptor {
+                texture_type: MTL_TEXTURE_TYPE_2D,
+                pixel_format,
+                width: COVERING_SIZE,
+                height: COVERING_SIZE,
+                depth: 1,
+                mipmap_level_count: 1,
+                sample_count: 1,
+                array_length: 1,
+                storage_mode: MTL_STORAGE_MODE_PRIVATE,
+                usage: gpu::USAGE_RENDER_TARGET,
+            },
+        )
+    };
+    let depth = texture(MTL_PIXEL_FORMAT_DEPTH32_FLOAT);
+    let stencil = texture(MTL_PIXEL_FORMAT_STENCIL8);
+    assert!(!depth.is_null() && !stencil.is_null());
+    let invert = resource::StencilState {
+        pass: 5, // MTLStencilOperationInvert
+        ..resource::StencilState::default()
+    };
+    let depth_stencil = resource::new_depth_stencil_state(resource::DepthStencilState {
+        depth_compare: MTL_COMPARE_FUNCTION_LESS_EQUAL,
+        depth_write: true,
+        front: invert,
+        back: invert,
+        stencil_enabled: true,
+    });
+    let pass = fixture.pass(std::ptr::null_mut());
+    // SAFETY: objects this test made, sent the selectors they implement.
+    unsafe {
+        let attachment = send(pass, "depthAttachment");
+        send_with_object(attachment, "setTexture:", depth);
+        send_number(attachment, "setLoadAction:", MTL_LOAD_ACTION_CLEAR);
+        send_number(attachment, "setStoreAction:", MTL_STORE_ACTION_STORE);
+        let attachment = send(pass, "stencilAttachment");
+        send_with_object(attachment, "setTexture:", stencil);
+        send_number(attachment, "setLoadAction:", MTL_LOAD_ACTION_CLEAR);
+        send_number(attachment, "setStoreAction:", MTL_STORE_ACTION_STORE);
+        send_number(attachment, "setClearStencil:", 0x5a);
+
+        let command = send(fixture.queue, "commandBuffer");
+        let render = render_encoder(command, pass);
+        fixture.bind(render);
+        send_with_object(render, "setDepthStencilState:", depth_stencil);
+        draw(render, 3);
+        send_void(render, "endEncoding");
+        send_void(command, "commit");
+        send_void(command, "waitUntilCompleted");
+    }
+
+    let mut depth_bytes = [0u8; (COVERING_SIZE * COVERING_SIZE * 4) as usize];
+    let mut stencil_bytes = [0u8; (COVERING_SIZE * COVERING_SIZE) as usize];
+    // SAFETY: each output buffer covers the complete texture region.
+    unsafe {
+        get_bytes(
+            depth,
+            [0, 0, COVERING_SIZE, COVERING_SIZE],
+            &mut depth_bytes,
+            COVERING_SIZE * 4,
+        );
+        get_bytes(
+            stencil,
+            [0, 0, COVERING_SIZE, COVERING_SIZE],
+            &mut stencil_bytes,
+            COVERING_SIZE,
+        );
+    }
+    let depths = depth_bytes
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|bytes| f32::from_ne_bytes(*bytes))
+        .collect::<Vec<_>>();
+    assert!(
+        stencil_bytes.iter().all(|&value| value == 0xa5),
+        "depth values: {depths:?}; stencil values: {stencil_bytes:?}"
+    );
+    assert!(
+        depths.iter().all(|depth| (*depth - 0.5).abs() < 0.0001),
+        "depth values: {depths:?}"
+    );
+
+    // A second, undrawn pass exercises the inbound bridge: Load must preserve
+    // both independent images through the temporary combined attachment.
+    let loaded = object::make(
+        c"MTLRenderPassDescriptor",
+        encoder::RenderPassDescriptor::default(),
+    );
+    // SAFETY: objects this test made, sent the selectors they implement.
+    unsafe {
+        for (selector, texture) in [("depthAttachment", depth), ("stencilAttachment", stencil)] {
+            let attachment = send(loaded, selector);
+            send_with_object(attachment, "setTexture:", texture);
+            send_number(attachment, "setLoadAction:", 1); // Load
+            send_number(attachment, "setStoreAction:", MTL_STORE_ACTION_STORE);
+        }
+        let command = send(fixture.queue, "commandBuffer");
+        let render = render_encoder(command, loaded);
+        send_void(render, "endEncoding");
+        send_void(command, "commit");
+        send_void(command, "waitUntilCompleted");
+        let expected_depth = depth_bytes;
+        let expected_stencil = stencil_bytes;
+        depth_bytes.fill(0);
+        stencil_bytes.fill(0);
+        get_bytes(
+            depth,
+            [0, 0, COVERING_SIZE, COVERING_SIZE],
+            &mut depth_bytes,
+            COVERING_SIZE * 4,
+        );
+        get_bytes(
+            stencil,
+            [0, 0, COVERING_SIZE, COVERING_SIZE],
+            &mut stencil_bytes,
+            COVERING_SIZE,
+        );
+        assert_eq!(depth_bytes, expected_depth);
+        assert_eq!(stencil_bytes, expected_stencil);
+    }
+
+    // One-sample StoreAndMultisampleResolve is a copy. Its two Metal
+    // destinations remain independent even though the Vulkan pass uses one
+    // temporary combined attachment.
+    let resolved_depth = texture(MTL_PIXEL_FORMAT_DEPTH32_FLOAT);
+    let resolved_stencil = texture(MTL_PIXEL_FORMAT_STENCIL8);
+    let resolving = object::make(
+        c"MTLRenderPassDescriptor",
+        encoder::RenderPassDescriptor::default(),
+    );
+    // SAFETY: objects this test made, sent the selectors they implement.
+    unsafe {
+        for (selector, source, destination) in [
+            ("depthAttachment", depth, resolved_depth),
+            ("stencilAttachment", stencil, resolved_stencil),
+        ] {
+            let attachment = send(resolving, selector);
+            send_with_object(attachment, "setTexture:", source);
+            send_number(attachment, "setLoadAction:", 1); // Load
+            send_number(attachment, "setStoreAction:", 3); // StoreAndMultisampleResolve
+            send_with_object(attachment, "setResolveTexture:", destination);
+        }
+        let command = send(fixture.queue, "commandBuffer");
+        let render = render_encoder(command, resolving);
+        send_void(render, "endEncoding");
+        send_void(command, "commit");
+        send_void(command, "waitUntilCompleted");
+        depth_bytes.fill(0);
+        stencil_bytes.fill(0);
+        get_bytes(
+            resolved_depth,
+            [0, 0, COVERING_SIZE, COVERING_SIZE],
+            &mut depth_bytes,
+            COVERING_SIZE * 4,
+        );
+        get_bytes(
+            resolved_stencil,
+            [0, 0, COVERING_SIZE, COVERING_SIZE],
+            &mut stencil_bytes,
+            COVERING_SIZE,
+        );
+        assert!(
+            depth_bytes
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .all(|bytes| (f32::from_ne_bytes(*bytes) - 0.5).abs() < 0.0001)
+        );
+        assert!(stencil_bytes.iter().all(|&value| value == 0xa5));
     }
 }
 
@@ -4513,8 +5217,10 @@ fn compute_encoders_order_subsequent_dispatches() {
     }
 }
 
+/// Each level waits for the blit which made the level before it, and the
+/// encoder ends with no barrier: nothing earlier touched the texture.
 #[test]
-fn generating_mipmaps_ends_a_blit_encoder_with_one_barrier() {
+fn generating_mipmaps_waits_only_between_levels() {
     isolate_metal_fixture!();
     let Some(device) = gpu_device() else {
         return;
@@ -4547,7 +5253,7 @@ fn generating_mipmaps_ends_a_blit_encoder_with_one_barrier() {
         send_void(blit, "endEncoding");
         let recorded =
             encoder::TEST_RECORDED_BARRIERS.load(std::sync::atomic::Ordering::Relaxed) - before;
-        assert_eq!(recorded, LEVELS - 1);
+        assert_eq!(recorded, LEVELS - 2);
         send_void(command, "commit");
         send_void(command, "waitUntilCompleted");
         assert_eq!(send_number_result(command, "status"), 4);
@@ -4913,6 +5619,119 @@ fn each_dispatch_reads_its_own_set_bytes_without_push_descriptors() {
     isolate_metal_fixture!();
     if let Some(device) = gpu_device_without_push_descriptors() {
         check_each_dispatch_reads_its_own_bytes(device);
+    }
+}
+
+fn check_dispatches_follow_single_binding_changes(device: Id) {
+    let add = kernel_from_source(
+        device,
+        "kernel void add(device uint* output [[buffer(0)]],\n\
+                         constant uint& amount [[buffer(1)]],\n\
+                         texture2d<uint> source [[texture(0)]]) {\n\
+             output[0] = output[0] + amount + source.read(uint2(0, 0)).x;\n\
+         }",
+        "add",
+    );
+    let scale = kernel_from_source(
+        device,
+        "kernel void scale(device uint* output [[buffer(0)]],\n\
+                           constant uint& amount [[buffer(1)]],\n\
+                           texture2d<uint> source [[texture(0)]]) {\n\
+             output[0] = output[0] + amount * source.read(uint2(0, 0)).x;\n\
+         }",
+        "scale",
+    );
+    const CHOICES: usize = 3;
+    const STEPS: usize = 60;
+    let texels: [u32; CHOICES] = [3, 50, 700];
+    let mut expected = [0u32; CHOICES];
+    // SAFETY: objects this test made, sent the selectors they implement.
+    unsafe {
+        let textures: [Id; CHOICES] = std::array::from_fn(|at| {
+            let texture =
+                readable_texture(device, TEXTURE_TYPE_2D, PIXEL_FORMAT_R32_UINT, [1, 1, 1]);
+            replace_region(texture, [0, 0, 1, 1], &texels[at].to_ne_bytes(), 4);
+            texture
+        });
+        let outputs: [Id; CHOICES] =
+            std::array::from_fn(|_| new_buffer(device, std::ptr::null(), 16, 0));
+        let queue = new_command_queue(device, std::ptr::null());
+        let command = send(queue, "commandBuffer");
+        let encoder = send(command, "computeCommandEncoder");
+        let (bind, sel) =
+            method::<unsafe extern "C" fn(Id, Sel, Id, u64)>(encoder, "setTexture:atIndex:");
+        let (mut output, mut texture, mut amount, mut scaled) = (0, 0, 1u32, false);
+        send_with_object(encoder, "setComputePipelineState:", add);
+        set_buffer_at(encoder, outputs[output], 0, 0);
+        set_bytes_named(
+            encoder,
+            "setBytes:length:atIndex:",
+            &amount.to_ne_bytes(),
+            1,
+        );
+        bind(encoder, sel, textures[texture], 0);
+        for step in 0..STEPS {
+            // One binding changes between dispatches, or none at all.
+            match step % 5 {
+                0 => {
+                    texture = (texture + 1) % CHOICES;
+                    bind(encoder, sel, textures[texture], 0);
+                }
+                1 => {
+                    amount += 7;
+                    set_bytes_named(
+                        encoder,
+                        "setBytes:length:atIndex:",
+                        &amount.to_ne_bytes(),
+                        1,
+                    );
+                }
+                2 => {
+                    output = (output + 1) % CHOICES;
+                    set_buffer_at(encoder, outputs[output], 0, 0);
+                }
+                3 => {
+                    scaled = !scaled;
+                    let kernel = if scaled { scale } else { add };
+                    send_with_object(encoder, "setComputePipelineState:", kernel);
+                }
+                _ => {}
+            }
+            dispatch(encoder, 1);
+            expected[output] += match scaled {
+                true => amount * texels[texture],
+                false => amount + texels[texture],
+            };
+        }
+        send_void(encoder, "endEncoding");
+        send_void(command, "commit");
+        send_void(command, "waitUntilCompleted");
+        for at in 0..CHOICES {
+            let contents = object::body::<resource::Buffer>(outputs[at]).inner.contents;
+            assert_eq!(
+                std::ptr::read(contents as *const u32),
+                expected[at],
+                "output {at}"
+            );
+        }
+    }
+}
+
+/// A dispatch which follows a change to one binding, to the pipeline, or to
+/// nothing reads every binding as it was last set.
+#[test]
+fn a_dispatch_reads_each_binding_as_last_set_when_one_changed() {
+    isolate_metal_fixture!();
+    if let Some(device) = gpu_device() {
+        check_dispatches_follow_single_binding_changes(device);
+    }
+}
+
+#[test]
+fn a_dispatch_reads_each_binding_as_last_set_without_push_descriptors() {
+    isolate_metal_fixture!();
+    if let Some(device) = gpu_device_without_push_descriptors() {
+        check_dispatches_follow_single_binding_changes(device);
     }
 }
 

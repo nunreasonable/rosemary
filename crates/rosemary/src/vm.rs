@@ -515,6 +515,7 @@ impl Vm {
                 program.install_trampolines();
             }
         }
+        program.seal_import_slots();
         let program = program;
 
         let stack = GuestStack::new(crate::stack::DEFAULT_STACK, exe_path, args)?;
@@ -691,6 +692,11 @@ impl Vm {
     /// linking spared it.
     pub fn cache_stats(&self) -> microlift::runtime::CacheStats {
         self.cache.stats()
+    }
+
+    /// How many translations still wait for an upgrade. See [`crate::jit::tiered`].
+    pub fn provisional_count(&self) -> usize {
+        self.cache.provisional_count()
     }
 
     /// `(installed, pending)` link cells. See [`crate::cache::CodeCache::cell_counts`].
@@ -1170,6 +1176,16 @@ impl Vm {
         if let Some(state) = crate::thread::current() {
             state.took_redirect();
             state.set_entered_by_jump(jumped);
+        }
+        // A guest that rebound the import goes where its slot now points, as
+        // the stub's `jmp [slot]` would.
+        // FIXME (ACCURACY): only a slow import notices: a fast one was baked into
+        // its caller's translation, and a slot rebound to a host address is still
+        // serviced as the import it was linked as.
+        if let Some(target) = site.rebound()
+            && self.program.is_guest_address(target)
+        {
+            return self.transfer_to_guest(target, ctx);
         }
         self.call_site(site, ctx)
     }

@@ -2,9 +2,9 @@ use super::*;
 
 pub(crate) fn new_encoder(command_buffer: Id, kind: Kind) -> Id {
     stats::count(Counter::Encoders);
-    if kind != Kind::Render {
-        // Blits and dispatches are not tracked by what they touch, so they
-        // wait for every render pass before them.
+    if kind == Kind::Compute {
+        // Dispatches are not tracked by what they touch, so they wait for
+        // all the work before them. Blits wait copy by copy.
         // SAFETY: an encoder is only made by a command buffer of this crate's.
         unsafe { object::body::<CommandBuffer>(command_buffer) }.flush_hazards();
     }
@@ -17,7 +17,7 @@ pub(crate) fn new_encoder(command_buffer: Id, kind: Kind) -> Id {
             command_buffer: objc::arc::retain(command_buffer),
             kind,
             concurrent: false,
-            barrier_is_last: std::cell::Cell::new(false),
+            ordered: std::cell::Cell::new(Ordered::Not),
             compute_pipeline: std::ptr::null_mut(),
             render_pipeline: std::ptr::null_mut(),
             depth_state: std::ptr::null_mut(),
@@ -30,6 +30,7 @@ pub(crate) fn new_encoder(command_buffer: Id, kind: Kind) -> Id {
             fill_mode: 0,
             depth_clip: 0,
             depth_bias: RecordedDepthBias::default(),
+            viewports: ViewportState::default(),
             in_render_pass: false,
             lazy: None,
             sub_encoder: false,
@@ -37,17 +38,22 @@ pub(crate) fn new_encoder(command_buffer: Id, kind: Kind) -> Id {
             resolve_mask: 0,
             depth_resolve: None,
             pending_copies: Vec::new(),
+            pending_depth_stencil_bridges: Vec::new(),
             capture_targets: Vec::new(),
             capture_pass: None,
             visibility: None,
             render_variant: None,
+            variant_stale: true,
             render_dynamic: None,
             compute_variant: None,
             attachments: Vec::new(),
+            copies: Hazards::default(),
             writes_elsewhere: false,
             bound: Default::default(),
             set_cache: Default::default(),
             wanted: Default::default(),
+            resolved: std::ptr::null(),
+            dirty: SlotSet::default(),
             dynamic_offsets: Vec::new(),
             vertex_buffers: [(vk::Buffer::null(), 0); SLOTS],
             index_buffer: (vk::Buffer::null(), 0, vk::IndexType::UINT16),
@@ -70,14 +76,6 @@ pub(super) unsafe extern "C" fn encoder_dealloc(receiver: Id, _sel: Sel) {
     // SAFETY: the body was established by `object::make` and is not read again.
     unsafe { std::ptr::drop_in_place(encoder as *mut Encoder) };
     objc::arc::finalize(receiver);
-}
-
-pub(super) fn stage_slot(stage: Stage) -> usize {
-    match stage {
-        Stage::Vertex => 1,
-        Stage::Fragment => 2,
-        _ => 0,
-    }
 }
 
 pub(super) fn bind_point_slot(bind_point: vk::PipelineBindPoint) -> usize {
@@ -111,13 +109,27 @@ pub(super) unsafe extern "C" fn end_encoding(receiver: Id, _sel: Sel) {
         }
         encoder.in_render_pass = false;
         visibility::resolve(encoder);
+        let mut bridges = std::mem::take(&mut encoder.pending_depth_stencil_bridges);
         let copies = std::mem::take(&mut encoder.pending_copies);
-        if !copies.is_empty() {
+        if !bridges.is_empty() || !copies.is_empty() {
             // The copies read what the pass just drew.
             for &(image, aspect) in &encoder.attachments {
-                command.hazards.note_written(image, aspect);
+                command
+                    .hazards
+                    .note_written(image, aspect, ATTACHMENT_WRITES);
             }
             command.flush_hazards();
+        }
+        for bridge in &mut bridges {
+            if let Err(reason) = record_depth_stencil_bridge(command, bridge, false) {
+                gpu::trace(format!("depth/stencil bridge store failed: {reason}"));
+                continue;
+            }
+            command.hazards.note_written(
+                bridge.original,
+                bridge.aspect,
+                vk::AccessFlags::TRANSFER_WRITE,
+            );
         }
         for copy in copies {
             let source = vk::ImageSubresourceLayers {
@@ -177,6 +189,10 @@ pub(super) unsafe extern "C" fn end_encoding(receiver: Id, _sel: Sel) {
         encoder.lazy = None;
         return;
     }
+    if encoder.kind == Kind::Blit && !encoder.writes_elsewhere {
+        encoder.leave_copies_pending();
+        return;
+    }
     encoder.lazy = None;
     if recorded {
         encoder.barrier();
@@ -217,7 +233,7 @@ impl Encoder {
 
     /// Record one draw or dispatch, timed under `ROSEMARY_METAL_PROFILE`.
     pub(super) fn record(&self, body: impl FnOnce()) {
-        self.barrier_is_last.set(false);
+        self.ordered.set(Ordered::Not);
         let command = self.command();
         let Some(profile) = &command.profile else {
             return body();
@@ -240,7 +256,7 @@ impl Encoder {
 
     /// Record work timed under a fixed name rather than the bound pipeline's.
     pub(super) fn record_named(&self, name: &'static str, body: impl FnOnce()) {
-        self.barrier_is_last.set(false);
+        self.ordered.set(Ordered::Not);
         let command = self.command();
         match &command.profile {
             Some(profile) => profile.span(
@@ -255,7 +271,7 @@ impl Encoder {
 
     /// Record work timed under an explicit label, or untimed without one.
     pub(super) fn record_as(&self, label: Option<std::sync::Arc<str>>, body: impl FnOnce()) {
-        self.barrier_is_last.set(false);
+        self.ordered.set(Ordered::Not);
         let command = self.command();
         match (&command.profile, label) {
             (Some(profile), Some(label)) => {
@@ -294,9 +310,23 @@ impl Encoder {
         layouts: &Layouts,
         bind_point: vk::PipelineBindPoint,
     ) -> bool {
-        let used = self.collect_writes(resources, inline_samplers, layouts);
+        // A set whose slots are as the last draw with this pipeline left them
+        // is already bound or pushed with what this one needs.
+        let stale = if std::ptr::eq(self.resolved, layouts) {
+            layouts.reads.map(|reads| reads.intersects(&self.dirty))
+        } else {
+            [true; SETS]
+        };
+        if !stale.contains(&true) {
+            return true;
+        }
+        // Until every stale set is bound, the bind point holds no pipeline's
+        // resources in full.
+        self.resolved = std::ptr::null();
+        let used = self.collect_writes(resources, inline_samplers, layouts, &stale);
         let push_compatible = self.bound[bind_point_slot(bind_point)].layouts == layouts.sets;
-        let Some(sets) = self.materialize_sets(&layouts.sets, &used, layouts.push_set) else {
+        let Some(sets) = self.materialize_sets(&layouts.sets, &used, &stale, layouts.push_set)
+        else {
             gpu::trace_once(
                 "a descriptor set could not be allocated, so the draw or dispatch which needed \
                  it is not recorded",
@@ -304,7 +334,10 @@ impl Encoder {
             return false;
         };
         self.bind_sets(&used, &sets, &layouts.sets, layouts.pipeline, bind_point);
-        if let Some(index) = layouts.push_set.filter(|index| used[*index]) {
+        if let Some(index) = layouts
+            .push_set
+            .filter(|index| used[*index] && stale[*index])
+        {
             self.push_set(
                 index,
                 layouts.sets[index],
@@ -313,11 +346,13 @@ impl Encoder {
                 push_compatible,
             );
         }
+        self.resolved = layouts;
+        self.dirty = SlotSet::default();
         true
     }
 
-    /// Gather each binding into the descriptor writes its set wants, and
-    /// report which sets the pipeline actually uses.
+    /// Gather each binding of a `stale` set into the descriptor writes that
+    /// set wants, and report which sets the pipeline actually uses.
     ///
     /// With robustness2, a resource the pipeline declares but the guest never
     /// bound becomes an explicit null descriptor. Vulkan does not admit null
@@ -330,11 +365,17 @@ impl Encoder {
         resources: &[metal_translate::ResourceBinding],
         inline_samplers: &[vk::Sampler],
         layouts: &Layouts,
+        stale: &[bool; SETS],
     ) -> [bool; SETS] {
         let gpu = self.command().gpu;
         let (null_descriptors, null_sampler) = (gpu.null_descriptors, gpu.null_sampler);
         let mut used = [false; SETS];
-        for wanted in &mut self.wanted {
+        for (wanted, _) in self
+            .wanted
+            .iter_mut()
+            .zip(stale)
+            .filter(|(_, stale)| **stale)
+        {
             wanted.clear();
         }
         debug_assert_eq!(resources.len(), inline_samplers.len());
@@ -346,6 +387,9 @@ impl Encoder {
                 continue;
             }
             used[set] = true;
+            if !stale[set] {
+                continue;
+            }
             let slot = stage_slot(binding.stage);
             let index = binding.metal_index as usize;
             let Some(kind) = binding_type(binding, layouts) else {
@@ -402,7 +446,7 @@ impl Encoder {
                         (0, 0, 0)
                     } else {
                         // SAFETY: only a texture of this crate's is ever bound.
-                        let texture = unsafe { object::body::<Texture>(bound) };
+                        let texture = unsafe { object::body_ref::<Texture>(bound) };
                         use vk::Handle;
                         let is_texel_buffer = texture.texel_view != vk::BufferView::null();
                         if is_texel_buffer != binding.texel_buffer {
@@ -474,16 +518,18 @@ impl Encoder {
                 dynamic_offset,
             });
         }
-        // One offset per dynamic binding of the layout, in binding order,
-        // including one nothing satisfied.
-        self.dynamic_offsets.clear();
-        for binding in &layouts.dynamic {
-            let offset = self.wanted[BUFFER_SET]
-                .iter()
-                .rev()
-                .find(|entry| entry.binding == *binding)
-                .map_or(0, |entry| entry.dynamic_offset);
-            self.dynamic_offsets.push(offset);
+        if stale[BUFFER_SET] {
+            // One offset per dynamic binding of the layout, in binding order,
+            // including one nothing satisfied.
+            self.dynamic_offsets.clear();
+            for binding in &layouts.dynamic {
+                let offset = self.wanted[BUFFER_SET]
+                    .iter()
+                    .rev()
+                    .find(|entry| entry.binding == *binding)
+                    .map_or(0, |entry| entry.dynamic_offset);
+                self.dynamic_offsets.push(offset);
+            }
         }
         used
     }
@@ -494,6 +540,7 @@ impl Encoder {
         &mut self,
         layouts: &[vk::DescriptorSetLayout; SETS],
         used: &[bool; SETS],
+        stale: &[bool; SETS],
         push_set: Option<usize>,
     ) -> Option<[vk::DescriptorSet; SETS]> {
         let command = self.command();
@@ -507,6 +554,10 @@ impl Encoder {
                 continue;
             }
             let cache = &mut self.set_cache[index];
+            if !stale[index] {
+                sets[index] = cache.set;
+                continue;
+            }
             if cache.set != vk::DescriptorSet::null()
                 && cache.layout == layouts[index]
                 && cache.entries == self.wanted[index]
@@ -784,14 +835,14 @@ impl Encoder {
 
     /// A full barrier: everything recorded before it completes, and its
     /// writes are visible, before anything after it runs. It closes compute
-    /// and blit encoders, which are not tracked by what they touch, and
-    /// render passes which wrote more than their attachments; see
-    /// [`hazards`](super::hazards) for the passes which did not.
+    /// encoders, which are not tracked by what they touch, and render passes
+    /// and blit encoders which wrote more than tracked images; see
+    /// [`hazards`](super::hazards) for those which did not.
     ///
     /// A second barrier with no work recorded since the first orders
     /// nothing more and is skipped.
     pub(super) fn barrier(&self) {
-        if self.barrier_is_last.replace(true) {
+        if self.ordered.replace(Ordered::All) == Ordered::All {
             return;
         }
         let command = self.command();
@@ -814,23 +865,20 @@ impl Encoder {
         count_barrier();
     }
 
-    /// Bind the pipeline variant and the resources one draw needs.
-    pub(super) fn prepare_draw(
+    /// The pipeline variant a draw of `primitive` uses, and the state it
+    /// sets per draw.
+    fn choose_variant(
         &mut self,
+        state: &RenderPipeline,
         primitive: u64,
-        base_instance: u64,
-    ) -> Option<(&'static ash::Device, vk::CommandBuffer)> {
-        if self.kind != Kind::Render || self.render_pipeline.is_null() || !self.in_render_pass {
-            return None;
-        }
-        // SAFETY: only a render pipeline state of this crate's is ever bound.
-        let state = unsafe { object::body::<RenderPipeline>(self.render_pipeline) };
-        self.writes_elsewhere |= state.writes_resources;
-        if !state.supports_base_instance(base_instance) {
-            gpu::trace_once(
-                "a draw with a vertex step rate greater than one and a non-zero base instance is unsupported by this Vulkan device",
-            );
-            return None;
+    ) -> Option<(vk::Pipeline, RenderDynamicState)> {
+        let viewport_count = self.viewports.count();
+        if !self.variant_stale
+            && let Some((_, cached, pipeline, dynamic)) = self.render_variant
+            && cached.topology == primitive
+            && cached.viewport_count == viewport_count
+        {
+            return Some((pipeline, dynamic));
         }
         let depth = if self.depth_state.is_null() {
             DepthStencilState::default()
@@ -840,6 +888,7 @@ impl Encoder {
         };
         let key = RenderVariantKey {
             topology: primitive,
+            viewport_count,
             cull_mode: self.cull_mode,
             winding: self.winding,
             fill_mode: self.fill_mode,
@@ -866,10 +915,35 @@ impl Encoder {
                 }
             },
         };
+        self.variant_stale = false;
+        Some((pipeline, wanted))
+    }
+
+    /// Bind the pipeline variant and the resources one draw needs.
+    pub(super) fn prepare_draw(
+        &mut self,
+        primitive: u64,
+        base_instance: u64,
+    ) -> Option<(&'static ash::Device, vk::CommandBuffer)> {
+        if self.kind != Kind::Render || self.render_pipeline.is_null() || !self.in_render_pass {
+            return None;
+        }
+        // SAFETY: only a render pipeline state of this crate's is ever bound.
+        let state = unsafe { object::body::<RenderPipeline>(self.render_pipeline) };
+        self.writes_elsewhere |= state.writes_resources;
+        if !state.supports_base_instance(base_instance) {
+            gpu::trace_once(
+                "a draw with a vertex step rate greater than one and a non-zero base instance is unsupported by this Vulkan device",
+            );
+            return None;
+        }
+        let (pipeline, wanted) = self.choose_variant(state, primitive)?;
+
         self.bind_pipeline(vk::PipelineBindPoint::GRAPHICS, pipeline);
         let command = self.command();
         let device = &command.gpu.device;
         let vk_command = command.command_buffer;
+        self.viewports.record(device, vk_command);
         if command.gpu.dynamic_render_state && self.render_dynamic != Some(wanted) {
             wanted.record(command.gpu, vk_command, self.render_dynamic.as_ref());
             self.render_dynamic = Some(wanted);

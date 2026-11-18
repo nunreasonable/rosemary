@@ -103,11 +103,10 @@ struct MappedImage {
     segments: Vec<(u64, u64)>,
 }
 
-/// The images the native backend mapped.
+/// The images the program's launch mapped, the executable first, under either
+/// backend.
 ///
-/// The emulated backend's are reachable through [`crate::thunk::current`], which
-/// is a `Vm` and so is absent under `native`. Nothing else answers for them:
-/// dyld never saw these mappings, so its `_dyld_find_unwind_sections` reports no
+/// Nothing else answers for them under `native`: dyld never saw these mappings, so its `_dyld_find_unwind_sections` reports no
 /// unwind info for a guest frame and a throw terminates instead of unwinding.
 /// Written once, before the program runs, and read once per frame of every
 /// unwind - so a lock rather than a `OnceLock` would put the unwinder's frame
@@ -635,13 +634,54 @@ fn indexed_image(index: u32) -> Option<(u64, u64, String)> {
         let header = MAIN_HEADER.load(Ordering::Acquire);
         return (header != 0).then_some((header, slide, path));
     }
+    // The executable's own link comes next, as dyld lists everything it mapped
+    // at launch before anything `dlopen` adds. Its first image is the executable.
+    let linked = launch_dependencies();
+    let index = index as usize - 1;
+    if let Some(image) = linked.get(index) {
+        return Some((image.header, image.slide, image.path.clone()));
+    }
     snapshot()
-        .get(index as usize - 1)
+        .get(index - linked.len())
         .map(|image| (image.handle, image.slide, image.path.clone()))
+}
+
+/// The images the executable was linked against at launch, the executable left
+/// out.
+fn launch_dependencies() -> &'static [MappedImage] {
+    MAPPED
+        .get()
+        .map_or(&[], |images| images.get(1..).unwrap_or_default())
+}
+
+/// The header of the launch-time dependency read from `path`, by whatever
+/// spelling. It is that image's `dlopen` handle: dyld never maps a file twice,
+/// and a second copy would have statics of its own.
+fn launch_dependency_named(path: &str) -> Option<u64> {
+    static CANONICAL: OnceLock<Vec<Option<std::path::PathBuf>>> = OnceLock::new();
+    let images = launch_dependencies();
+    if let Some(image) = images.iter().find(|i| i.path == path) {
+        return Some(image.header);
+    }
+    let wanted = std::fs::canonicalize(path).ok()?;
+    let canonical = CANONICAL.get_or_init(|| {
+        images
+            .iter()
+            .map(|i| std::fs::canonicalize(&i.path).ok())
+            .collect()
+    });
+    let index = canonical.iter().position(|c| c.as_ref() == Some(&wanted))?;
+    images.get(index).map(|i| i.header)
+}
+
+/// Whether `handle` is a launch-time dependency's, which is never unloaded.
+fn is_launch_dependency(handle: u64) -> bool {
+    handle != 0 && launch_dependencies().iter().any(|i| i.header == handle)
 }
 
 fn image_count() -> u32 {
     u32::from(MAIN_HEADER.load(Ordering::Acquire) != 0)
+        .saturating_add(launch_dependencies().len() as u32)
         .saturating_add(IMAGE_COUNT.load(Ordering::Acquire) as u32)
 }
 
@@ -931,6 +971,9 @@ pub fn open(path: &str) -> std::result::Result<u64, String> {
     {
         return Ok(image.handle);
     }
+    if let Some(header) = launch_dependency_named(&resolved) {
+        return Ok(header);
+    }
 
     let bytes = std::fs::read(&resolved).map_err(|e| format!("{resolved}: {e}"))?;
     match crate::exec::active().map(|exec| exec.engine()) {
@@ -1192,7 +1235,7 @@ fn link<S: MachSpec + 'static>(
             || contains(va)
             || vm.is_some_and(|vm| vm.program.is_guest_address(va))
     };
-    let (imports, imports_by_target) = collect_imports(&report, is_guest);
+    let (mut imports, imports_by_target) = collect_imports(&report, is_guest);
 
     // The same substitution the program's own slots get - see
     // [`crate::trampoline`] - and a `dlopen`ed plugin is where it pays most.
@@ -1206,6 +1249,7 @@ fn link<S: MachSpec + 'static>(
         &|_| false,
         &mut memory,
     );
+    crate::program::seal_import_slots(imports.values_mut(), &memory);
 
     let regions = memory
         .regions()
@@ -1315,7 +1359,7 @@ fn close(handle: u64) -> std::result::Result<(), String> {
         return Ok(());
     }
     let handle = handle & !FIRST_ONLY;
-    if synthetic::by_handle(handle).is_some() {
+    if synthetic::by_handle(handle).is_some() || is_launch_dependency(handle) {
         return Ok(());
     }
     let image = find(|i| (i.handle == handle).then_some(i))
@@ -1410,6 +1454,7 @@ fn collect_imports(
             resolved: b.resolved,
             tag: b.tag,
             is_stub: false,
+            binding: crate::program::SlotBinding::at(b.slot_va),
             plan: Default::default(),
         };
         imports.insert(b.slot_va, site.clone());
@@ -1431,6 +1476,7 @@ fn collect_imports(
                 resolved: 0,
                 tag: 0,
                 is_stub: false,
+                binding: crate::program::SlotBinding::at(m.slot_va),
                 plan: Default::default(),
             };
             imports.insert(m.slot_va, site.clone());
@@ -1502,7 +1548,8 @@ pub fn inserted_libraries<S: machish::spec::MachSpec + 'static>(
     let requested: Vec<String> = host
         .iter()
         .chain(guest.iter())
-        .flat_map(|list| list.split([':', ' ']))
+        // dyld separates entries with colons only: a path may contain spaces.
+        .flat_map(|list| list.split(':'))
         .filter(|lib| !lib.is_empty())
         .map(str::to_string)
         .collect();
@@ -1729,6 +1776,11 @@ fn global_lookup(name: &str, mangled: &str) -> Option<u64> {
     if let Some(addr) = crate::frameworks::symbol(name) {
         return Some(remember_native_symbol(addr, name, None));
     }
+    // Ahead of the native Objective-C runtime's answer, which is a search of
+    // every host library.
+    if let Some(addr) = crate::gl::host_override(name) {
+        return Some(remember_native_symbol(addr, name, None));
+    }
     if let Some(addr) = crate::objc::host::symbol(name) {
         return Some(remember_native_symbol(addr, name, None));
     }
@@ -1788,6 +1840,12 @@ impl Scope {
     fn of_handle(handle: u64) -> Option<Scope> {
         if handle != 0 && handle == MAIN_HEADER.load(Ordering::Acquire) {
             return main_exports().map(Scope::Main);
+        }
+        if let Some(image) = launch_dependencies().iter().find(|i| i.header == handle) {
+            let name = &image.name;
+            let program = PROGRAM_IMAGES.get()?;
+            let linked = program.iter().find(|l| &l.name == name)?;
+            return Some(Scope::Linked(linked, program));
         }
         synthetic::by_handle(handle)
             .map(Scope::Synthetic)
@@ -2240,6 +2298,7 @@ fn remember_native_symbol(addr: u64, name: &str, library: Option<String>) -> u64
             resolved: addr,
             tag: 0,
             is_stub: false,
+            binding: Default::default(),
             plan: Default::default(),
         }))
     });

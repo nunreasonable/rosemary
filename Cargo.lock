@@ -2057,6 +2057,7 @@ dependencies = [
  "darwin",
  "exports",
  "foundation",
+ "half",
  "iosurface",
  "libc",
  "metal_translate",
@@ -2083,7 +2084,7 @@ dependencies = [
 [[package]]
 name = "microlift"
 version = "0.1.0"
-source = "git+https://github.com/microlift/microlift?rev=0dc8e370e821a6dfd05fc2585a6ae5641147b1c0#0dc8e370e821a6dfd05fc2585a6ae5641147b1c0"
+source = "git+https://github.com/microlift/microlift?rev=2da7446d8ff1e468b196cf7d103bbaed2c5870ab#2da7446d8ff1e468b196cf7d103bbaed2c5870ab"
 dependencies = [
  "capstone",
  "cranelift",
@@ -2279,7 +2280,9 @@ version = "0.5.0"
 dependencies = [
  "appkit",
  "exports",
+ "libc",
  "sdl3",
+ "static_init",
 ]
 
 [[package]]

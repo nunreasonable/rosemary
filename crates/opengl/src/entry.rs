@@ -3,7 +3,15 @@
 
 use std::ffi::{CStr, c_void};
 
+use static_init::dynamic;
+
 use crate::driver::Entry;
+
+fn enable_mipmap_perf_hack() -> bool {
+    #[dynamic]
+    static ENABLED: bool = std::env::var("ROSEMARY_GL_MIPMAP_PERF_HACK").as_deref() == Ok("1");
+    *ENABLED
+}
 
 /// This crate's own `libGL` function `name`, where it has one.
 pub fn address(name: &str) -> Option<u64> {
@@ -15,6 +23,11 @@ pub fn address(name: &str) -> Option<u64> {
         "glFlush" => flush as *const (),
         "glFinish" => finish as *const (),
         "glShaderSource" => crate::glsl::shader_source as *const (),
+        // SDL's GL on a macOS host is Apple's; see [`crate::mipmap`].
+        #[cfg(target_os = "macos")]
+        "glGenerateMipmap" if apple_gl().is_some() && enable_mipmap_perf_hack() => {
+            generate_mipmap as *const ()
+        }
         _ => return crate::profile::address(name),
     };
     Some(f as usize as u64)
@@ -98,6 +111,25 @@ unsafe extern "C" fn delete_vertex_arrays(count: i32, arrays: *const u32) {
         // SAFETY: both spellings are `void (GLsizei, const GLuint *)`.
         let f: unsafe extern "C" fn(i32, *const u32) = unsafe { std::mem::transmute(entry) };
         unsafe { f(count, arrays) };
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn apple_gl() -> Option<&'static crate::mipmap::Gl> {
+    static GL: std::sync::OnceLock<Option<crate::mipmap::Gl>> = std::sync::OnceLock::new();
+    GL.get_or_init(|| {
+        crate::mipmap::Gl::load(|name| {
+            crate::driver::address(name.to_str().ok()?).map(|address| address as usize)
+        })
+    })
+    .as_ref()
+}
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" fn generate_mipmap(target: u32) {
+    if let Some(gl) = apple_gl() {
+        // SAFETY: the guest's call, made with its context current.
+        unsafe { gl.generate_mipmap(target) };
     }
 }
 

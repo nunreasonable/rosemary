@@ -35,7 +35,7 @@ Debug builds are fine, and useful for iteration, when running a *native* guest w
 extra checks have caught real bugs. Avoid debug builds whenever emulation is in play (no native slice for the host
 CPU), since that path is already slow and debug makes it much worse. Use release builds to judge performance.
 
-Rust 2024 edition, requires Rust 1.96+. Microlift and Microlift-Wasmtime are Git dependencies, so the build
+Rust 2024 edition, requires Rust 1.99+. Microlift and Microlift-Wasmtime are Git dependencies, so the build
 environment needs network access to fetch them. On Debian-based Linux, install `build-essential pkg-config
 libcurl4-openssl-dev zlib1g-dev libsdl3-dev libglu1-mesa libxkbcommon-dev` first. On macOS, install the Xcode command-line tools.
 
@@ -102,7 +102,12 @@ and AArch64 ABIs differ enough that bridging isn't attempted — most C++ calls 
 
 * `rustfmt` defaults: 4-space indent, `snake_case` for modules/functions/variables, `PascalCase` for types,
   `SCREAMING_SNAKE_CASE` for constants.
-* Put platform-specific behavior in `darwin`, not behind conditionals scattered through the runtime.
+* Put platform-specific behavior in `starnix` if it's something UNIX-esque, not behind conditionals scattered through the runtime.
+  For other platform-specific behavior that doesn't necessarily belong in `starnix`, design clean abstractions about the underlying
+  goal of the behavior that minimizes code duplication where possible.
+* Prefer to use `static_init` over OnceLock or LazyLock if safe to do so. `static_init` acts like C++ magic constructors, it is zero
+  overhead compared to a OnceLock or LazyLock but needs consideration of if it's safe to use it. Examples of where this is safe include
+  initializing a global boolean based on an environment variable.
 * Keep `machish` free of `std`.
 * Comments should be short, ASCII-only, and explain *why* a constraint exists — not narrate what the code does.
 * Semantic accuracy, simplicity, and self-explanatory code is prioritized over everything else. Do not write program-specific
