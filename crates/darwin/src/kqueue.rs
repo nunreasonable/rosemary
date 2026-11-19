@@ -11,11 +11,11 @@ use static_init::dynamic;
 use crate::mach::space::{self, Name};
 use crate::mach::wire::Receiver;
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
 mod sources;
-/// Only Linux has the host objects these filters are built on, so elsewhere
-/// they stay refused.
-#[cfg(not(target_os = "linux"))]
+/// Only Linux and FreeBSD have the host objects these filters are built on,
+/// so elsewhere they stay refused.
+#[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
 mod sources {
     use super::Kevent;
     use std::ffi::c_int;
@@ -73,13 +73,13 @@ const HOST_WAIT_BATCH: usize = 1024;
 
 const EVFILT_READ: i16 = -1;
 const EVFILT_WRITE: i16 = -2;
-/// Answered by `sources`, which only a Linux host has.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+/// Answered by `sources`, which only Linux and FreeBSD hosts have.
+#[cfg_attr(not(any(target_os = "linux", target_os = "freebsd")), allow(dead_code))]
 const EVFILT_VNODE: i16 = -4;
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[cfg_attr(not(any(target_os = "linux", target_os = "freebsd")), allow(dead_code))]
 const EVFILT_PROC: i16 = -5;
 const EVFILT_SIGNAL: i16 = -6;
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[cfg_attr(not(any(target_os = "linux", target_os = "freebsd")), allow(dead_code))]
 const EVFILT_TIMER: i16 = -7;
 const EVFILT_MACHPORT: i16 = -8;
 const EVFILT_USER: i16 = -10;
@@ -287,7 +287,7 @@ trait ReadinessBackend: Sized {
 
 /// The portable reconstruction of a readiness set. It remains the complete
 /// implementation on hosts with neither epoll nor a Darwin kqueue.
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "freebsd")))]
 struct PollBackend {
     /// Private rather than the guest's descriptor: a duplicate keeps the queue
     /// alive after the guest closes the number it was created under.
@@ -296,7 +296,7 @@ struct PollBackend {
     levels: Mutex<HashMap<c_int, i16>>,
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "freebsd")))]
 impl Drop for PollBackend {
     fn drop(&mut self) {
         forget_waker(self.wake);
@@ -304,7 +304,7 @@ impl Drop for PollBackend {
     }
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "freebsd")))]
 impl ReadinessBackend for PollBackend {
     fn new() -> Result<(Self, c_int), c_int> {
         let wake = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
@@ -757,7 +757,7 @@ fn epoll_revents(events: u32) -> i16 {
 /// The host's own kqueue. Guest signals are emulated, so `EVFILT_SIGNAL` and
 /// `EVFILT_USER` stay in `Queue`; the host queue only answers readiness, and
 /// is what the guest holds, so polling it reports watched descriptors.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "freebsd"))]
 struct KqueueBackend {
     kqueue: c_int,
     /// A pipe rather than `EVFILT_USER`, so a signal handler can wake the
@@ -766,9 +766,22 @@ struct KqueueBackend {
     wake_write: c_int,
     /// What the host's `EVFILT_SIGNAL` has reported, per Darwin signal.
     generated: [std::sync::atomic::AtomicU64; 32],
+    /// Write watches the host refused, by descriptor.
+    #[cfg(target_os = "freebsd")]
+    widowed: Mutex<HashMap<c_int, Widowed>>,
 }
 
-#[cfg(target_os = "macos")]
+/// A pipe end FreeBSD will not watch for writing because its reader is gone.
+/// Darwin registers it, and it stays writable with EOF for good, so it is
+/// reported without the host: every wait for a plain registration, once for
+/// an `EV_CLEAR` one.
+#[cfg(target_os = "freebsd")]
+struct Widowed {
+    edge: bool,
+    pending: bool,
+}
+
+#[cfg(any(target_os = "macos", target_os = "freebsd"))]
 impl Drop for KqueueBackend {
     fn drop(&mut self) {
         // The host queue is the guest-visible descriptor and the guest's to
@@ -781,7 +794,7 @@ impl Drop for KqueueBackend {
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "freebsd"))]
 impl KqueueBackend {
     /// The `udata` each host registration carries, so a reported event says
     /// which kind of registration it came from.
@@ -791,15 +804,27 @@ impl KqueueBackend {
     const PORT_TOKEN: usize = 2;
     const SIGNAL_TOKEN: usize = 3;
 
+    /// What the widowed write watches report now, consuming each edge.
+    #[cfg(target_os = "freebsd")]
+    fn take_widowed(&self) -> Vec<Ready> {
+        let mut widowed = self.widowed.lock().unwrap_or_else(|e| e.into_inner());
+        widowed
+            .iter_mut()
+            .filter_map(|(fd, watch)| {
+                (!watch.edge || std::mem::take(&mut watch.pending)).then(|| Ready {
+                    fd: *fd,
+                    revents: libc::POLLOUT | libc::POLLHUP,
+                    source: match watch.edge {
+                        true => Source::Edge,
+                        false => Source::Level,
+                    },
+                })
+            })
+            .collect()
+    }
+
     fn change(&self, fd: c_int, filter: i16, flags: u16, token: usize) -> Result<(), c_int> {
-        let change = libc::kevent {
-            ident: fd as usize,
-            filter,
-            flags,
-            fflags: 0,
-            data: 0,
-            udata: token as *mut c_void,
-        };
+        let change = host_kevent(fd as usize, filter, flags, token);
         let result = unsafe {
             libc::kevent(
                 self.kqueue,
@@ -818,7 +843,20 @@ impl KqueueBackend {
     }
 }
 
-#[cfg(target_os = "macos")]
+/// A host `kevent` for `ident`'s `filter`, carrying `token` as its `udata`.
+/// The host's `struct kevent` has more fields on some hosts than others.
+#[cfg(any(target_os = "macos", target_os = "freebsd"))]
+fn host_kevent(ident: usize, filter: i16, flags: u16, token: usize) -> libc::kevent {
+    // SAFETY: zero is a valid `kevent`; the fields that matter are set below.
+    let mut event: libc::kevent = unsafe { std::mem::zeroed() };
+    event.ident = ident;
+    event.filter = filter;
+    event.flags = flags;
+    event.udata = token as *mut c_void;
+    event
+}
+
+#[cfg(any(target_os = "macos", target_os = "freebsd"))]
 fn cloexec_nonblocking(fd: c_int) -> Result<(), c_int> {
     unsafe {
         let flags = libc::fcntl(fd, libc::F_GETFL);
@@ -832,7 +870,7 @@ fn cloexec_nonblocking(fd: c_int) -> Result<(), c_int> {
     Ok(())
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "freebsd"))]
 impl ReadinessBackend for KqueueBackend {
     fn new() -> Result<(Self, c_int), c_int> {
         let kqueue = unsafe { libc::kqueue() };
@@ -852,15 +890,15 @@ impl ReadinessBackend for KqueueBackend {
             wake_read: ends[0],
             wake_write: ends[1],
             generated: [const { std::sync::atomic::AtomicU64::new(0) }; 32],
+            #[cfg(target_os = "freebsd")]
+            widowed: Mutex::new(HashMap::new()),
         };
-        let wake = libc::kevent {
-            ident: backend.wake_read as usize,
-            filter: libc::EVFILT_READ,
-            flags: libc::EV_ADD,
-            fflags: 0,
-            data: 0,
-            udata: Self::WAKE_TOKEN as *mut c_void,
-        };
+        let wake = host_kevent(
+            backend.wake_read as usize,
+            libc::EVFILT_READ,
+            libc::EV_ADD,
+            Self::WAKE_TOKEN,
+        );
         // `O_NONBLOCK` on a kqueue is `ENOTTY`, and it is never read directly.
         let cloexec = match unsafe { libc::fcntl(kqueue, libc::F_SETFD, libc::FD_CLOEXEC) } {
             0 => Ok(()),
@@ -926,6 +964,13 @@ impl ReadinessBackend for KqueueBackend {
             // Deleted and added again rather than modified, so the host
             // re-reads `EV_CLEAR` and the token rather than keeping the old.
             if was.is_some() {
+                #[cfg(target_os = "freebsd")]
+                if filter == libc::EVFILT_WRITE {
+                    self.widowed
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .remove(&fd);
+                }
                 // Closing a watched descriptor removes its filters. Keep
                 // Darwin's deletion semantics even if the host already has.
                 match self.change(fd, filter, libc::EV_DELETE, 0) {
@@ -940,7 +985,21 @@ impl ReadinessBackend for KqueueBackend {
                     true => (libc::EV_ADD | libc::EV_CLEAR, Self::EDGE_TOKEN),
                     false => (libc::EV_ADD, Self::LEVEL_TOKEN),
                 };
-                self.change(fd, filter, flags, token)?;
+                match self.change(fd, filter, flags, token) {
+                    #[cfg(target_os = "freebsd")]
+                    Err(libc::EPIPE) if filter == libc::EVFILT_WRITE => {
+                        let widowed = Widowed {
+                            edge,
+                            pending: true,
+                        };
+                        self.widowed
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .insert(fd, widowed);
+                        self.wake();
+                    }
+                    other => other?,
+                }
             }
         }
         Ok(())
@@ -985,6 +1044,12 @@ impl ReadinessBackend for KqueueBackend {
         capacity: usize,
         mut timeout: c_int,
     ) -> Result<Vec<Ready>, c_int> {
+        #[cfg(target_os = "freebsd")]
+        let widowed = self.take_widowed();
+        #[cfg(target_os = "freebsd")]
+        if !widowed.is_empty() {
+            timeout = 0;
+        }
         // The ports' sockets are not in the host queue (a port set's members
         // can change under a registration), so wait on both with `poll` - a
         // kqueue descriptor polls readable while it has events - and then
@@ -1015,17 +1080,7 @@ impl ReadinessBackend for KqueueBackend {
         };
         // One slot more than the caller wants, so the wakeup cannot crowd
         // out a ready descriptor.
-        let mut events = vec![
-            libc::kevent {
-                ident: 0,
-                filter: 0,
-                flags: 0,
-                fflags: 0,
-                data: 0,
-                udata: std::ptr::null_mut(),
-            };
-            capacity + 1
-        ];
+        let mut events = vec![host_kevent(0, 0, 0, 0); capacity + 1];
         let count = unsafe {
             libc::kevent(
                 queue,
@@ -1041,6 +1096,9 @@ impl ReadinessBackend for KqueueBackend {
         }
         // The host reports each filter on its own; `kevent` matches every
         // registration on a descriptor against one entry, so fold them.
+        #[cfg(target_os = "freebsd")]
+        let mut result = widowed;
+        #[cfg(not(target_os = "freebsd"))]
         let mut result: Vec<Ready> = Vec::new();
         for event in events.iter().take(count as usize) {
             if event.udata as usize == Self::SIGNAL_TOKEN {
@@ -1089,9 +1147,9 @@ impl ReadinessBackend for KqueueBackend {
 
 #[cfg(target_os = "linux")]
 type SelectedBackend = EpollBackend;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "freebsd"))]
 type SelectedBackend = KqueueBackend;
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "freebsd")))]
 type SelectedBackend = PollBackend;
 
 fn queues() -> &'static Mutex<HashMap<c_int, Arc<Mutex<Queue<SelectedBackend>>>>> {
@@ -2105,7 +2163,7 @@ mod tests {
         assert_eq!(got[0].data, 5, "five bytes are waiting");
     }
 
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
     #[test]
     fn queue_descriptor_is_readable_when_a_watched_descriptor_is_ready() {
         let queue = kqueue();
@@ -2156,7 +2214,7 @@ mod tests {
     }
 
     /// epoll refuses regular files, so Linux answers them with `poll`.
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
     #[test]
     fn a_regular_file_is_reported_readable() {
         use std::os::fd::AsRawFd;
@@ -2219,6 +2277,41 @@ mod tests {
             assert_eq!(reads.len(), 1);
             assert_eq!(reads[0].flags & EV_EOF, EV_EOF);
             libc::close(read_end);
+            crate::net::descriptor::close(queue);
+        }
+    }
+
+    /// A pipe whose reader is gone is writable with `EV_EOF`, and an
+    /// `EV_CLEAR` watch on it is told once.
+    #[cfg(any(target_os = "macos", target_os = "freebsd"))]
+    #[test]
+    fn a_widowed_pipe_is_writable_with_eof() {
+        let queue = kqueue();
+        let (read_end, write_end) = pipe();
+        let change = Kevent {
+            ident: write_end as usize,
+            filter: EVFILT_WRITE,
+            flags: EV_ADD | EV_CLEAR,
+            ..Kevent::default()
+        };
+        let mut got = [Kevent::default(); 2];
+        // SAFETY: one change and room for two events.
+        unsafe {
+            libc::close(read_end);
+            let n = kevent(queue, &change, 1, got.as_mut_ptr(), 2, &raw const NO_WAIT);
+            assert_eq!(n, 1);
+            assert_eq!(got[0].filter, EVFILT_WRITE);
+            assert_eq!(got[0].flags & EV_EOF, EV_EOF);
+            let n = kevent(
+                queue,
+                std::ptr::null(),
+                0,
+                got.as_mut_ptr(),
+                2,
+                &raw const NO_WAIT,
+            );
+            assert_eq!(n, 0, "an edge is reported once");
+            libc::close(write_end);
             crate::net::descriptor::close(queue);
         }
     }
@@ -2331,8 +2424,8 @@ mod tests {
         let host = crate::signal::signal_to_host(SIGWINCH).expect("a host signal");
         // SAFETY: a signal this process takes by default as a no-op.
         unsafe {
-            libc::kill(libc::getpid(), host);
-            libc::kill(libc::getpid(), host);
+            libc::pthread_kill(libc::pthread_self(), host);
+            libc::pthread_kill(libc::pthread_self(), host);
         }
         let (n, event) = collect(queue, None);
         assert_eq!(n, 1);
@@ -2362,7 +2455,7 @@ mod tests {
         };
         assert_eq!(collect(queue, Some(&change)).0, 0);
         // SAFETY: ignored, so this returns.
-        unsafe { libc::kill(libc::getpid(), host) };
+        unsafe { libc::pthread_kill(libc::pthread_self(), host) };
         let (n, event) = collect(queue, None);
         assert_eq!((n, event.data), (1, 1));
 
@@ -2380,7 +2473,7 @@ mod tests {
 
     /// launchd blocks the signals it watches. Darwin reports one when it is
     /// generated, rather than once it is unblocked.
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "freebsd"))]
     #[test]
     fn a_signal_event_reports_a_signal_blocked_in_every_thread() {
         use std::os::fd::{FromRawFd, OwnedFd};
@@ -2509,6 +2602,10 @@ mod tests {
     /// A watched stop signal still stops the process, and the watch survives
     /// the stop: a job-control shell sees every ^Z, not only the first.
     #[test]
+    #[cfg_attr(
+        target_os = "freebsd",
+        ignore = "FreeBSD discards stop signals without job control; run from a job-control shell"
+    )]
     fn a_signal_event_sees_every_stop_of_a_default_stop_signal() {
         use std::os::fd::{FromRawFd, OwnedFd};
         use std::os::unix::process::CommandExt;
@@ -3240,7 +3337,10 @@ mod tests {
         drop(queue);
 
         // A host that reports signals itself never wakes a queue from a handler.
-        assert_eq!(wakes_on_signals(&held), !cfg!(target_os = "macos"));
+        assert_eq!(
+            wakes_on_signals(&held),
+            !cfg!(any(target_os = "macos", target_os = "freebsd"))
+        );
         assert_eq!(change(copied.0, &user_event(0, 0, NOTE_TRIGGER, 0)), 0);
         let (n, event) = collect(copied.0, None);
         assert_eq!(n, 1);
@@ -3252,7 +3352,7 @@ mod tests {
     }
 
     // A host that reports signals itself never wakes a queue from a handler.
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", target_os = "freebsd")))]
     #[test]
     fn deleting_the_last_signal_registration_stops_signal_wakeups() {
         let queue = Descriptor(kqueue());

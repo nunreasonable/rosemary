@@ -396,6 +396,9 @@ static SHARED_MODULES: &[exports::Module] = &[
     net::MODULE,
     kqueue::MODULE,
     modes::MODULE,
+    printf_l::MODULE,
+    sprintf::MODULE,
+    strfmt::MODULE,
 ];
 
 /// Builtin modules whose guest exports are not yet ported to macOS.
@@ -420,9 +423,6 @@ static NONPORTABLE_MODULES: &[exports::Module] = &[
     shm::MODULE,
     oslog::MODULE,
     backtrace::MODULE,
-    printf_l::MODULE,
-    sprintf::MODULE,
-    strfmt::MODULE,
     syslog::MODULE,
     asl::MODULE,
     #[cfg(target_arch = "x86_64")]
@@ -604,8 +604,6 @@ mod tests {
         for name in [
             "_clock_gettime",
             "_glob",
-            #[cfg(any(target_os = "macos", target_arch = "x86_64"))]
-            "_res_9_init",
             "_strerror",
             "_pthread_mutex_lock",
             "_pthread_attr_init",
