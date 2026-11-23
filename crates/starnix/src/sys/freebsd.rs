@@ -30,11 +30,13 @@ pub mod memory {
     }
 }
 
-use std::ffi::{CStr, c_char};
+use std::ffi::{CStr, c_char, c_void};
 use std::io;
 use std::os::fd::RawFd;
 use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
+use std::sync::{Mutex, OnceLock, PoisonError};
+use std::time::{Duration, Instant};
 
 use super::{kinfo, sysctl};
 use crate::process::{
@@ -169,8 +171,7 @@ pub fn usage(pid: i32) -> Option<Usage> {
     let proc = kinfo_proc(pid)?;
     let usage = proc.ki_rusage;
     let resident_size = (proc.ki_rssize.max(0) as u64).saturating_mul(page_size());
-    let regions = sysctl::bytes(&proc_mib(libc::KERN_PROC_VMMAP, pid))
-        .map_or(0, |bytes| vmentries(&bytes).count() as u32);
+    let regions = region_count(pid).unwrap_or(0);
     let threads = threads(pid).unwrap_or_default();
     // The monotonic clock counts from boot, and the start time is wall-clock.
     let start_ns = boot_time().map_or(0, |boot| {
@@ -247,8 +248,40 @@ fn vmentries(bytes: &[u8]) -> impl Iterator<Item = libc::kinfo_vmentry> + '_ {
     })
 }
 
+/// `ROSEMARY_REGION_COUNT_REUSE=1`: reuse a region count for up to
+/// [`REGION_COUNT_REUSE`]. `KERN_PROC_VMMAP` also counts every entry's resident
+/// pages under the map lock, tens of milliseconds in a game's address space,
+/// and engines poll the count several times a second. Off by default, as the
+/// count can then be out of date.
+const REGION_COUNT_REUSE_ENV: &str = "ROSEMARY_REGION_COUNT_REUSE";
+
+/// How long a region count is reused when [`REGION_COUNT_REUSE_ENV`] asks.
+const REGION_COUNT_REUSE: Duration = Duration::from_secs(1);
+
+fn reuse_region_count() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os(REGION_COUNT_REUSE_ENV).is_some_and(|v| v != "0"))
+}
+
 pub fn region_count(pid: i32) -> Option<u32> {
-    regions(pid).ok().map(|regions| regions.len() as u32)
+    if !reuse_region_count() {
+        return regions(pid).ok().map(|regions| regions.len() as u32);
+    }
+    // FIXME (ACCURACY): the count can be up to `REGION_COUNT_REUSE` old.
+    // Held across the walk so concurrent callers share one instead of each
+    // contending for the map lock.
+    static LAST: Mutex<Option<(i32, Instant, u32)>> = Mutex::new(None);
+    let mut last = LAST.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some((counted, when, count)) = *last
+        && counted == pid
+        && when.elapsed() < REGION_COUNT_REUSE
+    {
+        return Some(count);
+    }
+    let bytes = sysctl::bytes(&proc_mib(libc::KERN_PROC_VMMAP, pid)).ok()?;
+    let count = vmentries(&bytes).count() as u32;
+    *last = Some((pid, Instant::now(), count));
+    Some(count)
 }
 
 // `<sys/user.h>` flags the libc crate does not declare.
@@ -418,37 +451,175 @@ pub fn errno_location() -> *mut libc::c_int {
     unsafe { libc::__error() }
 }
 
-// FIXME (PORTABILITY): FreeBSD keeps these with `extattr_*`, not wired up yet.
+/// The only namespace [`xattr_name`] lets through.
+const NAMESPACE: libc::c_int = libc::EXTATTR_NAMESPACE_USER;
 
-pub fn xattr_get_fd(_: RawFd, _: &std::ffi::CStr, _: &mut [u8]) -> io::Result<usize> {
-    Err(io::ErrorKind::Unsupported.into())
+/// The file an attribute is on: an open descriptor, or a path and whether a
+/// final symlink is followed.
+#[derive(Clone, Copy)]
+enum XattrFile<'a> {
+    Fd(RawFd),
+    Path(&'a CStr, bool),
 }
 
-pub fn xattr_get_path(
-    _: &std::ffi::CStr,
-    _: &std::ffi::CStr,
-    _: &mut [u8],
-    _: bool,
-) -> io::Result<usize> {
-    Err(io::ErrorKind::Unsupported.into())
+/// Every attribute this crate is asked for is spelled as Linux does, and only
+/// the `user.` namespace is one a caller may touch without privilege. FreeBSD
+/// carries the namespace beside the name rather than inside it.
+fn xattr_name(name: &CStr) -> io::Result<&CStr> {
+    match name.to_bytes_with_nul().strip_prefix(b"user.") {
+        Some(rest) if rest.len() > 1 => {
+            Ok(CStr::from_bytes_with_nul(rest).map_err(|_| io::ErrorKind::InvalidInput)?)
+        }
+        _ => Err(io::Error::from_raw_os_error(libc::EOPNOTSUPP)),
+    }
 }
 
-pub fn xattr_set_fd(_: RawFd, _: &std::ffi::CStr, _: &[u8]) -> io::Result<()> {
-    Err(io::ErrorKind::Unsupported.into())
+/// `extattr_get_*` on `file`: up to `n` bytes into `p`, or the length for a
+/// null `p`.
+///
+/// # Safety
+///
+/// `p` is null or `n` writable bytes.
+unsafe fn xattr_read(file: XattrFile<'_>, name: &CStr, p: *mut c_void, n: usize) -> isize {
+    // SAFETY: NUL-terminated strings, and the caller's buffer.
+    unsafe {
+        match file {
+            XattrFile::Fd(fd) => libc::extattr_get_fd(fd, NAMESPACE, name.as_ptr(), p, n),
+            XattrFile::Path(path, true) => {
+                libc::extattr_get_file(path.as_ptr(), NAMESPACE, name.as_ptr(), p, n)
+            }
+            XattrFile::Path(path, false) => {
+                libc::extattr_get_link(path.as_ptr(), NAMESPACE, name.as_ptr(), p, n)
+            }
+        }
+    }
 }
 
-pub fn xattr_set_path(_: &std::ffi::CStr, _: &std::ffi::CStr, _: &[u8], _: bool) -> io::Result<()> {
-    Err(io::ErrorKind::Unsupported.into())
+fn xattr_result(rc: isize) -> io::Result<usize> {
+    usize::try_from(rc).map_err(|_| io::Error::last_os_error())
 }
 
-pub fn xattr_remove_fd(_: RawFd, _: &std::ffi::CStr) -> io::Result<()> {
-    Err(io::ErrorKind::Unsupported.into())
+fn xattr_get(file: XattrFile<'_>, name: &CStr, buf: &mut [u8]) -> io::Result<usize> {
+    let name = xattr_name(name)?;
+    // FreeBSD truncates into a short buffer where Linux refuses with `ERANGE`,
+    // and a truncated value reported as a whole one is the answer a caller
+    // cannot tell is wrong: ask for the length first.
+    // SAFETY: a null buffer asks for the length.
+    let length = xattr_result(unsafe { xattr_read(file, name, std::ptr::null_mut(), 0) })?;
+    if buf.is_empty() {
+        return Ok(length);
+    }
+    if length > buf.len() {
+        return Err(io::Error::from_raw_os_error(libc::ERANGE));
+    }
+    // SAFETY: a buffer of its own length.
+    xattr_result(unsafe { xattr_read(file, name, buf.as_mut_ptr().cast(), buf.len()) })
 }
 
-pub fn xattr_remove_path(_: &std::ffi::CStr, _: &std::ffi::CStr, _: bool) -> io::Result<()> {
-    Err(io::ErrorKind::Unsupported.into())
+fn xattr_set(file: XattrFile<'_>, name: &CStr, value: &[u8]) -> io::Result<()> {
+    let name = xattr_name(name)?;
+    let (p, n) = (value.as_ptr().cast(), value.len());
+    // SAFETY: NUL-terminated strings and the value's own bytes.
+    let rc = unsafe {
+        match file {
+            XattrFile::Fd(fd) => libc::extattr_set_fd(fd, NAMESPACE, name.as_ptr(), p, n),
+            XattrFile::Path(path, true) => {
+                libc::extattr_set_file(path.as_ptr(), NAMESPACE, name.as_ptr(), p, n)
+            }
+            XattrFile::Path(path, false) => {
+                libc::extattr_set_link(path.as_ptr(), NAMESPACE, name.as_ptr(), p, n)
+            }
+        }
+    };
+    xattr_result(rc).map(drop)
 }
 
-pub fn xattr_is_missing(_: &io::Error) -> bool {
-    false
+fn xattr_remove(file: XattrFile<'_>, name: &CStr) -> io::Result<()> {
+    let name = xattr_name(name)?;
+    // SAFETY: NUL-terminated strings.
+    let rc = unsafe {
+        match file {
+            XattrFile::Fd(fd) => libc::extattr_delete_fd(fd, NAMESPACE, name.as_ptr()),
+            XattrFile::Path(path, true) => {
+                libc::extattr_delete_file(path.as_ptr(), NAMESPACE, name.as_ptr())
+            }
+            XattrFile::Path(path, false) => {
+                libc::extattr_delete_link(path.as_ptr(), NAMESPACE, name.as_ptr())
+            }
+        }
+    };
+    match rc {
+        0 => Ok(()),
+        _ => Err(io::Error::last_os_error()),
+    }
+}
+
+pub fn xattr_get_fd(fd: RawFd, name: &CStr, buf: &mut [u8]) -> io::Result<usize> {
+    xattr_get(XattrFile::Fd(fd), name, buf)
+}
+
+pub fn xattr_get_path(path: &CStr, name: &CStr, buf: &mut [u8], follow: bool) -> io::Result<usize> {
+    xattr_get(XattrFile::Path(path, follow), name, buf)
+}
+
+pub fn xattr_set_fd(fd: RawFd, name: &CStr, value: &[u8]) -> io::Result<()> {
+    xattr_set(XattrFile::Fd(fd), name, value)
+}
+
+pub fn xattr_set_path(path: &CStr, name: &CStr, value: &[u8], follow: bool) -> io::Result<()> {
+    xattr_set(XattrFile::Path(path, follow), name, value)
+}
+
+pub fn xattr_remove_fd(fd: RawFd, name: &CStr) -> io::Result<()> {
+    xattr_remove(XattrFile::Fd(fd), name)
+}
+
+pub fn xattr_remove_path(path: &CStr, name: &CStr, follow: bool) -> io::Result<()> {
+    xattr_remove(XattrFile::Path(path, follow), name)
+}
+
+pub fn xattr_is_missing(error: &io::Error) -> bool {
+    error.raw_os_error() == Some(libc::ENOATTR)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Without `ROSEMARY_REGION_COUNT_REUSE`, a count follows the map at once.
+    #[test]
+    fn a_new_mapping_is_counted_at_once() {
+        if reuse_region_count() {
+            return;
+        }
+        let pid = crate::process::me();
+        let page = page_size() as usize;
+        // A mapping of an object of its own, which the kernel never merges
+        // into a neighbouring entry.
+        // SAFETY: a name and no flags.
+        let fd = unsafe { libc::memfd_create(c"region-count".as_ptr(), 0) };
+        assert!(fd >= 0);
+        // SAFETY: this test's own descriptor.
+        assert_eq!(unsafe { libc::ftruncate(fd, page as libc::off_t) }, 0);
+        let before = region_count(pid).expect("a count");
+        // SAFETY: a fresh mapping of that object, unmapped below.
+        let at = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                page,
+                libc::PROT_READ,
+                libc::MAP_SHARED,
+                fd,
+                0,
+            )
+        };
+        assert_ne!(at, libc::MAP_FAILED);
+        let after = region_count(pid).expect("a count");
+        // SAFETY: the mapping and descriptor made above.
+        unsafe {
+            libc::munmap(at, page);
+            libc::close(fd);
+        }
+        assert!(after > before, "{before} then {after}");
+    }
 }

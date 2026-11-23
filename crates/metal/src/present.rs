@@ -237,12 +237,15 @@ pub(crate) unsafe extern "C" fn next_drawable(receiver: Id, _sel: Sel) -> Id {
             && (entry.width, entry.height, entry.pixel_format) == (width, height, pixel_format)
     };
     debug_assert!(matches(&cache[at]));
+    let deadline = (send_flag(receiver, "allowsNextDrawableTimeout") != 0)
+        .then(|| std::time::Instant::now() + NEXT_DRAWABLE_TIMEOUT);
     let Some((_cache, drawable)) = vend(
         &CACHE,
         cache,
         matches,
         crate::swapchain::wait_copied,
         RECLAIM_POLL,
+        deadline,
     ) else {
         return std::ptr::null_mut();
     };
@@ -252,18 +255,24 @@ pub(crate) unsafe extern "C" fn next_drawable(receiver: Id, _sel: Sel) -> Id {
     objc::arc::autorelease(objc::arc::retain(drawable as Id))
 }
 
+/// How long `nextDrawable` waits on a full ring before answering nil, as Core
+/// Animation's does while `allowsNextDrawableTimeout` is YES.
+const NEXT_DRAWABLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// Mark a slot of the ring `matches` picks out vended, waiting for one while
 /// the ring is full, and hand it back with the lock still held. `None` once
-/// the ring has been retired. `retire` returns presented drawables whose
-/// copies are done, saying whether there was a copy to retire or wait for; it
-/// is given the same backoff `vend` is about to wait with, so a copy wait
-/// never polls tighter than the ring's own.
+/// the ring has been retired, or once `deadline` passes with the ring still
+/// full. `retire` returns presented drawables whose copies are done, saying
+/// whether there was a copy to retire or wait for; it is given the same
+/// backoff `vend` is about to wait with, so a copy wait never polls tighter
+/// than the ring's own.
 fn vend<'a>(
     pair: &'a DrawableCache,
     mut cache: std::sync::MutexGuard<'a, Vec<Cached>>,
     matches: impl Fn(&Cached) -> bool,
     mut retire: impl FnMut(std::time::Duration) -> bool,
     poll: std::time::Duration,
+    deadline: Option<std::time::Instant>,
 ) -> Option<(std::sync::MutexGuard<'a, Vec<Cached>>, usize)> {
     // Whether the swapchain had no copy left to retire or wait for, so that
     // only another thread can free a slot. Not on the first pass: a copy may
@@ -294,6 +303,9 @@ fn vend<'a>(
             return Some((cache, drawable));
         }
         crate::stats::count(crate::stats::Counter::DrawablePressure);
+        if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+            return None;
+        }
         let delay = match starved {
             0 => poll,
             streak => deferred_retry_delay(streak - 1),
@@ -1577,6 +1589,20 @@ pub(crate) fn send_id(receiver: Id, selector: &str) -> Id {
     };
     // SAFETY: an `id (id, SEL)` accessor.
     let call: unsafe extern "C" fn(Id, Sel) -> Id =
+        unsafe { std::mem::transmute(method.implementation()) };
+    unsafe { call(receiver, sel) }
+}
+
+/// A `BOOL` accessor's answer, zero for a receiver without one.
+pub(crate) fn send_flag(receiver: Id, selector: &str) -> u8 {
+    let sel = objc::sel::get(selector);
+    // SAFETY: null or an object the runtime allocated.
+    let Some(method) = unsafe { objc::object::class_of(receiver) }.and_then(|c| c.method(sel))
+    else {
+        return 0;
+    };
+    // SAFETY: a `BOOL (id, SEL)` accessor.
+    let call: unsafe extern "C" fn(Id, Sel) -> u8 =
         unsafe { std::mem::transmute(method.implementation()) };
     unsafe { call(receiver, sel) }
 }
@@ -3318,6 +3344,7 @@ mod drawable_pool_tests {
                 false
             },
             NEVER,
+            None,
         );
         assert_eq!(vended.map(|(_, drawable)| drawable), Some(1));
         assert_eq!(retirements, 1);
@@ -3341,6 +3368,7 @@ mod drawable_pool_tests {
                 true
             },
             NEVER,
+            None,
         );
         assert_eq!(vended.map(|(_, drawable)| drawable), Some(1));
         assert_eq!(retirements, 2);
@@ -3355,10 +3383,26 @@ mod drawable_pool_tests {
             let guard = pair.0.lock().unwrap();
             // Blocks on the lock until the vend below waits and gives it up.
             scope.spawn(|| finish_copy(&pair));
-            let vended = vend(&pair, guard, ring_of_layer_7, |_delay| false, NEVER);
+            let vended = vend(&pair, guard, ring_of_layer_7, |_delay| false, NEVER, None);
             assert_eq!(vended.map(|(_, drawable)| drawable), Some(1));
         });
         assert!(started.elapsed() < NEVER / 2);
+    }
+
+    #[test]
+    fn answers_nil_once_the_deadline_passes_with_the_ring_full() {
+        let pair = full_ring();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(20);
+        let vended = vend(
+            &pair,
+            pair.0.lock().unwrap(),
+            ring_of_layer_7,
+            |_delay| false,
+            std::time::Duration::from_millis(2),
+            Some(deadline),
+        );
+        assert!(vended.is_none());
+        assert!(std::time::Instant::now() >= deadline);
     }
 
     #[test]
@@ -3373,6 +3417,7 @@ mod drawable_pool_tests {
                 true
             },
             NEVER,
+            None,
         );
         assert!(vended.is_none());
     }
@@ -3400,6 +3445,7 @@ mod drawable_pool_tests {
                 false
             },
             RECLAIM_POLL,
+            None,
         );
         assert!(vended.is_none(), "the ring never had a slot to vend");
         use std::time::Duration;

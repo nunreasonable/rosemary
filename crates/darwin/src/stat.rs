@@ -934,8 +934,28 @@ pub(crate) mod beneath {
     /// `path` is a NUL-terminated host path.
     #[cfg(any(target_os = "macos", target_os = "freebsd"))]
     pub unsafe fn unlinkat(dirfd: c_int, path: *const c_char, flags: c_int) -> c_int {
+        // FreeBSD refuses a last `..` before it checks where it leads, with
+        // `EPERM` or `EINVAL`. Removing one always fails, so asking the way
+        // there first only decides which error an escape is told.
+        #[cfg(target_os = "freebsd")]
+        if ends_in_dot_dot(unsafe { CStr::from_ptr(path) }.to_bytes()) {
+            let mut host: libc::stat = unsafe { std::mem::zeroed() };
+            let flags = HOST_AT_RESOLVE_BENEATH | libc::AT_SYMLINK_NOFOLLOW;
+            // SAFETY: the caller's path and a live `stat`.
+            if unsafe { libc::fstatat(dirfd, path, &mut host, flags) } < 0 {
+                return -1;
+            }
+        }
         // SAFETY: the caller's path.
         unsafe { libc::unlinkat(dirfd, path, flags | HOST_AT_RESOLVE_BENEATH) }
+    }
+
+    /// Whether the last component of `path` is `..`, trailing slashes aside.
+    #[cfg(target_os = "freebsd")]
+    fn ends_in_dot_dot(path: &[u8]) -> bool {
+        let end = path.iter().rposition(|b| *b != b'/').map_or(0, |at| at + 1);
+        let path = &path[..end];
+        path == b".." || path.ends_with(b"/..")
     }
 
     /// `openat2` beneath `dirfd` with host `flags`.
@@ -1654,7 +1674,42 @@ mod tests {
         crate::errno::set(0);
     }
 
+    /// The process umask, asked of the kernel where it can say: setting it to
+    /// read it hands that mask to whatever another test creates meanwhile.
+    #[cfg(target_os = "freebsd")]
+    fn umask() -> u32 {
+        let name = [
+            libc::CTL_KERN,
+            libc::KERN_PROC,
+            libc::KERN_PROC_UMASK,
+            std::process::id() as c_int,
+        ];
+        let mut mask: u16 = 0;
+        let mut size = size_of::<u16>();
+        // SAFETY: a four-word name and a writable `u16` of the size given.
+        let rc = unsafe {
+            libc::sysctl(
+                name.as_ptr(),
+                4,
+                (&raw mut mask).cast(),
+                &mut size,
+                std::ptr::null(),
+                0,
+            )
+        };
+        assert_eq!(rc, 0);
+        u32::from(mask)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn umask() -> u32 {
+        let status = std::fs::read_to_string("/proc/self/status").expect("this process's status");
+        let line = status.lines().find_map(|line| line.strip_prefix("Umask:"));
+        u32::from_str_radix(line.expect("a Umask line").trim(), 8).expect("octal")
+    }
+
     /// The process umask, restored immediately after reading it.
+    #[cfg(not(any(target_os = "freebsd", target_os = "linux")))]
     fn umask() -> u32 {
         // SAFETY: `umask` cannot fail and the second call restores the first.
         unsafe {
